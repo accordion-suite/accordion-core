@@ -28,4 +28,4 @@ CI also checks formatting with `cargo fmt`, lints with `cargo clippy`, and check
 
 ## License
 
-[AGPL-3.0](LICENSE)
+[AGPL-3.0 or later](LICENSE)

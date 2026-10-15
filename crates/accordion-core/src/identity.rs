@@ -4,18 +4,23 @@
 //! this API, and never read the `identity_` tables directly.
 
 pub mod password;
+mod session;
 
-use accordion_types::{Role, UserId};
+pub use session::{AuthMethod, Client, Session, SessionToken, SignedIn};
+
+use accordion_types::{Role, SessionId, UserId};
 use rusqlite::{Connection, OptionalExtension, Row};
+use tokio::sync::broadcast;
 
 use crate::db::{self, Database, Migration};
 
 const OWNER: &str = "identity";
 
-static MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "Create users",
-    sql: "
+static MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "Create users",
+        sql: "
         CREATE TABLE identity_users (
             id BLOB PRIMARY KEY CHECK (length(id) = 16),
             username TEXT NOT NULL UNIQUE,
@@ -31,7 +36,31 @@ static MIGRATIONS: &[Migration] = &[Migration {
         CREATE UNIQUE INDEX identity_users_one_owner ON identity_users (role)
             WHERE role = 'owner';
     ",
-}];
+    },
+    Migration {
+        version: 2,
+        name: "Create sessions",
+        sql: "
+        CREATE TABLE identity_sessions (
+            id BLOB PRIMARY KEY CHECK (length(id) = 16),
+            user_id BLOB NOT NULL REFERENCES identity_users (id) ON DELETE CASCADE,
+            -- SHA-256 of the token. The token itself is never stored.
+            token_hash BLOB NOT NULL UNIQUE CHECK (length(token_hash) = 32),
+            client TEXT NOT NULL CHECK (client IN ('browser', 'app')),
+            device_name TEXT NOT NULL,
+            auth_method TEXT NOT NULL
+                CHECK (auth_method IN ('password', 'password_totp', 'passkey')),
+            -- When the user last proved who they are, for sensitive actions.
+            authenticated_at TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            -- Updated at most once an hour, so checks stay reads.
+            last_used_at TEXT NOT NULL
+        ) STRICT, WITHOUT ROWID;
+
+        CREATE INDEX identity_sessions_user ON identity_sessions (user_id);
+    ",
+    },
+];
 
 const MAX_USERNAME_LEN: usize = 32;
 const MAX_DISPLAY_NAME_LEN: usize = 100;
@@ -103,13 +132,17 @@ pub struct NewUser {
 #[derive(Clone)]
 pub struct Identity {
     db: Database,
+    ended: broadcast::Sender<SessionId>,
 }
 
 impl Identity {
     /// Starts the identity service, creating or updating its tables first.
     pub async fn new(db: Database) -> Result<Self, Error> {
         db.migrate(OWNER, MIGRATIONS).await?;
-        Ok(Self { db })
+        // Sign-outs come in bursts of at most a few dozen, such as signing
+        // out everywhere, so this is plenty.
+        let (ended, _) = broadcast::channel(256);
+        Ok(Self { db, ended })
     }
 
     /// Whether the server has an owner yet. The setup wizard runs until it
@@ -169,7 +202,7 @@ impl Identity {
                 conn.query_row(
                     "SELECT id, username, display_name, role FROM identity_users WHERE id = ?1",
                     [id.as_uuid()],
-                    user_from_row,
+                    |row| user_from_row(row, 0),
                 )
                 .optional()
             })
@@ -187,7 +220,7 @@ impl Identity {
                 conn.query_row(
                     "SELECT id, username, display_name, role FROM identity_users WHERE username = ?1",
                     [username],
-                    user_from_row,
+                    |row| user_from_row(row, 0),
                 )
                 .optional()
             })
@@ -208,7 +241,7 @@ impl Identity {
                             "SELECT id, username, display_name, role, password_hash
                              FROM identity_users WHERE username = ?1",
                             [username],
-                            |row| Ok((user_from_row(row)?, row.get::<_, Option<String>>(4)?)),
+                            |row| Ok((user_from_row(row, 0)?, row.get::<_, Option<String>>(4)?)),
                         )
                         .optional()
                     })
@@ -229,21 +262,39 @@ impl Identity {
         }
     }
 
-    pub async fn set_password(&self, id: UserId, password: String) -> Result<(), Error> {
+    /// Sets a user's password and signs out their other sessions, in case
+    /// someone else knew the old password.
+    ///
+    /// When users change their own password, pass the session they're using
+    /// as `keep`. When an admin resets it, pass `None` to sign out everywhere.
+    pub async fn set_password(
+        &self,
+        id: UserId,
+        password: String,
+        keep: Option<SessionId>,
+    ) -> Result<(), Error> {
         check_password_rules(&password)?;
         let hash = password::hash(password).await?;
-        let changed = self
+        let ended = self
             .db
             .write(move |tx| {
-                tx.execute(
+                let changed = tx.execute(
                     "UPDATE identity_users SET password_hash = ?2 WHERE id = ?1",
                     (id.as_uuid(), hash),
-                )
+                )?;
+                if changed == 0 {
+                    return Err(Error::UserNotFound);
+                }
+                // A nil UUID matches no session, so `None` keeps none.
+                let keep = keep.map_or(uuid::Uuid::nil(), |keep| keep.as_uuid());
+                Ok(session::delete_sessions(
+                    tx,
+                    "user_id = ?1 AND id != ?2",
+                    (id.as_uuid(), keep),
+                )?)
             })
             .await?;
-        if changed == 0 {
-            return Err(Error::UserNotFound);
-        }
+        self.announce_ended(&ended);
         Ok(())
     }
 }
@@ -260,14 +311,20 @@ fn exists(
     )
 }
 
-fn user_from_row(row: &Row<'_>) -> rusqlite::Result<User> {
-    let role: String = row.get(3)?;
+/// Reads a user from four columns, starting at `first`: id, username,
+/// display name, and role.
+fn user_from_row(row: &Row<'_>, first: usize) -> rusqlite::Result<User> {
+    let role: String = row.get(first + 3)?;
     Ok(User {
-        id: UserId::from_uuid(row.get(0)?),
-        username: row.get(1)?,
-        display_name: row.get(2)?,
+        id: UserId::from_uuid(row.get(first)?),
+        username: row.get(first + 1)?,
+        display_name: row.get(first + 2)?,
         role: role.parse().map_err(|err| {
-            rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, Box::new(err))
+            rusqlite::Error::FromSqlConversionFailure(
+                first + 3,
+                rusqlite::types::Type::Text,
+                Box::new(err),
+            )
         })?,
     })
 }
@@ -477,7 +534,7 @@ mod tests {
             .await
             .unwrap();
         identity
-            .set_password(alex.id, "battery staple".into())
+            .set_password(alex.id, "battery staple".into(), None)
             .await
             .unwrap();
 
@@ -495,7 +552,7 @@ mod tests {
         );
 
         let err = identity
-            .set_password(UserId::generate(), "battery staple".into())
+            .set_password(UserId::generate(), "battery staple".into(), None)
             .await
             .unwrap_err();
         assert!(matches!(err, Error::UserNotFound));

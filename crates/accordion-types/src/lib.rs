@@ -9,34 +9,49 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// The ID of a user account.
-///
-/// IDs are UUIDv7, so they sort by creation time and index well in SQLite.
-/// They never change, unlike usernames, so other data refers to users by ID.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct UserId(Uuid);
+/// Defines a UUIDv7 ID type. IDs sort by creation time and index well in
+/// SQLite.
+macro_rules! id_type {
+    ($(#[$doc:meta])* $name:ident) => {
+        $(#[$doc])*
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+        #[serde(transparent)]
+        pub struct $name(Uuid);
 
-impl UserId {
-    /// Creates a new, unique ID.
-    pub fn generate() -> Self {
-        Self(Uuid::now_v7())
-    }
+        impl $name {
+            /// Creates a new, unique ID.
+            pub fn generate() -> Self {
+                Self(Uuid::now_v7())
+            }
 
-    pub fn from_uuid(uuid: Uuid) -> Self {
-        Self(uuid)
-    }
+            pub fn from_uuid(uuid: Uuid) -> Self {
+                Self(uuid)
+            }
 
-    pub fn as_uuid(&self) -> Uuid {
-        self.0
-    }
+            pub fn as_uuid(&self) -> Uuid {
+                self.0
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                self.0.fmt(f)
+            }
+        }
+    };
 }
 
-impl fmt::Display for UserId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
+id_type!(
+    /// The ID of a user account. It never changes, unlike the username, so
+    /// other data refers to users by ID.
+    UserId
+);
+
+id_type!(
+    /// The ID of a sign-in session: one browser or app that's signed in.
+    /// Unlike the session's token, it's safe to show and to log.
+    SessionId
+);
 
 /// What a user account is allowed to do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]

@@ -1,0 +1,7 @@
+# Use LF line endings for text files on every platform, so scripts and
+# config files work on the Linux servers Accordion runs on.
+* text=auto eol=lf
+
+# Windows batch files only run correctly with CRLF line endings.
+*.bat text eol=crlf
+*.cmd text eol=crlf

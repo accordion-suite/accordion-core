@@ -5,3 +5,4 @@
 //! process later. See decision 1 in the `accordion` repo's `docs/decisions`.
 
 pub mod db;
+pub mod identity;

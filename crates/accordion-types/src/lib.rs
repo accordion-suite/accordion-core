@@ -2,3 +2,119 @@
 //!
 //! The server, every module, and the desktop and mobile apps all depend on
 //! this crate, so they agree on the shape of the data they exchange.
+
+use std::fmt;
+use std::str::FromStr;
+
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+/// The ID of a user account.
+///
+/// IDs are UUIDv7, so they sort by creation time and index well in SQLite.
+/// They never change, unlike usernames, so other data refers to users by ID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct UserId(Uuid);
+
+impl UserId {
+    /// Creates a new, unique ID.
+    pub fn generate() -> Self {
+        Self(Uuid::now_v7())
+    }
+
+    pub fn from_uuid(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
+
+    pub fn as_uuid(&self) -> Uuid {
+        self.0
+    }
+}
+
+impl fmt::Display for UserId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+/// What a user account is allowed to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Role {
+    /// The person who set up the server. There's exactly one.
+    Owner,
+    /// Manages users, modules, and server settings.
+    Admin,
+    /// A standard account.
+    User,
+    /// Can open only what's shared with them by link.
+    Guest,
+}
+
+impl Role {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Owner => "owner",
+            Self::Admin => "admin",
+            Self::User => "user",
+            Self::Guest => "guest",
+        }
+    }
+
+    /// Whether this role can use the admin panel.
+    pub fn is_admin(self) -> bool {
+        matches!(self, Self::Owner | Self::Admin)
+    }
+}
+
+impl fmt::Display for Role {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct UnknownRole;
+
+impl fmt::Display for UnknownRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("unknown role")
+    }
+}
+
+impl std::error::Error for UnknownRole {}
+
+impl FromStr for Role {
+    type Err = UnknownRole;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "owner" => Ok(Self::Owner),
+            "admin" => Ok(Self::Admin),
+            "user" => Ok(Self::User),
+            "guest" => Ok(Self::Guest),
+            _ => Err(UnknownRole),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn role_round_trips_through_its_name() {
+        for role in [Role::Owner, Role::Admin, Role::User, Role::Guest] {
+            assert_eq!(role.as_str().parse(), Ok(role));
+        }
+        assert_eq!("Owner".parse::<Role>(), Err(UnknownRole));
+    }
+
+    #[test]
+    fn user_ids_sort_by_creation() {
+        let first = UserId::generate();
+        let second = UserId::generate();
+        assert!(first < second);
+    }
+}

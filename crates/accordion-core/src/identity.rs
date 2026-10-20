@@ -3,10 +3,15 @@
 //! This is the one place that knows who users are. Modules ask it, through
 //! this API, and never read the `identity_` tables directly.
 
+pub mod limits;
 pub mod password;
 mod session;
 
+pub use limits::SignInFrom;
 pub use session::{AuthMethod, Client, Session, SessionToken, SignedIn};
+
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use accordion_types::{Role, SessionId, UserId};
 use rusqlite::{Connection, OptionalExtension, Row};
@@ -95,6 +100,13 @@ pub enum Error {
     #[error("The username or password is incorrect.")]
     WrongCredentials,
 
+    /// Sign-ins are paused after too many wrong passwords. See [`limits`].
+    #[error(
+        "There have been too many wrong passwords. Wait {}, then try again.",
+        minutes_in_words(*wait)
+    )]
+    TooManyTries { wait: Duration },
+
     #[error(transparent)]
     Database(#[from] db::Error),
 
@@ -133,6 +145,7 @@ pub struct NewUser {
 pub struct Identity {
     db: Database,
     ended: broadcast::Sender<SessionId>,
+    limits: Arc<Mutex<limits::Limits>>,
 }
 
 impl Identity {
@@ -142,7 +155,11 @@ impl Identity {
         // Sign-outs come in bursts of at most a few dozen, such as signing
         // out everywhere, so this is plenty.
         let (ended, _) = broadcast::channel(256);
-        Ok(Self { db, ended })
+        Ok(Self {
+            db,
+            ended,
+            limits: Arc::default(),
+        })
     }
 
     /// Whether the server has an owner yet. The setup wizard runs until it
@@ -231,8 +248,29 @@ impl Identity {
     /// Checks a username and password, and returns the account if they match.
     ///
     /// Every failure returns [`Error::WrongCredentials`] after the same amount
-    /// of work, whether the username exists or not.
-    pub async fn check_password(&self, username: &str, password: &str) -> Result<User, Error> {
+    /// of work, whether the username exists or not. After too many failures,
+    /// it returns [`Error::TooManyTries`] without checking the password.
+    pub async fn check_password(
+        &self,
+        username: &str,
+        password: &str,
+        from: SignInFrom,
+    ) -> Result<User, Error> {
+        self.limits()
+            .start(username, from, Instant::now())
+            .map_err(|wait| Error::TooManyTries { wait })?;
+        let user = self.verify_password(username, password).await?;
+        self.limits().succeeded(username, from);
+        Ok(user)
+    }
+
+    fn limits(&self) -> MutexGuard<'_, limits::Limits> {
+        self.limits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    async fn verify_password(&self, username: &str, password: &str) -> Result<User, Error> {
         let found = match normalize_username(username) {
             Ok(username) => {
                 self.db
@@ -362,6 +400,19 @@ fn validate_display_name(input: &str) -> Result<String, Error> {
     Ok(name.to_owned())
 }
 
+/// "a minute", "two minutes", or "15 minutes", rounding up.
+fn minutes_in_words(wait: Duration) -> String {
+    const WORDS: [&str; 10] = [
+        "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+    ];
+    let minutes = wait.as_secs().div_ceil(60).max(1);
+    match minutes {
+        1 => "a minute".to_owned(),
+        2..=9 => format!("{} minutes", WORDS[minutes as usize]),
+        _ => format!("{minutes} minutes"),
+    }
+}
+
 /// Counts characters, not bytes, so a password in any script gets the same
 /// limits.
 fn check_password_rules(password: &str) -> Result<(), Error> {
@@ -378,6 +429,11 @@ fn check_password_rules(password: &str) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const HOME: SignInFrom = SignInFrom {
+        address: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        home_network: true,
+    };
 
     async fn start() -> (tempfile::TempDir, Identity) {
         let dir = tempfile::tempdir().unwrap();
@@ -507,7 +563,7 @@ mod tests {
 
         assert_eq!(
             identity
-                .check_password("Alex", "correct horse")
+                .check_password("Alex", "correct horse", HOME)
                 .await
                 .unwrap(),
             alex
@@ -519,7 +575,7 @@ mod tests {
             ("alex", &"x".repeat(10_000)),
         ] {
             let err = identity
-                .check_password(username, password)
+                .check_password(username, password, HOME)
                 .await
                 .unwrap_err();
             assert!(matches!(err, Error::WrongCredentials), "{username:?}");
@@ -540,13 +596,13 @@ mod tests {
 
         assert!(
             identity
-                .check_password("alex", "correct horse")
+                .check_password("alex", "correct horse", HOME)
                 .await
                 .is_err()
         );
         assert!(
             identity
-                .check_password("alex", "battery staple")
+                .check_password("alex", "battery staple", HOME)
                 .await
                 .is_ok()
         );
@@ -571,5 +627,56 @@ mod tests {
 
         let identity = Identity::new(Database::open(&path).unwrap()).await.unwrap();
         assert_eq!(identity.user(alex.id).await.unwrap(), Some(alex));
+    }
+
+    #[tokio::test]
+    async fn pauses_sign_ins_after_too_many_wrong_passwords() {
+        let (_dir, identity) = start().await;
+        identity
+            .create_user(new_user("alex", Role::User))
+            .await
+            .unwrap();
+        let stranger = SignInFrom {
+            address: "203.0.113.5".parse().unwrap(),
+            home_network: false,
+        };
+        for _ in 0..limits::ADDRESS_LIMIT {
+            let err = identity
+                .check_password("alex", "wrong horse", stranger)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::WrongCredentials));
+        }
+        // Even the right password waits, or guessing could carry on.
+        let err = identity
+            .check_password("alex", "correct horse", stranger)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::TooManyTries { .. }));
+        assert_eq!(
+            err.to_string(),
+            "There have been too many wrong passwords. Wait 15 minutes, then try again."
+        );
+
+        // The home network has its own count.
+        assert!(
+            identity
+                .check_password("alex", "correct horse", HOME)
+                .await
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn says_how_long_to_wait() {
+        for (secs, words) in [
+            (1, "a minute"),
+            (60, "a minute"),
+            (61, "two minutes"),
+            (9 * 60, "nine minutes"),
+            (15 * 60, "15 minutes"),
+        ] {
+            assert_eq!(minutes_in_words(Duration::from_secs(secs)), words);
+        }
     }
 }

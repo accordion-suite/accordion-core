@@ -271,6 +271,36 @@ impl Identity {
         Ok(Some(signed_in))
     }
 
+    /// Records that the user just proved who they are again in this session,
+    /// such as by entering their password before a sensitive action. Check
+    /// the password or passkey first. Returns `false` if the user has no such
+    /// session.
+    pub async fn confirm_session(
+        &self,
+        user_id: UserId,
+        session_id: SessionId,
+        auth_method: AuthMethod,
+    ) -> Result<bool, Error> {
+        let confirmed = self
+            .db
+            .write(move |tx| {
+                tx.execute(
+                    concat!(
+                        "UPDATE identity_sessions SET auth_method = ?3, authenticated_at = ",
+                        sql_now!(),
+                        " WHERE user_id = ?1 AND id = ?2"
+                    ),
+                    (
+                        user_id.as_uuid(),
+                        session_id.as_uuid(),
+                        auth_method.as_str(),
+                    ),
+                )
+            })
+            .await?;
+        Ok(confirmed > 0)
+    }
+
     /// The user's live sessions, most recently used first.
     pub async fn sessions(&self, user_id: UserId) -> Result<Vec<Session>, Error> {
         self.db
@@ -555,6 +585,39 @@ mod tests {
             )
             .await;
         assert!(matches!(result, Err(Error::UserNotFound)));
+    }
+
+    #[tokio::test]
+    async fn confirming_a_session_counts_as_a_recent_sign_in() {
+        let (_dir, identity, alex) = start().await;
+        let (token, session) = sign_in(&identity, &alex, Client::Browser).await;
+        age(&identity, session.id, "-1 hour").await;
+        let check = async || {
+            identity
+                .check_session(token.as_str())
+                .await
+                .unwrap()
+                .unwrap()
+        };
+        assert!(!check().await.recently_authenticated);
+
+        assert!(
+            identity
+                .confirm_session(alex.id, session.id, AuthMethod::Passkey)
+                .await
+                .unwrap()
+        );
+        let confirmed = check().await;
+        assert!(confirmed.recently_authenticated);
+        assert_eq!(confirmed.session.auth_method, AuthMethod::Passkey);
+
+        let stranger = UserId::generate();
+        assert!(
+            !identity
+                .confirm_session(stranger, session.id, AuthMethod::Password)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

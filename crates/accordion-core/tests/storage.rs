@@ -124,6 +124,46 @@ async fn stores_identical_contents_once() {
 }
 
 #[tokio::test]
+async fn replaces_an_empty_version_instead_of_keeping_it() {
+    let server = start().await;
+    let alex = server.user("alex").await;
+    let top = server.storage.top_folder(alex).await.unwrap();
+    // As File Explorer saves a new file: empty first, then the contents.
+    let file = server
+        .storage
+        .write_file(top, "photo.jpg", &b""[..])
+        .await
+        .unwrap();
+    server
+        .storage
+        .write_file(top, "photo.jpg", &b"pixels"[..])
+        .await
+        .unwrap();
+    let versions = server.storage.versions(file.id).await.unwrap();
+    assert_eq!(versions.len(), 1);
+    assert_eq!(versions[0].number, 1);
+    assert_eq!(read(&server.storage, file.id).await, "pixels");
+
+    // Emptying a file keeps what it held before.
+    server
+        .storage
+        .write_file(top, "photo.jpg", &b""[..])
+        .await
+        .unwrap();
+    server
+        .storage
+        .write_file(top, "photo.jpg", &b"new pixels"[..])
+        .await
+        .unwrap();
+    let versions = server.storage.versions(file.id).await.unwrap();
+    assert_eq!(
+        versions.iter().map(|v| v.number).collect::<Vec<_>>(),
+        [2, 1]
+    );
+    assert_eq!(read(&server.storage, file.id).await, "new pixels");
+}
+
+#[tokio::test]
 async fn keeps_every_version() {
     let server = start().await;
     let alex = server.user("alex").await;

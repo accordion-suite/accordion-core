@@ -629,7 +629,7 @@ impl Storage {
     }
 
     /// Makes an older version current again, by saving it as a new version.
-    /// Every version stays in the history.
+    /// Every version stays in the history, apart from an empty current one.
     pub async fn restore_version(&self, id: ItemId, version: VersionId) -> Result<Item, Error> {
         let _changes = self.inner.changes.lock().await;
         let item = self
@@ -1296,7 +1296,38 @@ fn delete_subtree(conn: &Connection, id: ItemId) -> Result<(), Error> {
     Ok(())
 }
 
+/// Adds `blob` as the newest version of `item`. An empty current version
+/// is replaced instead of kept, because there's nothing in it to go back to.
+/// File Explorer on Windows, for example, saves every new file empty first,
+/// then saves its contents over it.
 fn add_version(conn: &Connection, item: ItemId, blob: Blob) -> Result<(), Error> {
+    let replaced = conn.execute(
+        concat!(
+            "UPDATE storage_versions SET blob = ?2, created_at = ",
+            sql_now!(),
+            " WHERE id = (SELECT v.id FROM storage_versions v
+                          JOIN storage_blobs b ON b.hash = v.blob
+                          WHERE v.item_id = ?1 AND b.size = 0
+                            AND v.number = (SELECT max(number) FROM storage_versions
+                                            WHERE item_id = ?1))"
+        ),
+        (item.as_uuid(), &blob.hash.0[..]),
+    )?;
+    if replaced == 0 {
+        insert_version(conn, item, blob)?;
+    }
+    conn.execute(
+        concat!(
+            "UPDATE storage_items SET modified_at = ",
+            sql_now!(),
+            " WHERE id = ?1"
+        ),
+        [item.as_uuid()],
+    )?;
+    Ok(())
+}
+
+fn insert_version(conn: &Connection, item: ItemId, blob: Blob) -> Result<(), Error> {
     conn.execute(
         concat!(
             "INSERT INTO storage_versions (id, item_id, number, blob, created_at)
@@ -1311,14 +1342,6 @@ fn add_version(conn: &Connection, item: ItemId, blob: Blob) -> Result<(), Error>
             item.as_uuid(),
             &blob.hash.0[..],
         ),
-    )?;
-    conn.execute(
-        concat!(
-            "UPDATE storage_items SET modified_at = ",
-            sql_now!(),
-            " WHERE id = ?1"
-        ),
-        [item.as_uuid()],
     )?;
     Ok(())
 }

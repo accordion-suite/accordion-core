@@ -3,10 +3,12 @@
 //! This is the one place that knows who users are. Modules ask it, through
 //! this API, and never read the `identity_` tables directly.
 
+mod app_password;
 pub mod limits;
 pub mod password;
 mod session;
 
+pub use app_password::{AppPassword, AppPasswordSecret, AppPasswordUse, UsingAppPassword};
 pub use limits::SignInFrom;
 pub use session::{AuthMethod, Client, Session, SessionToken, SignedIn};
 
@@ -63,6 +65,27 @@ static MIGRATIONS: &[Migration] = &[
         ) STRICT, WITHOUT ROWID;
 
         CREATE INDEX identity_sessions_user ON identity_sessions (user_id);
+    ",
+    },
+    Migration {
+        version: 3,
+        name: "Create app passwords",
+        sql: "
+        CREATE TABLE identity_app_passwords (
+            id BLOB PRIMARY KEY CHECK (length(id) = 16),
+            user_id BLOB NOT NULL REFERENCES identity_users (id) ON DELETE CASCADE,
+            -- SHA-256 of the password. The password itself is never stored.
+            password_hash BLOB NOT NULL UNIQUE CHECK (length(password_hash) = 32),
+            -- Mail (IMAP and SMTP), or files, calendars, and contacts (WebDAV,
+            -- CalDAV, and CardDAV).
+            use_for TEXT NOT NULL CHECK (use_for IN ('mail', 'dav')),
+            device_name TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            -- NULL until first used. Updated at most once an hour.
+            last_used_at TEXT
+        ) STRICT, WITHOUT ROWID;
+
+        CREATE INDEX identity_app_passwords_user ON identity_app_passwords (user_id);
     ",
     },
 ];

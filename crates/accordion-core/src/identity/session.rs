@@ -46,6 +46,7 @@ macro_rules! last_used_precision {
         sql_now!("-1 hour")
     };
 }
+pub(super) use last_used_precision;
 
 /// Whether the session is still live, for a query that names the sessions
 /// table `s`.
@@ -400,7 +401,7 @@ fn parse_token(token: &str) -> Option<Vec<u8>> {
 }
 
 /// Device names come from the client, so tidy them rather than reject them.
-fn clean_device_name(input: &str) -> String {
+pub(super) fn clean_device_name(input: &str) -> String {
     let name: String = input
         .chars()
         .filter(|c| !c.is_control())
@@ -434,7 +435,7 @@ fn session_from_row(row: &Row<'_>) -> rusqlite::Result<Session> {
     })
 }
 
-fn bad_value(column: usize, value: &str) -> rusqlite::Error {
+pub(super) fn bad_value(column: usize, value: &str) -> rusqlite::Error {
     rusqlite::Error::FromSqlConversionFailure(
         column,
         rusqlite::types::Type::Text,

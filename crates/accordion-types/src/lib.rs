@@ -54,6 +54,12 @@ id_type!(
 );
 
 id_type!(
+    /// The ID of an app password: the password that one standard client,
+    /// such as a WebDAV mount or a mail app, signs in with.
+    AppPasswordId
+);
+
+id_type!(
     /// The ID of a file or folder in storage. It stays the same when the
     /// item is renamed, moved, or changed, so sync clients can follow it.
     ItemId

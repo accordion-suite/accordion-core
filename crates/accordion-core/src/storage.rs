@@ -8,35 +8,46 @@
 //! database whenever it might be out of date. See decision 6 in the
 //! `accordion` repo's `docs/decisions`.
 //!
+//! Each user can have a quota, which counts every version and the trash.
+//! Large files arrive through resumable uploads ([`Storage::start_upload`]).
+//! Upkeep ([`Storage::maintain`]) empties old trash and versions, removes
+//! contents nothing uses, and rehashes stored files to find damage.
+//!
 //! Drive, Docs, Notes, Photos, and Takeout import all store files here,
 //! through this API. Who may open what is up to them.
 
 pub mod blobs;
+mod upkeep;
+mod uploads;
 mod view;
 
-pub use blobs::{Blob, ContentHash};
+pub use blobs::{Blob, ContentHash, Problem};
+pub use upkeep::{Checked, Cleaned, Damage, Purged, Retention, StorageStatus};
+pub use uploads::Upload;
 
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use accordion_types::{ItemId, UserId, VersionId};
+use accordion_types::{ItemId, UploadId, UserId, VersionId};
 use rusqlite::{Connection, OptionalExtension, Row};
 use tokio::io::AsyncRead;
+use tokio::sync::watch;
 
 use crate::db::{self, Database, Migration};
 use crate::identity::{self, Identity};
 use crate::sql_now;
-use blobs::Blobs;
+use blobs::{Blobs, Received};
 use view::{Entry, View};
 
 const OWNER: &str = "storage";
 
-static MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "Create items, versions, and blobs",
-    sql: "
+static MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "Create items, versions, and blobs",
+        sql: "
         -- Contents stored under blobs/, by hash.
         CREATE TABLE storage_blobs (
             hash BLOB PRIMARY KEY CHECK (length(hash) = 32),
@@ -79,7 +90,54 @@ static MIGRATIONS: &[Migration] = &[Migration {
 
         CREATE INDEX storage_versions_blob ON storage_versions (blob);
     ",
-}];
+    },
+    Migration {
+        version: 2,
+        name: "Add quotas, resumable uploads, module contents, and integrity checks",
+        sql: "
+        -- When nothing used the contents any more, so cleanup can wait a
+        -- day before removing them. NULL while something uses them.
+        ALTER TABLE storage_blobs ADD COLUMN unused_since TEXT;
+        -- When the integrity check last rehashed the contents, and what was
+        -- wrong if they failed.
+        ALTER TABLE storage_blobs ADD COLUMN checked_at TEXT;
+        ALTER TABLE storage_blobs ADD COLUMN damage TEXT
+            CHECK (damage IN ('missing', 'changed'));
+        UPDATE storage_blobs SET checked_at = created_at;
+        CREATE INDEX storage_blobs_checked ON storage_blobs (checked_at);
+        CREATE INDEX storage_blobs_damaged ON storage_blobs (damage)
+            WHERE damage IS NOT NULL;
+
+        CREATE INDEX storage_items_owner ON storage_items (owner_id);
+
+        -- Each user's limit in bytes. Users without a row have no limit.
+        CREATE TABLE storage_quotas (
+            owner_id BLOB PRIMARY KEY REFERENCES identity_users (id),
+            bytes INTEGER NOT NULL CHECK (bytes >= 0)
+        ) STRICT, WITHOUT ROWID;
+
+        -- Resumable uploads in progress. Their contents collect in uploads/.
+        CREATE TABLE storage_uploads (
+            id BLOB PRIMARY KEY CHECK (length(id) = 16),
+            owner_id BLOB NOT NULL REFERENCES identity_users (id),
+            size INTEGER NOT NULL CHECK (size >= 0),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        ) STRICT, WITHOUT ROWID;
+        CREATE INDEX storage_uploads_owner ON storage_uploads (owner_id);
+
+        -- Contents a module keeps for its own use, such as thumbnails.
+        CREATE TABLE storage_blob_refs (
+            module TEXT NOT NULL,
+            key TEXT NOT NULL,
+            blob BLOB NOT NULL REFERENCES storage_blobs (hash),
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (module, key)
+        ) STRICT, WITHOUT ROWID;
+        CREATE INDEX storage_blob_refs_blob ON storage_blob_refs (blob);
+    ",
+    },
+];
 
 /// The longest name, in bytes of UTF-8. Most file systems allow 255, so the
 /// plain view can show every name exactly.
@@ -119,6 +177,35 @@ pub enum Error {
 
     #[error("That isn't in the trash.")]
     NotInTrash,
+
+    #[error(
+        "There isn't enough space left in your storage. Delete some files and empty the \
+         trash, or ask your admin for more space."
+    )]
+    QuotaFull,
+
+    #[error("That user doesn't exist. They may have been removed.")]
+    UserNotFound,
+
+    #[error(
+        "That upload doesn't exist. It may have finished, been canceled, or been removed after \
+         a day without progress. Start it again."
+    )]
+    UploadNotFound,
+
+    #[error(
+        "The upload has {expected} bytes so far, so it can only continue from byte {expected}."
+    )]
+    UploadOffset { expected: u64 },
+
+    #[error("That's more than the {size} bytes the upload said it would send.")]
+    UploadTooLong { size: u64 },
+
+    #[error(
+        "The upload isn't finished. {received} of {size} bytes have arrived. Send the rest, \
+         then try again."
+    )]
+    UploadIncomplete { received: u64, size: u64 },
 
     #[error(
         "Accordion can't create hard links in its storage folder, {0}. Keep Accordion's data \
@@ -178,6 +265,18 @@ pub struct Version {
     pub created_at: String,
 }
 
+/// How much space a user's files take, and their limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Usage {
+    /// Every version of every file they own, including the trash, each at
+    /// its full size even when its contents are shared with another file.
+    pub used: u64,
+    /// Space set aside for uploads in progress.
+    pub uploading: u64,
+    /// `None` when there's no limit.
+    pub quota: Option<u64>,
+}
+
 /// The storage service. Cloning it is cheap.
 #[derive(Clone)]
 pub struct Storage {
@@ -190,8 +289,12 @@ struct Inner {
     blobs: Blobs,
     view: View,
     /// Held across each change and its update to the plain view, so the view
-    /// sees changes in the order the database does.
+    /// sees changes in the order the database does. Storing contents under
+    /// `blobs/` and committing what uses them also happen under it, so
+    /// cleanup never removes contents that a commit is about to use.
     changes: tokio::sync::Mutex<()>,
+    uploads: uploads::InProgress,
+    status: watch::Sender<StorageStatus>,
 }
 
 impl Storage {
@@ -209,6 +312,8 @@ impl Storage {
                 blobs,
                 view,
                 changes: tokio::sync::Mutex::new(()),
+                uploads: uploads::InProgress::default(),
+                status: watch::Sender::new(StorageStatus::default()),
             }),
         })
     }
@@ -328,33 +433,118 @@ impl Storage {
         contents: impl AsyncRead + Unpin,
     ) -> Result<Item, Error> {
         let name = check_name(name)?;
-        // Storing the contents is the slow part, so it happens before
-        // taking the lock. Unused contents are cleaned up later.
-        let blob = self.inner.blobs.put(contents).await?;
+        // Receiving the contents is the slow part, so it happens before
+        // taking the lock.
+        let received = self.inner.blobs.receive(contents).await?;
+        let result = self.save(parent, name, &received, None).await;
+        // Gone already if it was stored. Otherwise nothing uses it.
+        let _ = tokio::fs::remove_file(&received.path).await;
+        result
+    }
+
+    /// Stores received contents as the file `name` in `parent`, as a new
+    /// version if a file with that name is already there. For a resumable
+    /// upload, this also ends the upload.
+    async fn save(
+        &self,
+        parent: ItemId,
+        name: String,
+        received: &Received,
+        upload: Option<UploadId>,
+    ) -> Result<Item, Error> {
+        let blob = received.blob;
         let _changes = self.inner.changes.lock().await;
+        // Check before storing the contents, so refused contents never reach
+        // blobs/. The lock keeps the answer true until the commit.
+        let checked = name.clone();
+        self.inner
+            .db
+            .read(move |conn| check_save(conn, parent, &checked, blob.size, upload))
+            .await?;
+        let kept = self.keep(received).await?;
+        let stored = kept.stored;
         let new_id = ItemId::generate();
         let item = self
             .inner
             .db
             .write(move |tx| {
-                let parent = writable_folder(tx, parent)?;
-                insert_blob(tx, blob)?;
-                let id = match child_named(tx, parent.id, &name)? {
-                    Some(existing) if existing.kind == ItemKind::Folder => {
-                        return Err(Error::NameTaken);
-                    }
-                    Some(existing) => existing.id,
+                let (parent, existing) = check_save(tx, parent, &name, blob.size, upload)?;
+                insert_blob(tx, blob, stored)?;
+                let id = match existing {
+                    Some(id) => id,
                     None => {
                         insert_item(tx, new_id, parent.owner, parent.id, &name, "file")?;
                         new_id
                     }
                 };
                 add_version(tx, id, blob)?;
-                item(tx, id)?.ok_or(Error::NotFound)
+                if let Some(upload) = upload {
+                    tx.execute(
+                        "DELETE FROM storage_uploads WHERE id = ?1",
+                        [upload.as_uuid()],
+                    )?;
+                }
+                item_or_missing(tx, id)
             })
             .await?;
-        self.update_view(Change::Show(item.id)).await;
+        if kept.repaired {
+            self.show_repair().await;
+        } else {
+            self.update_view(Change::Show(item.id)).await;
+        }
         Ok(item)
+    }
+
+    /// Stores received contents under their hash. Call it holding the
+    /// `changes` lock, and commit what uses the contents before letting go.
+    async fn keep(&self, received: &Received) -> Result<Kept, Error> {
+        let hash = received.blob.hash;
+        // Contents the integrity check found damaged are replaced by the
+        // fresh copy, which repairs every file that uses them.
+        let damaged = self
+            .inner
+            .db
+            .read(move |conn| {
+                Ok::<_, Error>(conn.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM storage_blobs
+                                    WHERE hash = ?1 AND damage IS NOT NULL)",
+                    [&hash.0[..]],
+                    |row| row.get::<_, bool>(0),
+                )?)
+            })
+            .await?;
+        let path = received.path.clone();
+        let stored = self
+            .on_disk(move |blobs| {
+                if damaged {
+                    blobs.remove(hash)?;
+                }
+                blobs.keep(&path, hash)
+            })
+            .await?;
+        Ok(Kept {
+            stored,
+            repaired: damaged,
+        })
+    }
+
+    /// The plain view still links to the damaged copy of repaired contents,
+    /// wherever they appear, so it's rebuilt. Repairs are rare.
+    async fn show_repair(&self) {
+        if let Err(err) = self.rebuild_view_locked().await {
+            tracing::error!(%err, "couldn't rebuild the plain view after a repair");
+        }
+    }
+
+    /// Runs blocking work on `blobs/` and `uploads/` off the async threads.
+    async fn on_disk<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&Blobs) -> io::Result<T> + Send + 'static,
+    ) -> Result<T, Error> {
+        let inner = Arc::clone(&self.inner);
+        Ok(tokio::task::spawn_blocking(move || f(&inner.blobs))
+            .await
+            .expect("a storage task on the disk panicked")?)
     }
 
     /// Opens the current version of a file.
@@ -381,7 +571,7 @@ impl Storage {
     }
 
     async fn open_blob(&self, blob: Blob) -> Result<tokio::fs::File, Error> {
-        Ok(tokio::fs::File::open(self.inner.blobs.path(blob.hash)).await?)
+        self.open_contents(blob.hash).await
     }
 
     /// Every saved version of a file, newest first.
@@ -443,6 +633,7 @@ impl Storage {
                     )
                     .optional()?
                     .ok_or(Error::NotFound)?;
+                check_space(tx, item.owner, blob.size, None)?;
                 add_version(tx, id, blob)?;
                 item_or_missing(tx, id)
             })
@@ -553,8 +744,155 @@ impl Storage {
         Ok(item)
     }
 
-    /// Recreates the plain view from the database. Call it at startup, in
-    /// case the server stopped partway through a change.
+    /// Deletes an item in the trash for good, with everything inside it.
+    /// Its contents are removed a day later, unless something else uses
+    /// them.
+    pub async fn delete_forever(&self, id: ItemId) -> Result<(), Error> {
+        let _changes = self.inner.changes.lock().await;
+        self.inner
+            .db
+            .write(move |tx| {
+                let item = item(tx, id)?.ok_or(Error::NotFound)?;
+                if item.trashed_at.is_none() {
+                    return Err(Error::NotInTrash);
+                }
+                delete_subtree(tx, id)
+            })
+            .await
+    }
+
+    /// Deletes everything in `owner`'s trash for good.
+    pub async fn empty_trash(&self, owner: UserId) -> Result<(), Error> {
+        let _changes = self.inner.changes.lock().await;
+        self.inner
+            .db
+            .write(move |tx| {
+                let trashed: Vec<ItemId> = tx
+                    .prepare(
+                        "SELECT id FROM storage_items
+                         WHERE owner_id = ?1 AND trashed_at IS NOT NULL",
+                    )?
+                    .query_map([owner.as_uuid()], |row| Ok(ItemId::from_uuid(row.get(0)?)))?
+                    .collect::<Result<_, _>>()?;
+                for id in trashed {
+                    delete_subtree(tx, id)?;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// How much space `owner`'s files take, and their limit.
+    pub async fn usage(&self, owner: UserId) -> Result<Usage, Error> {
+        self.inner
+            .db
+            .read(move |conn| {
+                Ok(Usage {
+                    used: space_used(conn, owner)?,
+                    uploading: space_reserved(conn, owner, None)?,
+                    quota: quota(conn, owner)?,
+                })
+            })
+            .await
+    }
+
+    /// Limits how much space `owner`'s files can take, or lifts the limit
+    /// with `None`. A limit below what they already use stops new files and
+    /// versions, but keeps everything they have.
+    pub async fn set_quota(&self, owner: UserId, bytes: Option<u64>) -> Result<(), Error> {
+        self.inner
+            .identity
+            .user(owner)
+            .await?
+            .ok_or(Error::UserNotFound)?;
+        self.inner
+            .db
+            .write(move |tx| {
+                match bytes {
+                    Some(bytes) => tx.execute(
+                        "INSERT INTO storage_quotas (owner_id, bytes) VALUES (?1, ?2)
+                         ON CONFLICT (owner_id) DO UPDATE SET bytes = excluded.bytes",
+                        (owner.as_uuid(), to_sql_size(bytes)),
+                    )?,
+                    None => tx.execute(
+                        "DELETE FROM storage_quotas WHERE owner_id = ?1",
+                        [owner.as_uuid()],
+                    )?,
+                };
+                Ok(())
+            })
+            .await
+    }
+
+    /// Stores contents for a module's own use under `key`, such as a
+    /// thumbnail, replacing what was there. They stay until the module
+    /// releases `key`, and don't count toward anyone's quota.
+    pub async fn store(
+        &self,
+        module: &'static str,
+        key: &str,
+        contents: impl AsyncRead + Unpin,
+    ) -> Result<Blob, Error> {
+        let received = self.inner.blobs.receive(contents).await?;
+        let blob = received.blob;
+        let key = key.to_owned();
+        let result = async {
+            let _changes = self.inner.changes.lock().await;
+            let kept = self.keep(&received).await?;
+            self.inner
+                .db
+                .write(move |tx| {
+                    insert_blob(tx, blob, kept.stored)?;
+                    tx.execute(
+                        concat!(
+                            "INSERT INTO storage_blob_refs (module, key, blob, created_at)
+                             VALUES (?1, ?2, ?3, ",
+                            sql_now!(),
+                            ") ON CONFLICT (module, key) DO UPDATE
+                             SET blob = excluded.blob, created_at = excluded.created_at"
+                        ),
+                        (module, &key, &blob.hash.0[..]),
+                    )?;
+                    Ok::<_, Error>(())
+                })
+                .await?;
+            if kept.repaired {
+                self.show_repair().await;
+            }
+            Ok(())
+        }
+        .await;
+        let _ = tokio::fs::remove_file(&received.path).await;
+        result.map(|()| blob)
+    }
+
+    /// Lets go of what a module stored under `key`.
+    pub async fn release(&self, module: &'static str, key: &str) -> Result<(), Error> {
+        let key = key.to_owned();
+        self.inner
+            .db
+            .write(move |tx| {
+                tx.execute(
+                    "DELETE FROM storage_blob_refs WHERE module = ?1 AND key = ?2",
+                    (module, &key),
+                )?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// Opens stored contents by their hash, such as what [`Storage::store`]
+    /// returned.
+    pub async fn open_contents(&self, hash: ContentHash) -> Result<tokio::fs::File, Error> {
+        match tokio::fs::File::open(self.inner.blobs.path(hash)).await {
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Err(Error::NotFound),
+            other => Ok(other?),
+        }
+    }
+
+    /// Recreates the plain view from the database. [`Storage::maintain`]
+    /// does this when it starts, in case the server stopped partway through
+    /// a change.
     pub async fn rebuild_view(&self) -> Result<(), Error> {
         let _changes = self.inner.changes.lock().await;
         self.rebuild_view_locked().await
@@ -584,10 +922,16 @@ impl Storage {
             users.push((username, self.entries(top).await?));
         }
         let view = self.inner.view.clone();
-        tokio::task::spawn_blocking(move || view.rebuild(users))
+        self.inner
+            .status
+            .send_modify(|status| status.rebuilding_view = true);
+        let result = tokio::task::spawn_blocking(move || view.rebuild(users))
             .await
-            .expect("rebuilding the view panicked")?;
-        Ok(())
+            .expect("rebuilding the view panicked");
+        self.inner
+            .status
+            .send_modify(|status| status.rebuilding_view = false);
+        Ok(result?)
     }
 
     async fn username(&self, owner: UserId) -> Result<String, Error> {
@@ -655,6 +999,14 @@ impl Storage {
             None => Ok(None),
         }
     }
+}
+
+/// What [`Storage::keep`] did.
+struct Kept {
+    /// The contents weren't on disk, so they were written just now.
+    stored: bool,
+    /// They replaced a copy the integrity check found damaged.
+    repaired: bool,
 }
 
 enum Change {
@@ -806,17 +1158,118 @@ fn insert_item(
     Ok(())
 }
 
-fn insert_blob(conn: &Connection, blob: Blob) -> Result<(), Error> {
+/// Records stored contents. `stored` says they were written just now, which
+/// also repairs contents the integrity check found missing or changed.
+fn insert_blob(conn: &Connection, blob: Blob, stored: bool) -> Result<(), Error> {
     conn.execute(
         concat!(
-            "INSERT OR IGNORE INTO storage_blobs (hash, size, created_at) VALUES (?1, ?2, ",
+            "INSERT INTO storage_blobs (hash, size, created_at, checked_at)
+             VALUES (?1, ?2, ",
             sql_now!(),
-            ")"
+            ", ",
+            sql_now!(),
+            ") ON CONFLICT (hash) DO UPDATE SET
+                 unused_since = NULL,
+                 damage = CASE WHEN ?3 THEN NULL ELSE damage END,
+                 checked_at = CASE WHEN ?3 THEN excluded.checked_at ELSE checked_at END"
         ),
-        (
-            &blob.hash.0[..],
-            i64::try_from(blob.size).unwrap_or(i64::MAX),
-        ),
+        (&blob.hash.0[..], to_sql_size(blob.size), stored),
+    )?;
+    Ok(())
+}
+
+/// SQLite stores integers as `i64`. No file comes near the difference.
+fn to_sql_size(size: u64) -> i64 {
+    i64::try_from(size).unwrap_or(i64::MAX)
+}
+
+/// Checks that `name` in `parent` can take a new file or version of
+/// `size` bytes. Returns the folder, and the file already there if any.
+fn check_save(
+    conn: &Connection,
+    parent: ItemId,
+    name: &str,
+    size: u64,
+    upload: Option<UploadId>,
+) -> Result<(Item, Option<ItemId>), Error> {
+    let parent = writable_folder(conn, parent)?;
+    let existing = match child_named(conn, parent.id, name)? {
+        Some(existing) if existing.kind == ItemKind::Folder => return Err(Error::NameTaken),
+        existing => existing.map(|existing| existing.id),
+    };
+    if let Some(upload) = upload {
+        let owner = uploads::owner(conn, upload)?;
+        if owner != parent.owner {
+            return Err(Error::DifferentOwner);
+        }
+    }
+    check_space(conn, parent.owner, size, upload)?;
+    Ok((parent, existing))
+}
+
+/// Refuses `adding` more bytes for `owner` if it would go over their quota.
+/// Space set aside for `upload` is already part of `adding`.
+fn check_space(
+    conn: &Connection,
+    owner: UserId,
+    adding: u64,
+    upload: Option<UploadId>,
+) -> Result<(), Error> {
+    let Some(quota) = quota(conn, owner)? else {
+        return Ok(());
+    };
+    let used = space_used(conn, owner)? + space_reserved(conn, owner, upload)?;
+    if used.saturating_add(adding) > quota {
+        return Err(Error::QuotaFull);
+    }
+    Ok(())
+}
+
+fn quota(conn: &Connection, owner: UserId) -> Result<Option<u64>, Error> {
+    Ok(conn
+        .query_row(
+            "SELECT bytes FROM storage_quotas WHERE owner_id = ?1",
+            [owner.as_uuid()],
+            |row| size_from(row, 0),
+        )
+        .optional()?)
+}
+
+fn space_used(conn: &Connection, owner: UserId) -> Result<u64, Error> {
+    Ok(conn.query_row(
+        "SELECT coalesce(sum(b.size), 0) FROM storage_items i
+         JOIN storage_versions v ON v.item_id = i.id
+         JOIN storage_blobs b ON b.hash = v.blob
+         WHERE i.owner_id = ?1",
+        [owner.as_uuid()],
+        |row| size_from(row, 0),
+    )?)
+}
+
+/// Space set aside for `owner`'s uploads in progress, apart from `except`.
+fn space_reserved(
+    conn: &Connection,
+    owner: UserId,
+    except: Option<UploadId>,
+) -> Result<u64, Error> {
+    Ok(conn.query_row(
+        "SELECT coalesce(sum(size), 0) FROM storage_uploads
+         WHERE owner_id = ?1 AND id IS NOT ?2",
+        (owner.as_uuid(), except.map(|id| id.as_uuid())),
+        |row| size_from(row, 0),
+    )?)
+}
+
+/// Deletes an item, everything inside it, and all their versions.
+fn delete_subtree(conn: &Connection, id: ItemId) -> Result<(), Error> {
+    conn.execute(
+        "WITH RECURSIVE down (id) AS (
+             SELECT ?1
+             UNION ALL
+             SELECT i.id FROM storage_items i JOIN down ON i.parent_id = down.id
+         )
+         DELETE FROM storage_items WHERE id IN (SELECT id FROM down)",
+        [id.as_uuid()],
     )?;
     Ok(())
 }

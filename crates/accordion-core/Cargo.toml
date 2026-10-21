@@ -14,7 +14,7 @@ getrandom = "0.4.3"
 rusqlite = { version = "0.40.2", features = ["bundled", "uuid"] }
 sha2 = "0.11.1"
 thiserror = "2.0.21"
-tokio = { version = "1.53.3", features = ["fs", "io-util", "rt", "sync"] }
+tokio = { version = "1.53.3", features = ["fs", "io-util", "rt", "sync", "time"] }
 tracing = "0.1.44"
 uuid = "1.28.0"
 

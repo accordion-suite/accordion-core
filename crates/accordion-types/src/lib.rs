@@ -64,6 +64,11 @@ id_type!(
     VersionId
 );
 
+id_type!(
+    /// The ID of an upload that can resume after a dropped connection.
+    UploadId
+);
+
 /// What a user account is allowed to do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

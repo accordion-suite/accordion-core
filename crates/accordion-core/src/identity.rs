@@ -67,6 +67,11 @@ static MIGRATIONS: &[Migration] = &[
     },
 ];
 
+/// Names that can't be usernames. Storage's plain view keeps each user's
+/// files in a folder named after them, next to a `shared` folder for shared
+/// drives (decision 6).
+const RESERVED_USERNAMES: &[&str] = &["shared"];
+
 const MAX_USERNAME_LEN: usize = 32;
 const MAX_DISPLAY_NAME_LEN: usize = 100;
 
@@ -80,6 +85,9 @@ pub enum Error {
 
     #[error("That username is already taken. Try a different one.")]
     UsernameTaken,
+
+    #[error("That username is reserved for Accordion's own use. Try a different one.")]
+    UsernameReserved,
 
     #[error("Names can be up to {MAX_DISPLAY_NAME_LEN} characters and can't be blank.")]
     InvalidDisplayName,
@@ -178,9 +186,13 @@ impl Identity {
     }
 
     pub async fn create_user(&self, new: NewUser) -> Result<User, Error> {
+        let username = normalize_username(&new.username)?;
+        if RESERVED_USERNAMES.contains(&username.as_str()) {
+            return Err(Error::UsernameReserved);
+        }
         let user = User {
             id: UserId::generate(),
-            username: normalize_username(&new.username)?,
+            username,
             display_name: validate_display_name(&new.display_name)?,
             role: new.role,
         };
@@ -551,6 +563,16 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::UsernameTaken));
+    }
+
+    #[tokio::test]
+    async fn reserves_names_that_storage_uses() {
+        let (_dir, identity) = start().await;
+        let err = identity
+            .create_user(new_user("Shared", Role::User))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::UsernameReserved));
     }
 
     #[tokio::test]

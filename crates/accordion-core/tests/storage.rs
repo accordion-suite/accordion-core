@@ -1,0 +1,308 @@
+//! Stores files and folders, and checks the plain view on disk.
+
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+
+use accordion_core::db::Database;
+use accordion_core::identity::{Identity, NewUser};
+use accordion_core::storage::{Error, ItemKind, Storage};
+use accordion_types::{Role, UserId};
+use tokio::io::AsyncReadExt;
+
+struct Server {
+    dir: tempfile::TempDir,
+    storage: Storage,
+    identity: Identity,
+}
+
+impl Server {
+    fn view(&self) -> PathBuf {
+        self.dir.path().join("storage").join("files")
+    }
+
+    async fn user(&self, username: &str) -> UserId {
+        self.identity
+            .create_user(NewUser {
+                username: username.into(),
+                display_name: username.into(),
+                role: Role::User,
+                password: "correct horse".into(),
+            })
+            .await
+            .unwrap()
+            .id
+    }
+}
+
+async fn start() -> Server {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&dir.path().join("accordion.db")).unwrap();
+    let identity = Identity::new(db.clone()).await.unwrap();
+    let storage = Storage::open(db, identity.clone(), &dir.path().join("storage"))
+        .await
+        .unwrap();
+    Server {
+        dir,
+        storage,
+        identity,
+    }
+}
+
+async fn read(storage: &Storage, id: accordion_types::ItemId) -> String {
+    let mut text = String::new();
+    storage
+        .open_file(id)
+        .await
+        .unwrap()
+        .read_to_string(&mut text)
+        .await
+        .unwrap();
+    text
+}
+
+fn blob_count(dir: &Path) -> usize {
+    walk(&dir.join("storage").join("blobs"))
+}
+
+fn walk(dir: &Path) -> usize {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                walk(&entry.path())
+            } else {
+                1
+            }
+        })
+        .sum()
+}
+
+#[tokio::test]
+async fn stores_files_and_shows_them_by_name() {
+    let server = start().await;
+    let alex = server.user("alex").await;
+    let top = server.storage.top_folder(alex).await.unwrap();
+    assert_eq!(server.storage.top_folder(alex).await.unwrap(), top);
+
+    let documents = server
+        .storage
+        .create_folder(top, "Documents")
+        .await
+        .unwrap();
+    let report = server
+        .storage
+        .write_file(documents.id, "Report: 2026 ✓.txt", &b"hello"[..])
+        .await
+        .unwrap();
+    assert!(matches!(report.kind, ItemKind::File { blob, .. } if blob.size == 5));
+    assert_eq!(read(&server.storage, report.id).await, "hello");
+
+    let children = server.storage.children(documents.id).await.unwrap();
+    assert_eq!(children, std::slice::from_ref(&report));
+
+    let shown = server.view().join("alex/Documents/Report: 2026 ✓.txt");
+    assert_eq!(std::fs::read_to_string(&shown).unwrap(), "hello");
+}
+
+#[tokio::test]
+async fn stores_identical_contents_once() {
+    let server = start().await;
+    let alex = server.user("alex").await;
+    let top = server.storage.top_folder(alex).await.unwrap();
+    for name in ["a.txt", "b.txt"] {
+        server
+            .storage
+            .write_file(top, name, &b"same"[..])
+            .await
+            .unwrap();
+    }
+    assert_eq!(blob_count(server.dir.path()), 1);
+    // The stored contents and both names in the view are one file on disk.
+    let metadata = std::fs::metadata(server.view().join("alex/a.txt")).unwrap();
+    assert_eq!(metadata.nlink(), 3);
+}
+
+#[tokio::test]
+async fn keeps_every_version() {
+    let server = start().await;
+    let alex = server.user("alex").await;
+    let top = server.storage.top_folder(alex).await.unwrap();
+    let first = server
+        .storage
+        .write_file(top, "notes.md", &b"first"[..])
+        .await
+        .unwrap();
+    let second = server
+        .storage
+        .write_file(top, "notes.md", &b"second"[..])
+        .await
+        .unwrap();
+    assert_eq!(first.id, second.id);
+    assert_eq!(read(&server.storage, first.id).await, "second");
+
+    let versions = server.storage.versions(first.id).await.unwrap();
+    assert_eq!(
+        versions.iter().map(|v| v.number).collect::<Vec<_>>(),
+        [2, 1]
+    );
+    let mut old = String::new();
+    server
+        .storage
+        .open_version(first.id, versions[1].id)
+        .await
+        .unwrap()
+        .read_to_string(&mut old)
+        .await
+        .unwrap();
+    assert_eq!(old, "first");
+
+    server
+        .storage
+        .restore_version(first.id, versions[1].id)
+        .await
+        .unwrap();
+    assert_eq!(read(&server.storage, first.id).await, "first");
+    assert_eq!(server.storage.versions(first.id).await.unwrap().len(), 3);
+    let shown = server.view().join("alex/notes.md");
+    assert_eq!(std::fs::read_to_string(shown).unwrap(), "first");
+}
+
+#[tokio::test]
+async fn renames_and_moves() {
+    let server = start().await;
+    let alex = server.user("alex").await;
+    let top = server.storage.top_folder(alex).await.unwrap();
+    let photos = server.storage.create_folder(top, "Photos").await.unwrap();
+    let trip = server
+        .storage
+        .create_folder(photos.id, "Trip")
+        .await
+        .unwrap();
+    server
+        .storage
+        .write_file(trip.id, "beach.jpg", &b"jpeg"[..])
+        .await
+        .unwrap();
+    let other = server.storage.create_folder(top, "Archive").await.unwrap();
+
+    server
+        .storage
+        .move_item(trip.id, other.id, "Summer trip")
+        .await
+        .unwrap();
+    let view = server.view();
+    assert!(!view.join("alex/Photos/Trip").exists());
+    assert_eq!(
+        std::fs::read(view.join("alex/Archive/Summer trip/beach.jpg")).unwrap(),
+        b"jpeg"
+    );
+
+    let err = server
+        .storage
+        .move_item(other.id, other.id, "Archive")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::MoveIntoItself));
+    let summer = server.storage.children(other.id).await.unwrap()[0].id;
+    let err = server
+        .storage
+        .move_item(other.id, summer, "Archive")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::MoveIntoItself));
+    let err = server
+        .storage
+        .move_item(photos.id, top, "Archive")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::NameTaken));
+    let err = server
+        .storage
+        .move_item(top, top, "Mine")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::TopFolder));
+
+    let sam = server.user("sam").await;
+    let sams_top = server.storage.top_folder(sam).await.unwrap();
+    let err = server
+        .storage
+        .move_item(photos.id, sams_top, "Photos")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::DifferentOwner));
+}
+
+#[tokio::test]
+async fn deletes_to_the_trash_and_restores() {
+    let server = start().await;
+    let alex = server.user("alex").await;
+    let top = server.storage.top_folder(alex).await.unwrap();
+    let folder = server.storage.create_folder(top, "Taxes").await.unwrap();
+    server
+        .storage
+        .write_file(folder.id, "2025.pdf", &b"pdf"[..])
+        .await
+        .unwrap();
+
+    server.storage.delete(folder.id).await.unwrap();
+    assert!(!server.view().join("alex/Taxes").exists());
+    assert!(server.storage.children(top).await.unwrap().is_empty());
+    let trash = server.storage.trash(alex).await.unwrap();
+    assert_eq!(trash.len(), 1);
+    assert_eq!(trash[0].name, "Taxes");
+    let err = server
+        .storage
+        .write_file(folder.id, "2026.pdf", &b"pdf"[..])
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::InTrash));
+
+    // A new folder can take the deleted one's name, which then blocks the
+    // restore until one of them is renamed.
+    let replacement = server.storage.create_folder(top, "Taxes").await.unwrap();
+    let err = server.storage.restore(folder.id).await.unwrap_err();
+    assert!(matches!(err, Error::NameTaken));
+    server.storage.delete(replacement.id).await.unwrap();
+
+    server.storage.restore(folder.id).await.unwrap();
+    assert_eq!(
+        std::fs::read(server.view().join("alex/Taxes/2025.pdf")).unwrap(),
+        b"pdf"
+    );
+}
+
+#[tokio::test]
+async fn rebuilds_the_view_from_the_database() {
+    let server = start().await;
+    let alex = server.user("alex").await;
+    let top = server.storage.top_folder(alex).await.unwrap();
+    server
+        .storage
+        .write_file(top, "keep.txt", &b"keep"[..])
+        .await
+        .unwrap();
+    let view = server.view();
+    std::fs::remove_file(view.join("alex/keep.txt")).unwrap();
+    std::fs::write(view.join("alex/stray.txt"), b"stray").unwrap();
+
+    server.storage.rebuild_view().await.unwrap();
+    assert_eq!(std::fs::read(view.join("alex/keep.txt")).unwrap(), b"keep");
+    assert!(!view.join("alex/stray.txt").exists());
+}
+
+#[tokio::test]
+async fn refuses_names_the_view_cant_show() {
+    let server = start().await;
+    let alex = server.user("alex").await;
+    let top = server.storage.top_folder(alex).await.unwrap();
+    for name in ["", ".", "..", "a/b", "nul\0", &"x".repeat(256)] {
+        let err = server.storage.create_folder(top, name).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidName), "{name:?}");
+    }
+    // 255 bytes is fine, even when some characters take several bytes.
+    let long = format!("{}é", "x".repeat(253));
+    assert_eq!(long.len(), 255);
+    assert!(server.storage.create_folder(top, &long).await.is_ok());
+}

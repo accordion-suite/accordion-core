@@ -53,6 +53,17 @@ id_type!(
     SessionId
 );
 
+id_type!(
+    /// The ID of a file or folder in storage. It stays the same when the
+    /// item is renamed, moved, or changed, so sync clients can follow it.
+    ItemId
+);
+
+id_type!(
+    /// The ID of one saved version of a file.
+    VersionId
+);
+
 /// What a user account is allowed to do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

@@ -11,6 +11,7 @@ This repo is part of [Accordion](https://github.com/accordion-suite/accordion), 
 | `accordion-types` | Shared types and protocol definitions | Server, modules, and client apps |
 | `accordion-sync` | Sync engine for offline merging | Server, desktop app, and mobile apps |
 | `accordion-core` | Services that hold state: identity, search, jobs, and storage | Server and modules |
+| `accordion-module` | The interface between modules and the server: the `Module` trait, sign-in checks, and error responses | Server and modules |
 
 Modules use core only through these crates' public APIs and never read core's database tables directly. [Decision 1](https://github.com/accordion-suite/accordion/blob/main/docs/decisions/0001-where-core-services-run.md) explains why.
 

@@ -306,3 +306,40 @@ async fn refuses_names_the_view_cant_show() {
     assert_eq!(long.len(), 255);
     assert!(server.storage.create_folder(top, &long).await.is_ok());
 }
+
+#[tokio::test]
+async fn finds_items_by_path() {
+    let server = start().await;
+    let alex = server.user("alex").await;
+    let top = server.storage.top_folder(alex).await.unwrap();
+    let docs = server
+        .storage
+        .create_folder(top, "Documents")
+        .await
+        .unwrap();
+    let report = server
+        .storage
+        .write_file(docs.id, "report.pdf", &b"pdf"[..])
+        .await
+        .unwrap();
+    let find = |names: &[&str]| {
+        server
+            .storage
+            .find(top, names.iter().map(|&name| name.to_owned()).collect())
+    };
+
+    assert_eq!(find(&[]).await.unwrap().unwrap().id, top);
+    assert_eq!(find(&["Documents"]).await.unwrap().unwrap().id, docs.id);
+    let found = find(&["Documents", "report.pdf"]).await.unwrap().unwrap();
+    assert_eq!(found.id, report.id);
+    for missing in [
+        &["Photos"][..],
+        &["Documents", "report.pdf", "page 1"],
+        &["documents"],
+    ] {
+        assert_eq!(find(missing).await.unwrap(), None, "{missing:?}");
+    }
+
+    server.storage.delete(report.id).await.unwrap();
+    assert_eq!(find(&["Documents", "report.pdf"]).await.unwrap(), None);
+}

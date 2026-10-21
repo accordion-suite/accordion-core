@@ -387,6 +387,28 @@ impl Storage {
             .await
     }
 
+    /// Follows `names` down from `folder`, such as `["Documents",
+    /// "report.pdf"]`, skipping anything in the trash. Returns `None` if any
+    /// name along the way is missing, or names a file before the last one.
+    /// An empty list finds `folder` itself.
+    pub async fn find(&self, folder: ItemId, names: Vec<String>) -> Result<Option<Item>, Error> {
+        self.inner
+            .db
+            .read(move |conn| {
+                let mut found = item(conn, folder)?;
+                for name in &names {
+                    match found {
+                        Some(parent) if parent.kind == ItemKind::Folder => {
+                            found = child_named(conn, parent.id, name)?;
+                        }
+                        _ => return Ok(None),
+                    }
+                }
+                Ok(found)
+            })
+            .await
+    }
+
     /// What `owner` has deleted, newest first.
     pub async fn trash(&self, owner: UserId) -> Result<Vec<Item>, Error> {
         self.inner

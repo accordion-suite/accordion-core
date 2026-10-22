@@ -5,7 +5,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use accordion_core::backup::{Backup, CheckDepth, Error, RunKind};
+use accordion_core::backup::{Backup, CheckDepth, Error, KeyState, RunKind};
 use accordion_core::db::Database;
 use accordion_core::identity::{Identity, NewUser};
 use accordion_core::storage::Storage;
@@ -332,4 +332,120 @@ fn files_in(dir: &Path) -> Vec<PathBuf> {
         }
     }
     files
+}
+
+#[tokio::test]
+async fn reports_how_backups_are_doing() {
+    let server = start().await;
+    let status = server.backup.status();
+    assert_eq!(status.borrow().key, KeyState::None);
+    assert_eq!(status.borrow().hour, 3);
+
+    let key = server.backup.create_recovery_key().await.unwrap();
+    assert_eq!(status.borrow().key, KeyState::Unconfirmed);
+    server
+        .backup
+        .confirm_recovery_key(key.as_str())
+        .await
+        .unwrap();
+    assert_eq!(status.borrow().key, KeyState::Confirmed);
+
+    let target = server
+        .backup
+        .add_folder("USB disk", &server.usb())
+        .await
+        .unwrap();
+    {
+        let status = status.borrow();
+        assert_eq!(status.targets.len(), 1);
+        assert_eq!(status.targets[0].target, target);
+        assert_eq!(status.targets[0].last_backup, None);
+    }
+    server.backup.back_up().await.unwrap();
+    let status = status.borrow().clone();
+    assert!(!status.running);
+    let usb = &status.targets[0];
+    assert!(usb.last_backup.as_ref().unwrap().ok);
+    assert!(usb.last_good_backup.is_some());
+    assert!(usb.last_check.as_ref().unwrap().ok);
+    assert_eq!(usb.last_restore_test, None);
+
+    let err = server.backup.set_hour(24).await.unwrap_err();
+    assert!(matches!(err, Error::BadHour));
+    server.backup.set_hour(5).await.unwrap();
+    assert_eq!(server.backup.status().borrow().hour, 5);
+}
+
+#[tokio::test]
+async fn runs_weekly_and_monthly_work_when_its_due() {
+    let server = start().await;
+    server.backup.create_recovery_key().await.unwrap();
+    server
+        .backup
+        .add_folder("USB disk", &server.usb())
+        .await
+        .unwrap();
+
+    // The first night: a backup and its check, then the weekly check of
+    // the first eighth of the data, then the first restore test.
+    server.backup.nightly().await;
+    let mut kinds: Vec<RunKind> = server
+        .backup
+        .runs(10)
+        .await
+        .unwrap()
+        .iter()
+        .map(|run| run.kind)
+        .collect();
+    kinds.reverse();
+    assert_eq!(
+        kinds,
+        [
+            RunKind::Backup,
+            RunKind::Check,
+            RunKind::Check,
+            RunKind::RestoreTest
+        ]
+    );
+    assert!(
+        server
+            .backup
+            .runs(10)
+            .await
+            .unwrap()
+            .iter()
+            .all(|run| run.ok)
+    );
+
+    // The next night, only the backup and its check are due.
+    server.backup.nightly().await;
+    assert_eq!(server.backup.runs(10).await.unwrap().len(), 6);
+}
+
+#[tokio::test(start_paused = true)]
+async fn catches_up_on_a_missed_backup() {
+    let server = start().await;
+    server.backup.create_recovery_key().await.unwrap();
+    server
+        .backup
+        .add_folder("USB disk", &server.usb())
+        .await
+        .unwrap();
+    // The server was off at backup time, so one starts 10 minutes after it
+    // does, not at the next backup hour. Time is paused, so it jumps ahead
+    // to each timer.
+    let mut status = server.backup.status();
+    let backed_up = async move {
+        let _ = status
+            .wait_for(|status| status.targets[0].last_backup.is_some())
+            .await;
+    };
+    let started = tokio::time::Instant::now();
+    server.backup.clone().maintain(backed_up).await;
+    assert_eq!(started.elapsed().as_secs() / 60, 10);
+    assert!(
+        server.backup.status().borrow().targets[0]
+            .last_good_backup
+            .is_some()
+    );
 }

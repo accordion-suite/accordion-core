@@ -351,6 +351,9 @@ impl Backup {
         restic: PathBuf,
     ) -> Result<Self, Error> {
         db.migrate(OWNER, MIGRATIONS).await?;
+        // restic runs inside the data folder, so every path it's given must
+        // be a full path.
+        let data_dir = &std::fs::canonicalize(data_dir)?;
         let dir = data_dir.join("backup");
         for folder in [&dir, &dir.join("cache"), &dir.join("temp")] {
             std::fs::create_dir_all(folder)?;
@@ -723,9 +726,9 @@ impl Backup {
         let parent = tokio::fs::canonicalize(parent)
             .await
             .map_err(|_| Error::NoSuchFolder(parent.to_owned()))?;
-        let data_dir = tokio::fs::canonicalize(&self.inner.data_dir).await?;
+        let data_dir = &self.inner.data_dir;
         let path = parent.join(path.file_name().ok_or(Error::InsideData)?);
-        if path.starts_with(&data_dir) || data_dir.starts_with(&path) {
+        if path.starts_with(data_dir) || data_dir.starts_with(&path) {
             return Err(Error::InsideData);
         }
         let location = path

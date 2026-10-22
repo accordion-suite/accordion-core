@@ -177,7 +177,10 @@ async fn backs_up_everything_and_passes_a_restore_test() {
         .add_folder("USB disk", &server.usb())
         .await
         .unwrap();
-    assert_eq!(server.backup.targets().await.unwrap(), std::slice::from_ref(&target));
+    assert_eq!(
+        server.backup.targets().await.unwrap(),
+        std::slice::from_ref(&target)
+    );
 
     let runs = server.backup.back_up().await.unwrap();
     let kinds: Vec<(RunKind, bool)> = runs.iter().map(|run| (run.kind, run.ok)).collect();

@@ -75,6 +75,16 @@ id_type!(
     UploadId
 );
 
+id_type!(
+    /// The ID of a place backups go, such as a USB disk.
+    BackupTargetId
+);
+
+id_type!(
+    /// The ID of one backup, check, or restore test of one target.
+    BackupRunId
+);
+
 /// What a user account is allowed to do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

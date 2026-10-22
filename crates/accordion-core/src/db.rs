@@ -17,6 +17,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use rusqlite::backup::Backup;
 use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 use tokio::sync::oneshot;
 
@@ -54,6 +55,15 @@ const BUSY_TIMEOUT_MS: u32 = 5_000;
 pub enum Error {
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
+
+    #[error("Accordion couldn't copy the database: {0}")]
+    Copy(std::io::Error),
+
+    #[error(
+        "Accordion copied the database, but the copy failed SQLite's check \
+         (\"{0}\"). Check the disk for errors, then try again."
+    )]
+    CopyDamaged(String),
 
     #[error(
         "SQLite couldn't turn on write-ahead logging for the database (it reported \
@@ -211,6 +221,34 @@ impl Database {
         .await
     }
 
+    /// Copies the whole database into a new file at `path` with SQLite's
+    /// online backup API, for backups and before updates. Writes carry on
+    /// while it runs, and the copy holds every commit up to when it started.
+    pub async fn copy_to(&self, path: &Path) -> Result<(), Error> {
+        let path = path.to_owned();
+        run(&self.readers, move |conn| {
+            match std::fs::remove_file(&path) {
+                Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(Error::Copy(err));
+                }
+                _ => {}
+            }
+            let mut copy = Connection::open(&path)?;
+            // A single step copies every page inside one read transaction,
+            // so the copy is consistent. Smaller steps would start over each
+            // time a write commits.
+            let backup = Backup::new(conn, &mut copy)?;
+            backup.step(-1)?;
+            drop(backup);
+            let check: String = copy.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+            if check != "ok" {
+                return Err(Error::CopyDamaged(check));
+            }
+            Ok(())
+        })
+        .await
+    }
+
     /// Brings `owner`'s tables up to date by running any of `migrations` that
     /// haven't run yet.
     ///
@@ -343,6 +381,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(&dir.path().join("accordion.db")).unwrap();
         (dir, db)
+    }
+
+    #[tokio::test]
+    async fn copies_the_database_while_it_runs() {
+        let (dir, db) = open();
+        db.migrate("pets", PETS).await.unwrap();
+        db.write(|tx| tx.execute("INSERT INTO pets_pets (name) VALUES ('Rex')", []))
+            .await
+            .unwrap();
+        let path = dir.path().join("copy.db");
+        std::fs::write(&path, b"an older copy").unwrap();
+        db.copy_to(&path).await.unwrap();
+        // Writes after the copy don't reach it.
+        db.write(|tx| tx.execute("INSERT INTO pets_pets (name) VALUES ('Tom')", []))
+            .await
+            .unwrap();
+
+        let copy = Connection::open(&path).unwrap();
+        let names: Vec<String> = copy
+            .prepare("SELECT name FROM pets_pets")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(names, ["Rex"]);
     }
 
     #[tokio::test]

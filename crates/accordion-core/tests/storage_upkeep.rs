@@ -384,6 +384,32 @@ async fn removes_contents_a_day_after_nothing_uses_them() {
 }
 
 #[tokio::test]
+async fn keeps_contents_while_a_backup_holds_them() {
+    let server = start().await;
+    let storage = &server.storage;
+    let (_, top) = server.user("alex").await;
+    let gone = storage
+        .write_file(top, "gone.txt", &b"gone"[..])
+        .await
+        .unwrap();
+    storage.delete(gone.id).await.unwrap();
+    storage.delete_forever(gone.id).await.unwrap();
+    storage.clean_up().await.unwrap();
+    server
+        .sql(format!(
+            "UPDATE storage_blobs SET unused_since = {LONG_AGO} WHERE unused_since IS NOT NULL"
+        ))
+        .await;
+
+    let hold = storage.hold_contents().await;
+    assert_eq!(storage.clean_up().await.unwrap().contents, 0);
+    assert_eq!(server.blob_files(), 1);
+    drop(hold);
+    assert_eq!(storage.clean_up().await.unwrap().contents, 1);
+    assert_eq!(server.blob_files(), 0);
+}
+
+#[tokio::test]
 async fn keeps_what_modules_store_until_they_release_it() {
     let server = start().await;
     let storage = &server.storage;

@@ -29,6 +29,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use accordion_types::{ItemId, UploadId, UserId, VersionId};
 use rusqlite::{Connection, OptionalExtension, Row};
@@ -295,6 +296,23 @@ struct Inner {
     changes: tokio::sync::Mutex<()>,
     uploads: uploads::InProgress,
     status: watch::Sender<StorageStatus>,
+    /// How many [`ContentsHold`]s there are.
+    holds: AtomicUsize,
+}
+
+/// While one exists, upkeep doesn't remove stored contents, so a copy of the
+/// database taken after it was made only refers to contents that are still
+/// on disk. Backups hold one while they run. Dropping it lets upkeep carry
+/// on.
+#[must_use = "contents are only held until this is dropped"]
+pub struct ContentsHold {
+    inner: Arc<Inner>,
+}
+
+impl Drop for ContentsHold {
+    fn drop(&mut self) {
+        self.inner.holds.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Storage {
@@ -314,8 +332,27 @@ impl Storage {
                 changes: tokio::sync::Mutex::new(()),
                 uploads: uploads::InProgress::default(),
                 status: watch::Sender::new(StorageStatus::default()),
+                holds: AtomicUsize::new(0),
             }),
         })
+    }
+
+    /// Stops upkeep from removing stored contents until the hold is dropped.
+    pub async fn hold_contents(&self) -> ContentsHold {
+        // Taken under the lock, so a round of cleanup that's already removing
+        // contents finishes its batch first.
+        let _changes = self.inner.changes.lock().await;
+        self.inner.holds.fetch_add(1, Ordering::SeqCst);
+        ContentsHold {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+
+    /// Where stored contents are kept, relative to the storage folder, such
+    /// as `blobs/sha256/3f/9a/3f9a…`. Backups use it to find contents in a
+    /// restored copy.
+    pub fn contents_path(hash: ContentHash) -> PathBuf {
+        Path::new("blobs").join("sha256").join(blobs::shard(hash))
     }
 
     /// `owner`'s top folder, created the first time it's needed.
@@ -1280,6 +1317,22 @@ fn space_reserved(
         (owner.as_uuid(), except.map(|id| id.as_uuid())),
         |row| size_from(row, 0),
     )?)
+}
+
+/// Up to `count` stored contents chosen at random from the database `conn`,
+/// leaving out any the integrity check already found damaged. Restore tests
+/// use it on a database restored from a backup.
+pub(crate) fn sample_contents(conn: &Connection, count: usize) -> rusqlite::Result<Vec<Blob>> {
+    conn.prepare(
+        "SELECT hash, size FROM storage_blobs WHERE damage IS NULL ORDER BY random() LIMIT ?1",
+    )?
+    .query_map([i64::try_from(count).unwrap_or(i64::MAX)], |row| {
+        Ok(Blob {
+            hash: hash_from(row, 0)?,
+            size: size_from(row, 1)?,
+        })
+    })?
+    .collect()
 }
 
 /// Deletes an item, everything inside it, and all their versions.

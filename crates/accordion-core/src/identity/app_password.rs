@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 
 use super::session::{bad_value, clean_device_name, last_used_precision};
 use super::{Error, Identity, User, normalize_username, user_from_row};
-use crate::sql_now;
+use crate::{random, sql_now};
 
 /// 16 lowercase letters is about 75 bits, far more than anyone can guess
 /// through a server, and they can be typed on a phone without symbols.
@@ -60,11 +60,7 @@ impl AppPasswordSecret {
     /// reads better off a screen. Clients can send it with or without the
     /// spaces.
     pub fn grouped(&self) -> String {
-        let groups: Vec<&str> = (0..LEN)
-            .step_by(4)
-            .map(|start| &self.0[start..start + 4])
-            .collect();
-        groups.join(" ")
+        random::grouped(&self.0, 4)
     }
 }
 
@@ -261,36 +257,15 @@ impl Identity {
 }
 
 fn new_secret() -> (AppPasswordSecret, Vec<u8>) {
-    // 234 is the largest multiple of 26 that fits in a byte. Skipping bytes
-    // above it makes every letter equally likely.
-    const LIMIT: u8 = 234;
-    let mut letters = String::with_capacity(LEN);
-    let mut random = [0u8; 32];
-    while letters.len() < LEN {
-        getrandom::fill(&mut random).expect("the OS random number generator failed");
-        letters.extend(
-            random
-                .iter()
-                .filter(|&&byte| byte < LIMIT)
-                .map(|&byte| char::from(b'a' + byte % 26))
-                .take(LEN - letters.len()),
-        );
-    }
+    let letters = random::letters(LEN);
     let hash = hash_secret(&letters);
     (AppPasswordSecret(letters), hash)
 }
 
 /// Returns the hash to look up, or `None` if `input` can't be an app
-/// password. Spaces and hyphens are ignored, and so is case, because phone
-/// keyboards often capitalize the first letter.
+/// password.
 fn parse_secret(input: &str) -> Option<Vec<u8>> {
-    let letters: String = input
-        .chars()
-        .filter(|c| !matches!(c, ' ' | '-'))
-        .map(|c| c.to_ascii_lowercase())
-        .collect();
-    (letters.len() == LEN && letters.bytes().all(|b| b.is_ascii_lowercase()))
-        .then(|| hash_secret(&letters))
+    random::parse_letters(input, LEN).map(|letters| hash_secret(&letters))
 }
 
 fn hash_secret(letters: &str) -> Vec<u8> {

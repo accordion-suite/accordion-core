@@ -3,6 +3,7 @@
 //! all in the background.
 
 use std::collections::HashSet;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use rusqlite::params_from_iter;
@@ -265,6 +266,10 @@ impl Storage {
         }
         loop {
             let _changes = self.inner.changes.lock().await;
+            // A backup is copying what the database refers to.
+            if self.inner.holds.load(Ordering::SeqCst) > 0 {
+                break;
+            }
             let gone: Vec<Blob> = self
                 .inner
                 .db

@@ -112,8 +112,7 @@ impl Blobs {
 
     /// Where the contents with `hash` live, such as `blobs/sha256/3f/9a/3f9a…`.
     pub(crate) fn path(&self, hash: ContentHash) -> PathBuf {
-        let hex = hash.to_hex();
-        self.blobs.join(&hex[..2]).join(&hex[2..4]).join(hex)
+        self.blobs.join(shard(hash))
     }
 
     /// Where a resumable upload collects its contents.
@@ -230,6 +229,13 @@ impl Blobs {
         let intact = size == blob.size && ContentHash(hasher.finalize().into()) == blob.hash;
         Ok((!intact).then_some(Problem::Changed))
     }
+}
+
+/// Where contents live under `blobs/sha256/`, such as `3f/9a/3f9a…`. Two
+/// levels of folders keep each folder small.
+pub(crate) fn shard(hash: ContentHash) -> PathBuf {
+    let hex = hash.to_hex();
+    [&hex[..2], &hex[2..4], &hex].iter().collect()
 }
 
 fn folders_in(dir: &Path) -> io::Result<Vec<PathBuf>> {

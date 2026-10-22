@@ -16,6 +16,11 @@
 //! [`Backup::maintain`] runs the schedule: a backup every night, a weekly
 //! prune and check that reads an eighth of each repository's data, and a
 //! monthly restore test.
+//!
+//! Restoring to a fresh server happens in two parts. [`Backup::restore`]
+//! brings a snapshot back into `restore/` in the data folder while the server
+//! runs. Then the server starts again, and [`apply_restore`] moves the
+//! restored data into place before anything opens the database.
 
 mod restic;
 
@@ -122,6 +127,12 @@ const CATCH_UP: Duration = Duration::from_secs(10 * 60);
 /// box's hostname or data folder changes.
 const TAG: &str = "accordion";
 
+/// Where a restore waits in the data folder until the server starts again.
+const RESTORE_DIR: &str = "restore";
+/// Written once a restore is complete and checked. Without it, the restore
+/// stopped partway, and the next start deletes it.
+const RESTORE_READY: &str = "ready";
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
@@ -183,6 +194,36 @@ pub enum Error {
 
     #[error("Choose an hour from 0 to 23.")]
     BadHour,
+
+    #[error("A recovery key is 30 letters. Check what you wrote down, then try again.")]
+    BadKey,
+
+    #[error(
+        "The recovery key doesn't open the backup in {0}. Check what you wrote down, \
+         then try again."
+    )]
+    KeyDoesntOpen(String),
+
+    #[error(
+        "There are no Accordion backups in {0}. Check that it's the folder you chose \
+         when you set up backups."
+    )]
+    NoSnapshots(String),
+
+    #[error("Accordion couldn't find that backup. Choose one from the list.")]
+    NoSuchSnapshot,
+
+    #[error(
+        "The backup came back without Accordion's database, so it can't be \
+         restored. Choose an earlier backup."
+    )]
+    NoDatabase,
+
+    #[error(
+        "The database in the backup failed SQLite's check (\"{0}\"), so it can't be \
+         restored. Choose an earlier backup."
+    )]
+    DamagedDatabase(String),
 }
 
 /// The password that locks every backup. Shown to the owner in groups of
@@ -259,6 +300,16 @@ pub struct Run {
     pub bytes_added: Option<u64>,
     /// What went wrong, written for the admin.
     pub problem: Option<String>,
+}
+
+/// A backup in a location, for the owner to choose from when restoring.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Snapshot {
+    /// restic's ID for it.
+    pub id: String,
+    pub time: SystemTime,
+    /// How much it holds, before deduplication, if restic recorded it.
+    pub size: Option<u64>,
 }
 
 /// How much of the stored data a check reads back and verifies.
@@ -1010,6 +1061,157 @@ impl Backup {
         .expect("checking restored files panicked")
     }
 
+    /// The Accordion backups in the folder at `path`, newest first, if
+    /// `key` opens them. For restoring to a fresh server.
+    pub async fn find_snapshots(&self, path: &Path, key: &str) -> Result<Vec<Snapshot>, Error> {
+        let _busy = self.busy().await;
+        let (location, restic) = self.prepare_restore(path, key).await?;
+        let result = restic
+            .run(
+                &location,
+                None,
+                &args(["snapshots", "--json", "--tag", TAG]),
+            )
+            .await;
+        // Nothing is restored yet, so only the typed key is in there.
+        let _ = tokio::fs::remove_dir_all(self.restore_dir()).await;
+        let stdout = result.map_err(|failure| restore_failure(&failure, &location))?;
+        let mut snapshots = parse_snapshots(&stdout).ok_or_else(|| {
+            Error::Restic("restic listed the backups in a way Accordion didn't expect.".into())
+        })?;
+        if snapshots.is_empty() {
+            return Err(Error::NoSnapshots(location));
+        }
+        snapshots.sort_by_key(|snapshot| std::cmp::Reverse(snapshot.time));
+        Ok(snapshots)
+    }
+
+    /// Restores `snapshot` from the folder at `path` into `restore/` in the
+    /// data folder, and checks its database. `progress` hears how much is
+    /// done, from 0 to 1. The restored data waits there until the server
+    /// starts again, when [`apply_restore`] moves it into place. Returns the
+    /// folder holding it, such as for reading the server's restored name.
+    ///
+    /// Only the server's setup should call this, before there's anything to
+    /// lose: the restore replaces everything.
+    pub async fn restore(
+        &self,
+        path: &Path,
+        key: &str,
+        snapshot: &str,
+        progress: impl FnMut(f64) + Send,
+    ) -> Result<PathBuf, Error> {
+        // An ID from the list, so it can't be mistaken for one of restic's
+        // options.
+        if snapshot.len() < 8 || !snapshot.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(Error::NoSuchSnapshot);
+        }
+        let _busy = self.busy().await;
+        let (location, restic) = self.prepare_restore(path, key).await?;
+        let result = self
+            .restore_snapshot(&restic, &location, snapshot, progress)
+            .await;
+        if result.is_err() {
+            let _ = tokio::fs::remove_dir_all(self.restore_dir()).await;
+        }
+        result
+    }
+
+    async fn restore_snapshot(
+        &self,
+        restic: &Restic,
+        location: &str,
+        snapshot: &str,
+        mut progress: impl FnMut(f64) + Send,
+    ) -> Result<PathBuf, Error> {
+        let dir = self.restore_dir();
+        let place = dir.join("snapshot");
+        let mut command = args(["restore", snapshot, "--json", "--target"]);
+        command.push(place.clone().into());
+        restic
+            .run_streaming(location, None, &command, |line| {
+                if let Ok(status) = serde_json::from_str::<serde_json::Value>(line)
+                    && status["message_type"] == "status"
+                    && let Some(done) = status["percent_done"].as_f64()
+                {
+                    progress(done.clamp(0.0, 1.0));
+                }
+            })
+            .await
+            .map_err(|failure| match failure {
+                Failure::Failed { message, .. } if message.contains("no matching ID found") => {
+                    Error::NoSuchSnapshot
+                }
+                failure => restore_failure(&failure, location),
+            })?;
+
+        let database = place.join("backup").join("accordion.db");
+        tokio::task::spawn_blocking(move || {
+            if !database.is_file() {
+                return Err(Error::NoDatabase);
+            }
+            let conn = Connection::open(&database)?;
+            let check: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+            if check != "ok" {
+                return Err(Error::DamagedDatabase(check));
+            }
+            Ok(())
+        })
+        .await
+        .expect("checking the restored database panicked")?;
+
+        let ready = dir.join(RESTORE_READY);
+        tokio::task::spawn_blocking(move || std::fs::File::create(ready)?.sync_all())
+            .await
+            .expect("marking the restore ready panicked")?;
+        Ok(place)
+    }
+
+    fn restore_dir(&self) -> PathBuf {
+        self.inner.data_dir.join(RESTORE_DIR)
+    }
+
+    /// Checks the folder and key for a restore, and starts an empty
+    /// `restore/` holding the key, which restic reads it from. Returns the
+    /// folder's full path and a restic that uses that key.
+    async fn prepare_restore(&self, path: &Path, key: &str) -> Result<(String, Restic), Error> {
+        let letters = random::parse_letters(key, KEY_LEN).ok_or(Error::BadKey)?;
+        if !path.is_absolute() {
+            return Err(Error::NotAbsolute);
+        }
+        let location = tokio::fs::canonicalize(path)
+            .await
+            .map_err(|_| Error::NoSuchFolder(path.to_owned()))?
+            .to_str()
+            .ok_or(Error::Restic(
+                "Accordion can only use folders whose path is valid UTF-8.".into(),
+            ))?
+            .to_owned();
+        let dir = self.restore_dir();
+        let key_file = dir.join("recovery-key");
+        let path = key_file.clone();
+        tokio::task::spawn_blocking(move || {
+            ignore_missing(std::fs::remove_dir_all(&dir))?;
+            std::fs::create_dir(&dir)?;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)?;
+            file.write_all(letters.as_bytes())?;
+            file.sync_all()
+        })
+        .await
+        .expect("preparing the restore panicked")?;
+        let restic = Restic {
+            program: self.inner.restic.program.clone(),
+            key_file,
+            cache: self.inner.restic.cache.clone(),
+            temp: self.inner.restic.temp.clone(),
+        };
+        Ok((location, restic))
+    }
+
     /// The most recent runs, newest first.
     pub async fn runs(&self, limit: usize) -> Result<Vec<Run>, Error> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
@@ -1128,6 +1330,81 @@ fn describe(failure: &Failure, location: &str) -> String {
                 code.map_or_else(|| "stopped".to_owned(), |code| format!("exit code {code}"));
             format!("restic couldn't finish ({code}): {message}")
         }
+    }
+}
+
+/// What a restic failure means while restoring from `location`.
+fn restore_failure(failure: &Failure, location: &str) -> Error {
+    match failure {
+        Failure::WrongKey => Error::KeyDoesntOpen(location.to_owned()),
+        failure => Error::Restic(describe(failure, location)),
+    }
+}
+
+/// The snapshots in the output of `restic snapshots --json`.
+fn parse_snapshots(stdout: &str) -> Option<Vec<Snapshot>> {
+    let list: Vec<serde_json::Value> = serde_json::from_str(stdout.trim()).ok()?;
+    list.iter()
+        .map(|snapshot| {
+            let time: jiff::Timestamp = snapshot["time"].as_str()?.parse().ok()?;
+            Some(Snapshot {
+                id: snapshot["id"].as_str()?.to_owned(),
+                time: SystemTime::from(time),
+                size: snapshot["summary"]["total_bytes_processed"].as_u64(),
+            })
+        })
+        .collect()
+}
+
+/// Moves a finished restore into place: the database, stored contents, the
+/// gateway's settings, and the recovery key. Call it when the server starts,
+/// before anything opens the database. Returns whether there was one to
+/// move. A restore that stopped partway is deleted instead.
+pub fn apply_restore(data_dir: &Path) -> io::Result<bool> {
+    let dir = data_dir.join(RESTORE_DIR);
+    if !dir.exists() {
+        return Ok(false);
+    }
+    if !dir.join(RESTORE_READY).exists() {
+        std::fs::remove_dir_all(&dir)?;
+        return Ok(false);
+    }
+    // Each step moves something only if it's still waiting in `restore/`, so
+    // after a power cut partway through, the next start carries on.
+    let restored = dir.join("snapshot");
+    let database = restored.join("backup").join("accordion.db");
+    if database.exists() {
+        for name in ["accordion.db", "accordion.db-wal", "accordion.db-shm"] {
+            ignore_missing(std::fs::remove_file(data_dir.join(name)))?;
+        }
+        std::fs::rename(&database, data_dir.join("accordion.db"))?;
+    }
+    for folder in ["storage/blobs", "gateway"] {
+        let from = restored.join(folder);
+        if from.exists() {
+            let to = data_dir.join(folder);
+            ignore_missing(std::fs::remove_dir_all(&to))?;
+            if let Some(parent) = to.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::rename(&from, &to)?;
+        }
+    }
+    let key = dir.join("recovery-key");
+    if key.exists() {
+        let backup = data_dir.join("backup");
+        std::fs::create_dir_all(&backup)?;
+        std::fs::rename(&key, backup.join("recovery-key"))?;
+    }
+    std::fs::remove_dir_all(&dir)?;
+    Ok(true)
+}
+
+/// Treats removing something that isn't there as done.
+fn ignore_missing(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(err) if err.kind() != io::ErrorKind::NotFound => Err(err),
+        _ => Ok(()),
     }
 }
 

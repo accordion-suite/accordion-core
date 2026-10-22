@@ -4,8 +4,9 @@
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 
 /// How restic exits when the repository doesn't exist.
@@ -48,6 +49,54 @@ impl Restic {
         dir: Option<&Path>,
         args: &[OsString],
     ) -> Result<String, Failure> {
+        let output = self
+            .command(repository, dir, args)
+            .output()
+            .await
+            .map_err(Failure::Start)?;
+        if output.status.success() {
+            return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+        }
+        Err(failure(output.status, &output.stderr))
+    }
+
+    /// Like [`Restic::run`], but hands each line restic prints to `on_line`
+    /// as it arrives, such as progress during a long restore.
+    pub async fn run_streaming(
+        &self,
+        repository: &str,
+        dir: Option<&Path>,
+        args: &[OsString],
+        mut on_line: impl FnMut(&str),
+    ) -> Result<(), Failure> {
+        let mut command = self.command(repository, dir, args);
+        // About one progress line a second. Without a terminal, restic
+        // otherwise prints dozens.
+        command.env("RESTIC_PROGRESS_FPS", "1");
+        let mut child = command.spawn().map_err(Failure::Start)?;
+        let stdout = child.stdout.take().expect("restic's output is piped");
+        let mut stderr = child.stderr.take().expect("restic's errors are piped");
+        // Both are read at once, so neither pipe fills up and stalls restic.
+        let errors = async {
+            let mut errors = Vec::new();
+            let _ = stderr.read_to_end(&mut errors).await;
+            errors
+        };
+        let lines = async {
+            let mut lines = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                on_line(&line);
+            }
+        };
+        let (errors, ()) = tokio::join!(errors, lines);
+        let status = child.wait().await.map_err(Failure::Start)?;
+        if status.success() {
+            return Ok(());
+        }
+        Err(failure(status, &errors))
+    }
+
+    fn command(&self, repository: &str, dir: Option<&Path>, args: &[OsString]) -> Command {
         let mut command = Command::new(&self.program);
         // Only what restic needs, so nothing from the server's environment,
         // such as other credentials, reaches it.
@@ -71,22 +120,22 @@ impl Restic {
         if let Some(dir) = dir {
             command.current_dir(dir);
         }
-        let output = command.output().await.map_err(Failure::Start)?;
-        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-        if output.status.success() {
-            return Ok(stdout);
-        }
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        tracing::debug!(code = ?output.status.code(), %stderr, "restic failed");
-        Err(match output.status.code() {
-            Some(NO_REPOSITORY) => Failure::NoRepository,
-            Some(LOCKED) => Failure::Locked,
-            Some(WRONG_PASSWORD) => Failure::WrongKey,
-            code => Failure::Failed {
-                code,
-                message: last_lines(&stderr),
-            },
-        })
+        command
+    }
+}
+
+/// What a failed run means, from restic's exit code and error output.
+fn failure(status: ExitStatus, stderr: &[u8]) -> Failure {
+    let stderr = String::from_utf8_lossy(stderr);
+    tracing::debug!(code = ?status.code(), %stderr, "restic failed");
+    match status.code() {
+        Some(NO_REPOSITORY) => Failure::NoRepository,
+        Some(LOCKED) => Failure::Locked,
+        Some(WRONG_PASSWORD) => Failure::WrongKey,
+        code => Failure::Failed {
+            code,
+            message: last_lines(&stderr),
+        },
     }
 }
 

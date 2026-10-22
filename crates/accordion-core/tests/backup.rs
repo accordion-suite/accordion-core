@@ -5,7 +5,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use accordion_core::backup::{Backup, CheckDepth, Error, KeyState, RunKind};
+use accordion_core::backup::{self, Backup, CheckDepth, Error, KeyState, RunKind};
 use accordion_core::db::Database;
 use accordion_core::identity::{Identity, NewUser};
 use accordion_core::storage::Storage;
@@ -319,6 +319,144 @@ async fn uses_an_existing_backup_only_with_its_key() {
         .await
         .unwrap_err();
     assert!(matches!(err, Error::WrongKey(_)));
+}
+
+#[tokio::test]
+async fn restores_everything_to_a_new_server() {
+    let server = start().await;
+    std::fs::create_dir(server.data.path().join("gateway")).unwrap();
+    std::fs::write(server.data.path().join("gateway/settings.json"), "{}").unwrap();
+    let key = server.backup.create_recovery_key().await.unwrap();
+    server
+        .backup
+        .add_folder("USB disk", &server.usb())
+        .await
+        .unwrap();
+    server.backup.back_up().await.unwrap();
+
+    // A fresh server, whose data folder holds an empty database and nothing
+    // else worth keeping. Its services use their own folder, because a
+    // database must be closed before a restore replaces it, and the server
+    // does that by starting again.
+    let data = tempfile::tempdir().unwrap();
+    let services = tempfile::tempdir().unwrap();
+    let db = Database::open(&services.path().join("accordion.db")).unwrap();
+    let identity = Identity::new(db.clone()).await.unwrap();
+    let storage = Storage::open(db.clone(), identity, &services.path().join("storage"))
+        .await
+        .unwrap();
+    let fresh = Backup::open(db, storage, data.path(), restic())
+        .await
+        .unwrap();
+    for (path, contents) in [
+        ("accordion.db", "empty"),
+        ("accordion.db-wal", "empty"),
+        ("storage/blobs/leftover", "old"),
+        ("gateway/settings.json", "old"),
+    ] {
+        let path = data.path().join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    let usb = server.usb();
+    let err = fresh.find_snapshots(&usb, "abcde").await.unwrap_err();
+    assert!(matches!(err, Error::BadKey));
+    let wrong = "abcde fghij klmno pqrst uvwxy zabcd";
+    let err = fresh.find_snapshots(&usb, wrong).await.unwrap_err();
+    assert!(matches!(err, Error::KeyDoesntOpen(_)), "{err}");
+    let err = fresh
+        .find_snapshots(&server.disk.path().join("missing"), key.as_str())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::NoSuchFolder(_)));
+    let err = fresh
+        .find_snapshots(server.disk.path(), key.as_str())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("There's no backup in"), "{err}");
+
+    // The key is accepted however it's typed.
+    let snapshots = fresh
+        .find_snapshots(&usb, &key.grouped().to_uppercase())
+        .await
+        .unwrap();
+    assert_eq!(snapshots.len(), 1);
+    assert!(snapshots[0].size.unwrap() > 0);
+    // Listing leaves nothing behind, including the typed key.
+    assert!(!data.path().join("restore").exists());
+
+    let err = fresh
+        .restore(&usb, key.as_str(), "--help", |_| {})
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::NoSuchSnapshot));
+    let err = fresh
+        .restore(&usb, key.as_str(), "0123456789abcdef", |_| {})
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::NoSuchSnapshot), "{err}");
+    assert!(!data.path().join("restore").exists());
+
+    let restored = fresh
+        .restore(&usb, key.as_str(), &snapshots[0].id, |done| {
+            assert!((0.0..=1.0).contains(&done));
+        })
+        .await
+        .unwrap();
+    assert!(restored.join("gateway/settings.json").is_file());
+    drop(fresh);
+
+    assert!(backup::apply_restore(data.path()).unwrap());
+    assert!(!data.path().join("restore").exists());
+    assert!(!data.path().join("accordion.db-wal").exists());
+    assert!(!data.path().join("storage/blobs/leftover").exists());
+    let read = |path: &str| std::fs::read_to_string(data.path().join(path)).unwrap();
+    assert_eq!(read("gateway/settings.json"), "{}");
+    assert_eq!(read("backup/recovery-key"), key.as_str());
+
+    // The restored server has the same people and files.
+    let db = Database::open(&data.path().join("accordion.db")).unwrap();
+    let identity = Identity::new(db.clone()).await.unwrap();
+    let alex = identity.user_by_username("alex").await.unwrap().unwrap();
+    let storage = Storage::open(db, identity, &data.path().join("storage"))
+        .await
+        .unwrap();
+    let top = storage.top_folder(alex.id).await.unwrap();
+    let notes = storage
+        .find(top, vec!["notes.md".into()])
+        .await
+        .unwrap()
+        .unwrap();
+    let mut contents = String::new();
+    tokio::io::AsyncReadExt::read_to_string(
+        &mut storage.open_file(notes.id).await.unwrap(),
+        &mut contents,
+    )
+    .await
+    .unwrap();
+    assert_eq!(contents, "shopping list");
+
+    // Nothing more to move the next time the server starts.
+    assert!(!backup::apply_restore(data.path()).unwrap());
+}
+
+#[test]
+fn deletes_a_restore_that_stopped_partway() {
+    let data = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(data.path().join("restore/snapshot/backup")).unwrap();
+    std::fs::write(
+        data.path().join("restore/snapshot/backup/accordion.db"),
+        "half",
+    )
+    .unwrap();
+    std::fs::write(data.path().join("accordion.db"), "current").unwrap();
+    assert!(!backup::apply_restore(data.path()).unwrap());
+    assert!(!data.path().join("restore").exists());
+    assert_eq!(
+        std::fs::read_to_string(data.path().join("accordion.db")).unwrap(),
+        "current"
+    );
 }
 
 fn files_in(dir: &Path) -> Vec<PathBuf> {

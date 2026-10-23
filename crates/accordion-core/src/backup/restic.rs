@@ -19,6 +19,34 @@ const WRONG_PASSWORD: i32 = 12;
 /// The lines of restic's error output kept for a problem's description.
 const PROBLEM_LINES: usize = 3;
 
+/// What restic prints before it tries a failed request to a repository
+/// again, followed by the error.
+const RETRYING: &str = " returned error, retrying after ";
+
+/// A repository restic opens: where it is and, for a bucket, its keys.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct Repository {
+    /// In restic's form, such as `/media/usb/backups` or
+    /// `s3:https://s3.example.com/backups`.
+    pub location: String,
+    pub keys: Option<Keys>,
+}
+
+/// The access key for an S3 bucket.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct Keys {
+    pub id: String,
+    pub secret: String,
+}
+
+impl std::fmt::Debug for Keys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Keys")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
 pub(super) struct Restic {
     pub program: PathBuf,
     pub key_file: PathBuf,
@@ -33,6 +61,9 @@ pub(super) enum Failure {
     NoRepository,
     Locked,
     WrongKey,
+    /// A request to the repository failed, and restic was stopped before it
+    /// tried again. Holds the error restic gave.
+    Retrying(String),
     /// Anything else, with restic's last lines of error output.
     Failed {
         code: Option<i32>,
@@ -41,11 +72,12 @@ pub(super) enum Failure {
 }
 
 impl Restic {
-    /// Runs restic on the repository at `repository`, in `dir` if given, and
-    /// returns what it printed.
+    /// Runs restic on `repository`, in `dir` if given, and returns what it
+    /// printed. restic tries failed requests again for several minutes, which
+    /// rides out a network blip during a nightly backup.
     pub async fn run(
         &self,
-        repository: &str,
+        repository: &Repository,
         dir: Option<&Path>,
         args: &[OsString],
     ) -> Result<String, Failure> {
@@ -60,11 +92,61 @@ impl Restic {
         Err(failure(output.status, &output.stderr))
     }
 
+    /// Like [`Restic::run`], but stops restic the first time a request
+    /// fails. For setting up and finding backups while someone waits, where
+    /// a mistyped key or bucket should get an answer right away.
+    pub async fn run_once(
+        &self,
+        repository: &Repository,
+        dir: Option<&Path>,
+        args: &[OsString],
+    ) -> Result<String, Failure> {
+        let mut child = self
+            .command(repository, dir, args)
+            .spawn()
+            .map_err(Failure::Start)?;
+        let mut stdout = child.stdout.take().expect("restic's output is piped");
+        let stderr = child.stderr.take().expect("restic's errors are piped");
+        let output = async {
+            let mut output = Vec::new();
+            let _ = stdout.read_to_end(&mut output).await;
+            output
+        };
+        let errors = async {
+            let mut errors = String::new();
+            let mut retrying = None;
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if retrying.is_none()
+                    && let Some((_, rest)) = line.split_once(RETRYING)
+                {
+                    // After the wait, such as "1.2s: Access Denied."
+                    let problem = rest.split_once(": ").map_or(rest, |(_, problem)| problem);
+                    retrying = Some(problem.trim().to_owned());
+                    let _ = child.start_kill();
+                }
+                errors.push_str(&line);
+                errors.push('\n');
+            }
+            (errors, retrying)
+        };
+        let (output, (errors, retrying)) = tokio::join!(output, errors);
+        let status = child.wait().await.map_err(Failure::Start)?;
+        if let Some(problem) = retrying {
+            tracing::debug!(%errors, "stopped restic at its first retry");
+            return Err(Failure::Retrying(problem));
+        }
+        if status.success() {
+            return Ok(String::from_utf8_lossy(&output).into_owned());
+        }
+        Err(failure(status, errors.as_bytes()))
+    }
+
     /// Like [`Restic::run`], but hands each line restic prints to `on_line`
     /// as it arrives, such as progress during a long restore.
     pub async fn run_streaming(
         &self,
-        repository: &str,
+        repository: &Repository,
         dir: Option<&Path>,
         args: &[OsString],
         mut on_line: impl FnMut(&str),
@@ -96,7 +178,7 @@ impl Restic {
         Err(failure(status, &errors))
     }
 
-    fn command(&self, repository: &str, dir: Option<&Path>, args: &[OsString]) -> Command {
+    fn command(&self, repository: &Repository, dir: Option<&Path>, args: &[OsString]) -> Command {
         let mut command = Command::new(&self.program);
         // Only what restic needs, so nothing from the server's environment,
         // such as other credentials, reaches it.
@@ -104,8 +186,13 @@ impl Restic {
         if let Some(path) = std::env::var_os("PATH") {
             command.env("PATH", path);
         }
+        if let Some(keys) = &repository.keys {
+            command
+                .env("AWS_ACCESS_KEY_ID", &keys.id)
+                .env("AWS_SECRET_ACCESS_KEY", &keys.secret);
+        }
         command
-            .env("RESTIC_REPOSITORY", repository)
+            .env("RESTIC_REPOSITORY", &repository.location)
             .env("RESTIC_PASSWORD_FILE", &self.key_file)
             .env("RESTIC_CACHE_DIR", &self.cache)
             // Packs wait here before upload. /tmp is often a small RAM disk.

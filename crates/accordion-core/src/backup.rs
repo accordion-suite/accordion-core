@@ -8,6 +8,11 @@
 //! restic runs as a separate process, so a problem in a backup can't stop
 //! the server.
 //!
+//! A target is a folder, such as one on a USB disk, or an S3 bucket at a
+//! storage provider. A bucket's access key is kept in the database, so a
+//! restored server goes on backing up to it. It's read only when restic
+//! runs, so it never reaches the status that pages show.
+//!
 //! Every repository is locked with the recovery key. The owner keeps a copy
 //! of it off the box, and `backup/recovery-key` in the data folder keeps
 //! another, so backups run unattended. `backup/` also holds restic's cache,
@@ -41,7 +46,7 @@ use tokio::sync::{Mutex, MutexGuard, Notify, watch};
 use crate::db::{self, Database, Migration};
 use crate::storage::{Blob, ContentHash, Storage};
 use crate::{random, sql_now, time};
-use restic::{Failure, Restic};
+use restic::{Failure, Keys, Repository, Restic};
 
 const OWNER: &str = "backup";
 
@@ -98,6 +103,51 @@ static MIGRATIONS: &[Migration] = &[
         -- Which eighth of the target's data the next weekly check reads.
         ALTER TABLE backup_targets ADD COLUMN next_part INTEGER NOT NULL DEFAULT 1
             CHECK (next_part BETWEEN 1 AND 8);
+    ",
+    },
+    Migration {
+        version: 3,
+        name: "Add S3 buckets as targets",
+        // SQLite can't change a CHECK constraint in place, so both tables are
+        // rebuilt. Runs are copied first, so dropping the old targets can't
+        // delete them.
+        sql: "
+        CREATE TABLE backup_targets_new (
+            id BLOB PRIMARY KEY CHECK (length(id) = 16),
+            name TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK (kind IN ('folder', 's3')),
+            -- In restic's form: a folder's path, or s3:https://host/bucket.
+            location TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            pruned_at TEXT,
+            next_part INTEGER NOT NULL DEFAULT 1 CHECK (next_part BETWEEN 1 AND 8),
+            -- A bucket's access key. Folders don't have one.
+            access_key_id TEXT,
+            secret_access_key TEXT,
+            CHECK ((kind = 's3') = (access_key_id IS NOT NULL AND secret_access_key IS NOT NULL))
+        ) STRICT, WITHOUT ROWID;
+        INSERT INTO backup_targets_new (id, name, kind, location, created_at, pruned_at, next_part)
+            SELECT id, name, kind, location, created_at, pruned_at, next_part FROM backup_targets;
+
+        CREATE TABLE backup_runs_new (
+            id BLOB PRIMARY KEY CHECK (length(id) = 16),
+            target_id BLOB NOT NULL REFERENCES backup_targets_new (id) ON DELETE CASCADE,
+            kind TEXT NOT NULL CHECK (kind IN ('backup', 'check', 'restore_test')),
+            started_at TEXT NOT NULL,
+            finished_at TEXT NOT NULL,
+            ok INTEGER NOT NULL CHECK (ok IN (0, 1)),
+            snapshot TEXT,
+            bytes_added INTEGER CHECK (bytes_added >= 0),
+            problem TEXT
+        ) STRICT, WITHOUT ROWID;
+        INSERT INTO backup_runs_new SELECT * FROM backup_runs;
+
+        DROP TABLE backup_runs;
+        DROP TABLE backup_targets;
+        -- Renaming also updates the runs' reference to the targets.
+        ALTER TABLE backup_targets_new RENAME TO backup_targets;
+        ALTER TABLE backup_runs_new RENAME TO backup_runs;
+        CREATE INDEX backup_runs_latest ON backup_runs (target_id, kind, finished_at);
     ",
     },
 ];
@@ -179,9 +229,42 @@ pub enum Error {
 
     #[error(
         "There's already a backup in {0}, locked with a different recovery key. \
-         Choose another folder."
+         Choose another folder or bucket."
     )]
     WrongKey(String),
+
+    #[error(
+        "Enter the S3 address from your storage provider, starting with https://, \
+         such as https://s3.us-west-004.backblazeb2.com."
+    )]
+    BadEndpoint,
+
+    #[error(
+        "Bucket names are 3 to 63 lowercase letters, numbers, periods, and hyphens. \
+         Check the name your storage provider shows."
+    )]
+    BadBucket,
+
+    #[error("Enter the key ID and the secret key from your storage provider.")]
+    NoKeys,
+
+    #[error(
+        "{0} didn't accept the key ID and secret key. Check them, and check that the \
+         key is allowed to read and write the bucket."
+    )]
+    KeysRefused(String),
+
+    #[error(
+        "There's no bucket named {bucket} at {host}. Check the name, or create the \
+         bucket at your storage provider first."
+    )]
+    NoBucket { bucket: String, host: String },
+
+    #[error(
+        "Accordion couldn't reach {host} ({problem}). Check the address, and that the \
+         server is connected to the internet, then try again."
+    )]
+    Unreachable { host: String, problem: String },
 
     #[error("That backup location is already set up.")]
     TargetExists,
@@ -205,8 +288,8 @@ pub enum Error {
     KeyDoesntOpen(String),
 
     #[error(
-        "There are no Accordion backups in {0}. Check that it's the folder you chose \
-         when you set up backups."
+        "There are no Accordion backups in {0}. Check that it's the folder or bucket \
+         you chose when you set up backups."
     )]
     NoSnapshots(String),
 
@@ -254,9 +337,64 @@ impl fmt::Debug for RecoveryKey {
 pub struct Target {
     pub id: BackupTargetId,
     pub name: String,
-    /// A folder path, for a folder target.
+    pub kind: TargetKind,
+    /// In restic's form: a folder's path, or `s3:https://host/bucket`.
     pub location: String,
     pub created_at: String,
+}
+
+impl Target {
+    /// The host and bucket name, for a bucket.
+    pub fn bucket(&self) -> Option<(&str, &str)> {
+        match self.kind {
+            TargetKind::S3 => bucket_parts(&self.location),
+            TargetKind::Folder => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetKind {
+    Folder,
+    S3,
+}
+
+impl TargetKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Folder => "folder",
+            Self::S3 => "s3",
+        }
+    }
+}
+
+/// Where backups go, or where to restore from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Place {
+    /// A folder's full path, such as one on a USB disk.
+    Folder(PathBuf),
+    S3(S3Bucket),
+}
+
+/// An S3 bucket at a storage provider, as the owner types it in.
+#[derive(Clone, PartialEq, Eq)]
+pub struct S3Bucket {
+    /// The provider's S3 address, such as
+    /// `https://s3.us-west-004.backblazeb2.com`.
+    pub endpoint: String,
+    pub bucket: String,
+    pub key_id: String,
+    pub secret_key: String,
+}
+
+impl fmt::Debug for S3Bucket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("S3Bucket")
+            .field("endpoint", &self.endpoint)
+            .field("bucket", &self.bucket)
+            .field("key_id", &self.key_id)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -464,7 +602,9 @@ impl Backup {
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )?;
                 let targets: Vec<Target> = conn
-                    .prepare(&format!("{TARGET_SELECT} ORDER BY created_at, id"))?
+                    .prepare(&format!(
+                        "SELECT {TARGET_COLUMNS} FROM backup_targets t ORDER BY t.created_at, t.id"
+                    ))?
                     .query_map([], target_from_row)?
                     .collect::<Result<_, _>>()?;
                 let mut statuses = Vec::with_capacity(targets.len());
@@ -624,23 +764,22 @@ impl Backup {
             .inner
             .db
             .read(|conn| {
-                conn.prepare(concat!(
-                    "SELECT t.id, t.name, t.location, t.created_at,
-                            CASE WHEN t.pruned_at IS NULL OR t.pruned_at < ",
-                    sql_now!("-7 days"),
-                    " THEN t.next_part END,
+                conn.prepare(&format!(
+                    "SELECT {TARGET_COLUMNS},
+                            CASE WHEN t.pruned_at IS NULL OR t.pruned_at < {week_ago}
+                                 THEN t.next_part END,
                             NOT EXISTS (SELECT 1 FROM backup_runs r
                                         WHERE r.target_id = t.id AND r.kind = 'restore_test'
-                                          AND r.finished_at > ",
-                    sql_now!("-30 days"),
-                    ")
+                                          AND r.finished_at > {month_ago})
                      FROM backup_targets t
                      WHERE EXISTS (SELECT 1 FROM backup_runs r
                                    WHERE r.target_id = t.id AND r.kind = 'backup' AND r.ok = 1)
-                     ORDER BY t.created_at, t.id"
+                     ORDER BY t.created_at, t.id",
+                    week_ago = sql_now!("-7 days"),
+                    month_ago = sql_now!("-30 days"),
                 ))?
                 .query_map([], |row| {
-                    Ok((target_from_row(row)?, row.get(4)?, row.get(5)?))
+                    Ok((target_from_row(row)?, row.get(5)?, row.get(6)?))
                 })?
                 .collect::<Result<_, _>>()
             })
@@ -759,19 +898,83 @@ impl Backup {
             .await?)
     }
 
-    /// Adds a folder, such as one on a USB disk, as a place for backups.
-    /// Sets up a new repository there, or uses the one already there if the
-    /// recovery key opens it.
-    pub async fn add_folder(&self, name: &str, path: &Path) -> Result<Target, Error> {
+    /// Adds a place for backups: a folder, such as one on a USB disk, or an
+    /// S3 bucket. Sets up a new repository there, or uses the one already
+    /// there if the recovery key opens it.
+    pub async fn add_target(&self, name: &str, place: &Place) -> Result<Target, Error> {
         let name = name.trim().to_owned();
         if name.is_empty() || name.chars().count() > 100 {
             return Err(Error::BadName);
         }
-        if !path.is_absolute() {
-            return Err(Error::NotAbsolute);
-        }
+        let (kind, repository) = match place {
+            Place::Folder(path) => (TargetKind::Folder, self.new_folder(path).await?),
+            Place::S3(bucket) => (TargetKind::S3, s3_repository(bucket)?),
+        };
         if self.recovery_key().await?.is_none() {
             return Err(Error::NoRecoveryKey);
+        }
+
+        let _busy = self.busy().await;
+        let restic = &self.inner.restic;
+        match restic
+            .run_once(&repository, None, &args(["cat", "config"]))
+            .await
+        {
+            Ok(_) => {}
+            Err(Failure::NoRepository) => {
+                restic
+                    .run_once(&repository, None, &args(["init", "--json"]))
+                    .await
+                    .map_err(|failure| setup_failure(&failure, &repository))?;
+            }
+            Err(Failure::WrongKey) => return Err(Error::WrongKey(place_name(&repository))),
+            Err(failure) => return Err(setup_failure(&failure, &repository)),
+        }
+
+        let id = BackupTargetId::generate();
+        let target = self
+            .inner
+            .db
+            .write(move |tx| {
+                let taken: bool = tx.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM backup_targets WHERE location = ?1)",
+                    [&repository.location],
+                    |row| row.get(0),
+                )?;
+                if taken {
+                    return Err(Error::TargetExists);
+                }
+                let keys = repository.keys.as_ref();
+                tx.execute(
+                    concat!(
+                        "INSERT INTO backup_targets (id, name, kind, location, created_at,
+                                                     access_key_id, secret_access_key)
+                         VALUES (?1, ?2, ?3, ?4, ",
+                        sql_now!(),
+                        ", ?5, ?6)"
+                    ),
+                    (
+                        id.as_uuid(),
+                        &name,
+                        kind.as_str(),
+                        &repository.location,
+                        keys.map(|keys| &keys.id),
+                        keys.map(|keys| &keys.secret),
+                    ),
+                )?;
+                target(tx, id)?.ok_or(Error::NotFound)
+            })
+            .await?;
+        self.refresh().await?;
+        Ok(target)
+    }
+
+    /// Checks a folder for new backups: a full path, on another disk than
+    /// the data folder, in a folder that exists. The folder itself can be
+    /// new.
+    async fn new_folder(&self, path: &Path) -> Result<Repository, Error> {
+        if !path.is_absolute() {
+            return Err(Error::NotAbsolute);
         }
         let parent = path.parent().ok_or(Error::InsideData)?;
         let parent = tokio::fs::canonicalize(parent)
@@ -782,54 +985,7 @@ impl Backup {
         if path.starts_with(data_dir) || data_dir.starts_with(&path) {
             return Err(Error::InsideData);
         }
-        let location = path
-            .to_str()
-            .ok_or(Error::Restic(
-                "Accordion can only use folders whose path is valid UTF-8.".into(),
-            ))?
-            .to_owned();
-
-        let _busy = self.busy().await;
-        let restic = &self.inner.restic;
-        match restic.run(&location, None, &args(["cat", "config"])).await {
-            Ok(_) => {}
-            Err(Failure::NoRepository) => {
-                restic
-                    .run(&location, None, &args(["init", "--json"]))
-                    .await
-                    .map_err(|failure| Error::Restic(describe(&failure, &location)))?;
-            }
-            Err(Failure::WrongKey) => return Err(Error::WrongKey(location)),
-            Err(failure) => return Err(Error::Restic(describe(&failure, &location))),
-        }
-
-        let id = BackupTargetId::generate();
-        let target = self
-            .inner
-            .db
-            .write(move |tx| {
-                let taken: bool = tx.query_row(
-                    "SELECT EXISTS (SELECT 1 FROM backup_targets WHERE location = ?1)",
-                    [&location],
-                    |row| row.get(0),
-                )?;
-                if taken {
-                    return Err(Error::TargetExists);
-                }
-                tx.execute(
-                    concat!(
-                        "INSERT INTO backup_targets (id, name, kind, location, created_at)
-                         VALUES (?1, ?2, 'folder', ?3, ",
-                        sql_now!(),
-                        ")"
-                    ),
-                    (id.as_uuid(), &name, &location),
-                )?;
-                target(tx, id)?.ok_or(Error::NotFound)
-            })
-            .await?;
-        self.refresh().await?;
-        Ok(target)
+        folder_repository(&path)
     }
 
     /// Every place backups go, oldest first.
@@ -838,9 +994,11 @@ impl Backup {
             .inner
             .db
             .read(|conn| {
-                conn.prepare(&format!("{TARGET_SELECT} ORDER BY created_at, id"))?
-                    .query_map([], target_from_row)?
-                    .collect::<Result<_, _>>()
+                conn.prepare(&format!(
+                    "SELECT {TARGET_COLUMNS} FROM backup_targets t ORDER BY t.created_at, t.id"
+                ))?
+                .query_map([], target_from_row)?
+                .collect::<Result<_, _>>()
             })
             .await?)
     }
@@ -906,13 +1064,17 @@ impl Backup {
         let mut command = args(["backup", "--json", "--host", TAG, "--tag", TAG]);
         command.extend(paths.iter().cloned());
         let restic = &self.inner.restic;
-        let result = restic
-            .run(&target.location, Some(&self.inner.data_dir), &command)
-            .await;
         let mut run = Run::new(target.id, RunKind::Backup, started_at);
+        let repository = match self.repository(target).await {
+            Ok(repository) => repository,
+            Err(err) => return run.failed(err.to_string()),
+        };
+        let result = restic
+            .run(&repository, Some(&self.inner.data_dir), &command)
+            .await;
         let stdout = match result {
             Ok(stdout) => stdout,
-            Err(failure) => return run.failed(describe(&failure, &target.location)),
+            Err(failure) => return run.failed(describe(&failure, &repository)),
         };
         let summary = restic::message(&stdout, "summary").unwrap_or_default();
         run.snapshot = summary["snapshot_id"].as_str().map(str::to_owned);
@@ -924,11 +1086,11 @@ impl Backup {
         for (flag, count) in KEEP {
             forget.extend(args([flag, count]));
         }
-        if let Err(failure) = restic.run(&target.location, None, &forget).await {
+        if let Err(failure) = restic.run(&repository, None, &forget).await {
             // The backup itself worked, so this is only worth a warning.
             tracing::warn!(
                 target = %target.name,
-                problem = describe(&failure, &target.location),
+                problem = describe(&failure, &repository),
                 "couldn't remove old snapshots"
             );
         }
@@ -939,11 +1101,12 @@ impl Backup {
     /// so it runs weekly rather than after every backup.
     pub async fn prune(&self, target: &Target) -> Result<(), Error> {
         let _busy = self.busy().await;
+        let repository = self.repository(target).await?;
         self.inner
             .restic
-            .run(&target.location, None, &args(["prune"]))
+            .run(&repository, None, &args(["prune"]))
             .await
-            .map_err(|failure| Error::Restic(describe(&failure, &target.location)))?;
+            .map_err(|failure| Error::Restic(describe(&failure, &repository)))?;
         Ok(())
     }
 
@@ -961,14 +1124,13 @@ impl Backup {
             command.push(format!("--read-data-subset={part}/{of}").into());
         }
         let run = Run::new(target.id, RunKind::Check, started_at);
-        match self
-            .inner
-            .restic
-            .run(&target.location, None, &command)
-            .await
-        {
+        let repository = match self.repository(target).await {
+            Ok(repository) => repository,
+            Err(err) => return run.failed(err.to_string()),
+        };
+        match self.inner.restic.run(&repository, None, &command).await {
             Ok(_) => run.finish(),
-            Err(failure) => run.failed(describe(&failure, &target.location)),
+            Err(failure) => run.failed(describe(&failure, &repository)),
         }
     }
 
@@ -996,6 +1158,10 @@ impl Backup {
             .await
             .map_err(|err| err.to_string())?
             .ok_or("There's no backup in this location yet.")?;
+        let repository = &self
+            .repository(target)
+            .await
+            .map_err(|err| err.to_string())?;
         let restic = &self.inner.restic;
         let restore = |includes: Vec<String>| {
             let mut command = args(["restore", &snapshot, "--target"]);
@@ -1005,9 +1171,9 @@ impl Backup {
             }
             async move {
                 restic
-                    .run(&target.location, None, &command)
+                    .run(repository, None, &command)
                     .await
-                    .map_err(|failure| describe(&failure, &target.location))
+                    .map_err(|failure| describe(&failure, repository))
             }
         };
 
@@ -1061,32 +1227,32 @@ impl Backup {
         .expect("checking restored files panicked")
     }
 
-    /// The Accordion backups in the folder at `path`, newest first, if
-    /// `key` opens them. For restoring to a fresh server.
-    pub async fn find_snapshots(&self, path: &Path, key: &str) -> Result<Vec<Snapshot>, Error> {
+    /// The Accordion backups in `place`, newest first, if `key` opens them.
+    /// For restoring to a fresh server.
+    pub async fn find_snapshots(&self, place: &Place, key: &str) -> Result<Vec<Snapshot>, Error> {
         let _busy = self.busy().await;
-        let (location, restic) = self.prepare_restore(path, key).await?;
+        let (repository, restic) = self.prepare_restore(place, key).await?;
         let result = restic
-            .run(
-                &location,
+            .run_once(
+                &repository,
                 None,
                 &args(["snapshots", "--json", "--tag", TAG]),
             )
             .await;
         // Nothing is restored yet, so only the typed key is in there.
         let _ = tokio::fs::remove_dir_all(self.restore_dir()).await;
-        let stdout = result.map_err(|failure| restore_failure(&failure, &location))?;
+        let stdout = result.map_err(|failure| restore_failure(&failure, &repository))?;
         let mut snapshots = parse_snapshots(&stdout).ok_or_else(|| {
             Error::Restic("restic listed the backups in a way Accordion didn't expect.".into())
         })?;
         if snapshots.is_empty() {
-            return Err(Error::NoSnapshots(location));
+            return Err(Error::NoSnapshots(place_name(&repository)));
         }
         snapshots.sort_by_key(|snapshot| std::cmp::Reverse(snapshot.time));
         Ok(snapshots)
     }
 
-    /// Restores `snapshot` from the folder at `path` into `restore/` in the
+    /// Restores `snapshot` from `place` into `restore/` in the
     /// data folder, and checks its database. `progress` hears how much is
     /// done, from 0 to 1. The restored data waits there until the server
     /// starts again, when [`apply_restore`] moves it into place. Returns the
@@ -1096,7 +1262,7 @@ impl Backup {
     /// lose: the restore replaces everything.
     pub async fn restore(
         &self,
-        path: &Path,
+        place: &Place,
         key: &str,
         snapshot: &str,
         progress: impl FnMut(f64) + Send,
@@ -1107,9 +1273,9 @@ impl Backup {
             return Err(Error::NoSuchSnapshot);
         }
         let _busy = self.busy().await;
-        let (location, restic) = self.prepare_restore(path, key).await?;
+        let (repository, restic) = self.prepare_restore(place, key).await?;
         let result = self
-            .restore_snapshot(&restic, &location, snapshot, progress)
+            .restore_snapshot(&restic, &repository, snapshot, progress)
             .await;
         if result.is_err() {
             let _ = tokio::fs::remove_dir_all(self.restore_dir()).await;
@@ -1120,7 +1286,7 @@ impl Backup {
     async fn restore_snapshot(
         &self,
         restic: &Restic,
-        location: &str,
+        repository: &Repository,
         snapshot: &str,
         mut progress: impl FnMut(f64) + Send,
     ) -> Result<PathBuf, Error> {
@@ -1129,7 +1295,7 @@ impl Backup {
         let mut command = args(["restore", snapshot, "--json", "--target"]);
         command.push(place.clone().into());
         restic
-            .run_streaming(location, None, &command, |line| {
+            .run_streaming(repository, None, &command, |line| {
                 if let Ok(status) = serde_json::from_str::<serde_json::Value>(line)
                     && status["message_type"] == "status"
                     && let Some(done) = status["percent_done"].as_f64()
@@ -1142,7 +1308,7 @@ impl Backup {
                 Failure::Failed { message, .. } if message.contains("no matching ID found") => {
                     Error::NoSuchSnapshot
                 }
-                failure => restore_failure(&failure, location),
+                failure => restore_failure(&failure, repository),
             })?;
 
         let database = place.join("backup").join("accordion.db");
@@ -1171,22 +1337,27 @@ impl Backup {
         self.inner.data_dir.join(RESTORE_DIR)
     }
 
-    /// Checks the folder and key for a restore, and starts an empty
+    /// Checks the place and key for a restore, and starts an empty
     /// `restore/` holding the key, which restic reads it from. Returns the
-    /// folder's full path and a restic that uses that key.
-    async fn prepare_restore(&self, path: &Path, key: &str) -> Result<(String, Restic), Error> {
+    /// repository and a restic that uses that key.
+    async fn prepare_restore(
+        &self,
+        place: &Place,
+        key: &str,
+    ) -> Result<(Repository, Restic), Error> {
         let letters = random::parse_letters(key, KEY_LEN).ok_or(Error::BadKey)?;
-        if !path.is_absolute() {
-            return Err(Error::NotAbsolute);
-        }
-        let location = tokio::fs::canonicalize(path)
-            .await
-            .map_err(|_| Error::NoSuchFolder(path.to_owned()))?
-            .to_str()
-            .ok_or(Error::Restic(
-                "Accordion can only use folders whose path is valid UTF-8.".into(),
-            ))?
-            .to_owned();
+        let repository = match place {
+            Place::Folder(path) => {
+                if !path.is_absolute() {
+                    return Err(Error::NotAbsolute);
+                }
+                let path = tokio::fs::canonicalize(path)
+                    .await
+                    .map_err(|_| Error::NoSuchFolder(path.to_owned()))?;
+                folder_repository(&path)?
+            }
+            Place::S3(bucket) => s3_repository(bucket)?,
+        };
         let dir = self.restore_dir();
         let key_file = dir.join("recovery-key");
         let path = key_file.clone();
@@ -1209,7 +1380,38 @@ impl Backup {
             cache: self.inner.restic.cache.clone(),
             temp: self.inner.restic.temp.clone(),
         };
-        Ok((location, restic))
+        Ok((repository, restic))
+    }
+
+    /// The repository for a target, with its keys if it's a bucket.
+    async fn repository(&self, target: &Target) -> Result<Repository, Error> {
+        let keys = match target.kind {
+            TargetKind::Folder => None,
+            TargetKind::S3 => {
+                let id = target.id;
+                self.inner
+                    .db
+                    .read(move |conn| {
+                        conn.query_row(
+                            "SELECT access_key_id, secret_access_key FROM backup_targets
+                             WHERE id = ?1",
+                            [id.as_uuid()],
+                            |row| {
+                                Ok(Keys {
+                                    id: row.get(0)?,
+                                    secret: row.get(1)?,
+                                })
+                            },
+                        )
+                        .optional()
+                    })
+                    .await?
+            }
+        };
+        Ok(Repository {
+            location: target.location.clone(),
+            keys,
+        })
     }
 
     /// The most recent runs, newest first.
@@ -1307,24 +1509,30 @@ impl Run {
     }
 }
 
-/// What a restic failure means for the admin, at `location`.
-fn describe(failure: &Failure, location: &str) -> String {
+/// What a restic failure means for the admin.
+fn describe(failure: &Failure, repository: &Repository) -> String {
+    let place = place_name(repository);
     match failure {
         Failure::Start(err) => format!(
             "Accordion couldn't start restic, the program that makes backups: {err}. \
              Reinstall Accordion, then try again."
         ),
+        Failure::NoRepository if repository.keys.is_some() => format!(
+            "There's no backup in {place}. Check that the bucket still exists at your \
+             storage provider, then try again."
+        ),
         Failure::NoRepository => format!(
-            "There's no backup in {location}. If it's on a USB disk, check that the \
+            "There's no backup in {place}. If it's on a USB disk, check that the \
              disk is plugged in, then try again."
         ),
         Failure::Locked => format!(
-            "Another program is using the backup in {location}. Try again in a few \
+            "Another program is using the backup in {place}. Try again in a few \
              minutes."
         ),
         Failure::WrongKey => {
-            format!("The backup in {location} is locked with a different recovery key.")
+            format!("The backup in {place} is locked with a different recovery key.")
         }
+        Failure::Retrying(problem) => format!("restic couldn't reach {place}: {problem}"),
         Failure::Failed { code, message } => {
             let code =
                 code.map_or_else(|| "stopped".to_owned(), |code| format!("exit code {code}"));
@@ -1333,12 +1541,137 @@ fn describe(failure: &Failure, location: &str) -> String {
     }
 }
 
-/// What a restic failure means while restoring from `location`.
-fn restore_failure(failure: &Failure, location: &str) -> Error {
-    match failure {
-        Failure::WrongKey => Error::KeyDoesntOpen(location.to_owned()),
-        failure => Error::Restic(describe(failure, location)),
+/// What a restic failure means while the owner sets up a target or looks
+/// for backups, with the common mistakes in a bucket's details spelled out.
+fn setup_failure(failure: &Failure, repository: &Repository) -> Error {
+    let Failure::Retrying(problem) = failure else {
+        return Error::Restic(describe(failure, repository));
+    };
+    let Some((host, bucket)) = bucket_parts(&repository.location) else {
+        return Error::Restic(describe(failure, repository));
+    };
+    let lower = problem.to_ascii_lowercase();
+    if [
+        "signature",
+        "access denied",
+        "accessdenied",
+        "access key",
+        "forbidden",
+    ]
+    .iter()
+    .any(|phrase| lower.contains(phrase))
+    {
+        Error::KeysRefused(host.to_owned())
+    } else if lower.contains("bucket does not exist") || lower.contains("nosuchbucket") {
+        Error::NoBucket {
+            bucket: bucket.to_owned(),
+            host: host.to_owned(),
+        }
+    } else {
+        Error::Unreachable {
+            host: host.to_owned(),
+            problem: problem.clone(),
+        }
     }
+}
+
+/// What a restic failure means while restoring.
+fn restore_failure(failure: &Failure, repository: &Repository) -> Error {
+    match failure {
+        Failure::WrongKey => Error::KeyDoesntOpen(place_name(repository)),
+        failure => setup_failure(failure, repository),
+    }
+}
+
+/// How messages name a repository: a folder's path, or "the bucket b at
+/// host".
+fn place_name(repository: &Repository) -> String {
+    match bucket_parts(&repository.location) {
+        Some((host, bucket)) if repository.keys.is_some() => {
+            format!("the bucket {bucket} at {host}")
+        }
+        _ => repository.location.clone(),
+    }
+}
+
+/// The host and bucket in an `s3:` location.
+fn bucket_parts(location: &str) -> Option<(&str, &str)> {
+    let rest = location.strip_prefix("s3:")?;
+    let rest = rest.split_once("://").map_or(rest, |(_, rest)| rest);
+    rest.split_once('/')
+}
+
+fn folder_repository(path: &Path) -> Result<Repository, Error> {
+    let location = path
+        .to_str()
+        .ok_or(Error::Restic(
+            "Accordion can only use folders whose path is valid UTF-8.".into(),
+        ))?
+        .to_owned();
+    Ok(Repository {
+        location,
+        keys: None,
+    })
+}
+
+/// Checks what the owner typed for a bucket, and puts it in restic's form.
+fn s3_repository(bucket: &S3Bucket) -> Result<Repository, Error> {
+    let endpoint = s3_endpoint(&bucket.endpoint).ok_or(Error::BadEndpoint)?;
+    let name = bucket.bucket.trim();
+    if !is_bucket_name(name) {
+        return Err(Error::BadBucket);
+    }
+    let (id, secret) = (bucket.key_id.trim(), bucket.secret_key.trim());
+    if id.is_empty() || secret.is_empty() {
+        return Err(Error::NoKeys);
+    }
+    Ok(Repository {
+        location: format!("s3:{endpoint}/{name}"),
+        keys: Some(Keys {
+            id: id.to_owned(),
+            secret: secret.to_owned(),
+        }),
+    })
+}
+
+/// A provider's S3 address as `https://host`, with a port if it has one.
+/// Without a scheme, it's HTTPS. Plain HTTP is only for a server on this
+/// machine, such as one for testing, because anyone on the network could
+/// read what it sends.
+fn s3_endpoint(typed: &str) -> Option<String> {
+    let typed = typed.trim().trim_end_matches('/').to_ascii_lowercase();
+    let (scheme, host) = match typed.split_once("://") {
+        Some((scheme, host)) => (scheme, host),
+        None => ("https", typed.as_str()),
+    };
+    let (name, port) = match host.rsplit_once(':') {
+        Some((name, port)) => (name, Some(port)),
+        None => (host, None),
+    };
+    let name_ok = !name.is_empty()
+        && name.len() <= 253
+        && name.split('.').all(|label| {
+            !label.is_empty()
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        });
+    let port_ok = port.is_none_or(|port| port.parse::<u16>().is_ok_and(|port| port > 0));
+    let local = name == "localhost" || name == "127.0.0.1";
+    let scheme_ok = scheme == "https" || (scheme == "http" && local);
+    (name_ok && port_ok && scheme_ok).then(|| format!("{scheme}://{host}"))
+}
+
+/// S3's rules for bucket names: 3 to 63 lowercase letters, numbers, periods,
+/// and hyphens, starting and ending with a letter or number.
+fn is_bucket_name(name: &str) -> bool {
+    let edge = |b: Option<u8>| b.is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
+    (3..=63).contains(&name.len())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
+        && edge(name.bytes().next())
+        && edge(name.bytes().last())
 }
 
 /// The snapshots in the output of `restic snapshots --json`.
@@ -1420,23 +1753,29 @@ fn now() -> String {
     time::format(now)
 }
 
-const TARGET_SELECT: &str = "SELECT id, name, location, created_at FROM backup_targets";
+const TARGET_COLUMNS: &str = "t.id, t.name, t.kind, t.location, t.created_at";
 
 fn target(conn: &Connection, id: BackupTargetId) -> rusqlite::Result<Option<Target>> {
     conn.query_row(
-        &format!("{TARGET_SELECT} WHERE id = ?1"),
+        &format!("SELECT {TARGET_COLUMNS} FROM backup_targets t WHERE t.id = ?1"),
         [id.as_uuid()],
         target_from_row,
     )
     .optional()
 }
 
+/// A target from the first five columns of `row`, as in [`TARGET_COLUMNS`].
 fn target_from_row(row: &Row<'_>) -> rusqlite::Result<Target> {
+    let kind: String = row.get(2)?;
     Ok(Target {
         id: BackupTargetId::from_uuid(row.get(0)?),
         name: row.get(1)?,
-        location: row.get(2)?,
-        created_at: row.get(3)?,
+        kind: match kind.as_str() {
+            "s3" => TargetKind::S3,
+            _ => TargetKind::Folder,
+        },
+        location: row.get(3)?,
+        created_at: row.get(4)?,
     })
 }
 
@@ -1488,4 +1827,99 @@ fn latest_outcome(
         },
     )
     .optional()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn adding_buckets_keeps_existing_targets_and_their_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("accordion.db")).unwrap();
+        db.migrate(OWNER, &MIGRATIONS[..2]).await.unwrap();
+        db.write(|tx| {
+            tx.execute_batch(
+                "INSERT INTO backup_targets (id, name, kind, location, created_at, next_part)
+                 VALUES (x'00000000000000000000000000000001', 'USB disk', 'folder',
+                         '/media/usb/backups', '2026-10-01T03:00:00.000Z', 3);
+                 INSERT INTO backup_runs (id, target_id, kind, started_at, finished_at, ok)
+                 VALUES (x'00000000000000000000000000000002',
+                         x'00000000000000000000000000000001', 'backup',
+                         '2026-10-01T03:00:00.000Z', '2026-10-01T03:05:00.000Z', 1);",
+            )
+        })
+        .await
+        .unwrap();
+
+        db.migrate(OWNER, MIGRATIONS).await.unwrap();
+        let (target, next_part, runs) = db
+            .read(|conn| {
+                let target = target(conn, BackupTargetId::from_uuid(uuid::Uuid::from_u128(1)))?;
+                let next_part: u32 =
+                    conn.query_row("SELECT next_part FROM backup_targets", [], |row| row.get(0))?;
+                let runs: u32 =
+                    conn.query_row("SELECT count(*) FROM backup_runs", [], |row| row.get(0))?;
+                Ok::<_, rusqlite::Error>((target, next_part, runs))
+            })
+            .await
+            .unwrap();
+        let target = target.unwrap();
+        assert_eq!(target.kind, TargetKind::Folder);
+        assert_eq!(target.location, "/media/usb/backups");
+        assert_eq!((next_part, runs), (3, 1));
+
+        // Runs still go with their target.
+        db.write(|tx| tx.execute("DELETE FROM backup_targets", []))
+            .await
+            .unwrap();
+        let runs: u32 = db
+            .read(|conn| conn.query_row("SELECT count(*) FROM backup_runs", [], |row| row.get(0)))
+            .await
+            .unwrap();
+        assert_eq!(runs, 0);
+    }
+
+    #[test]
+    fn reads_s3_addresses() {
+        for (typed, endpoint) in [
+            (
+                "https://s3.us-west-004.backblazeb2.com",
+                "https://s3.us-west-004.backblazeb2.com",
+            ),
+            ("S3.Example.com/", "https://s3.example.com"),
+            ("https://s3.example.com:8443", "https://s3.example.com:8443"),
+            ("http://127.0.0.1:9000", "http://127.0.0.1:9000"),
+        ] {
+            assert_eq!(s3_endpoint(typed).as_deref(), Some(endpoint), "{typed}");
+        }
+        for typed in [
+            "",
+            "https://",
+            "http://s3.example.com",
+            "https://s3.example.com/bucket",
+            "https://s3..example.com",
+            "https://s3.example.com:0",
+            "https://user@s3.example.com",
+        ] {
+            assert_eq!(s3_endpoint(typed), None, "{typed}");
+        }
+    }
+
+    #[test]
+    fn names_buckets_in_messages() {
+        let repository = s3_repository(&S3Bucket {
+            endpoint: "https://s3.example.com".into(),
+            bucket: "backups".into(),
+            key_id: "id".into(),
+            secret_key: "secret".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            place_name(&repository),
+            "the bucket backups at s3.example.com"
+        );
+        let folder = folder_repository(Path::new("/media/usb/backups")).unwrap();
+        assert_eq!(place_name(&folder), "/media/usb/backups");
+    }
 }

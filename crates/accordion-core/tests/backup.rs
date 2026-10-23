@@ -5,7 +5,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use accordion_core::backup::{self, Backup, CheckDepth, Error, KeyState, RunKind};
+use accordion_core::backup::{
+    self, Backup, CheckDepth, Error, KeyState, Place, RunKind, S3Bucket, TargetKind,
+};
 use accordion_core::db::Database;
 use accordion_core::identity::{Identity, NewUser};
 use accordion_core::storage::Storage;
@@ -30,6 +32,10 @@ fn restic() -> PathBuf {
                 .find(|path| path.is_file())
         })
         .expect("These tests run restic. Install restic 0.19.1, or set ACCORDION_RESTIC.")
+}
+
+fn folder(path: impl AsRef<Path>) -> Place {
+    Place::Folder(path.as_ref().to_owned())
 }
 
 async fn start() -> Server {
@@ -133,7 +139,7 @@ async fn needs_a_key_and_somewhere_to_go() {
     let usb = server.usb();
     let err = server
         .backup
-        .add_folder("USB disk", &usb)
+        .add_target("USB disk", &folder(&usb))
         .await
         .unwrap_err();
     assert!(matches!(err, Error::NoRecoveryKey));
@@ -146,23 +152,33 @@ async fn needs_a_key_and_somewhere_to_go() {
 
     let err = server
         .backup
-        .add_folder("USB disk", Path::new("backups"))
+        .add_target("USB disk", &folder(Path::new("backups")))
         .await
         .unwrap_err();
     assert!(matches!(err, Error::NotAbsolute));
     let err = server
         .backup
-        .add_folder("Same disk", &server.data.path().join("storage/backups"))
+        .add_target(
+            "Same disk",
+            &folder(server.data.path().join("storage/backups")),
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, Error::InsideData));
     let err = server
         .backup
-        .add_folder("Unplugged", &server.disk.path().join("missing/backups"))
+        .add_target(
+            "Unplugged",
+            &folder(server.disk.path().join("missing/backups")),
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, Error::NoSuchFolder(_)));
-    let err = server.backup.add_folder(" ", &usb).await.unwrap_err();
+    let err = server
+        .backup
+        .add_target(" ", &folder(&usb))
+        .await
+        .unwrap_err();
     assert!(matches!(err, Error::BadName));
 }
 
@@ -174,7 +190,7 @@ async fn backs_up_everything_and_passes_a_restore_test() {
     server.backup.create_recovery_key().await.unwrap();
     let target = server
         .backup
-        .add_folder("USB disk", &server.usb())
+        .add_target("USB disk", &folder(server.usb()))
         .await
         .unwrap();
     assert_eq!(
@@ -227,7 +243,7 @@ async fn finds_damage_in_a_backup() {
     server.backup.create_recovery_key().await.unwrap();
     let target = server
         .backup
-        .add_folder("USB disk", &server.usb())
+        .add_target("USB disk", &folder(server.usb()))
         .await
         .unwrap();
     server.backup.back_up().await.unwrap();
@@ -258,12 +274,12 @@ async fn reports_a_missing_disk_without_stopping_other_targets() {
     server.backup.create_recovery_key().await.unwrap();
     server
         .backup
-        .add_folder("USB disk", &server.usb())
+        .add_target("USB disk", &folder(server.usb()))
         .await
         .unwrap();
     server
         .backup
-        .add_folder("Second disk", &server.disk.path().join("second"))
+        .add_target("Second disk", &folder(server.disk.path().join("second")))
         .await
         .unwrap();
     std::fs::rename(server.usb(), server.disk.path().join("unplugged")).unwrap();
@@ -290,13 +306,13 @@ async fn uses_an_existing_backup_only_with_its_key() {
     server.backup.create_recovery_key().await.unwrap();
     let target = server
         .backup
-        .add_folder("USB disk", &server.usb())
+        .add_target("USB disk", &folder(server.usb()))
         .await
         .unwrap();
     server.backup.back_up().await.unwrap();
     let err = server
         .backup
-        .add_folder("Again", &server.usb())
+        .add_target("Again", &folder(server.usb()))
         .await
         .unwrap_err();
     assert!(matches!(err, Error::TargetExists));
@@ -306,7 +322,7 @@ async fn uses_an_existing_backup_only_with_its_key() {
     assert!(server.backup.targets().await.unwrap().is_empty());
     server
         .backup
-        .add_folder("USB disk", &server.usb())
+        .add_target("USB disk", &folder(server.usb()))
         .await
         .unwrap();
 
@@ -315,7 +331,7 @@ async fn uses_an_existing_backup_only_with_its_key() {
     other.backup.create_recovery_key().await.unwrap();
     let err = other
         .backup
-        .add_folder("Borrowed disk", &server.usb())
+        .add_target("Borrowed disk", &folder(server.usb()))
         .await
         .unwrap_err();
     assert!(matches!(err, Error::WrongKey(_)));
@@ -329,7 +345,7 @@ async fn restores_everything_to_a_new_server() {
     let key = server.backup.create_recovery_key().await.unwrap();
     server
         .backup
-        .add_folder("USB disk", &server.usb())
+        .add_target("USB disk", &folder(server.usb()))
         .await
         .unwrap();
     server.backup.back_up().await.unwrap();
@@ -360,25 +376,31 @@ async fn restores_everything_to_a_new_server() {
     }
 
     let usb = server.usb();
-    let err = fresh.find_snapshots(&usb, "abcde").await.unwrap_err();
+    let err = fresh
+        .find_snapshots(&folder(&usb), "abcde")
+        .await
+        .unwrap_err();
     assert!(matches!(err, Error::BadKey));
     let wrong = "abcde fghij klmno pqrst uvwxy zabcd";
-    let err = fresh.find_snapshots(&usb, wrong).await.unwrap_err();
+    let err = fresh
+        .find_snapshots(&folder(&usb), wrong)
+        .await
+        .unwrap_err();
     assert!(matches!(err, Error::KeyDoesntOpen(_)), "{err}");
     let err = fresh
-        .find_snapshots(&server.disk.path().join("missing"), key.as_str())
+        .find_snapshots(&folder(server.disk.path().join("missing")), key.as_str())
         .await
         .unwrap_err();
     assert!(matches!(err, Error::NoSuchFolder(_)));
     let err = fresh
-        .find_snapshots(server.disk.path(), key.as_str())
+        .find_snapshots(&folder(server.disk.path()), key.as_str())
         .await
         .unwrap_err();
     assert!(err.to_string().contains("There's no backup in"), "{err}");
 
     // The key is accepted however it's typed.
     let snapshots = fresh
-        .find_snapshots(&usb, &key.grouped().to_uppercase())
+        .find_snapshots(&folder(&usb), &key.grouped().to_uppercase())
         .await
         .unwrap();
     assert_eq!(snapshots.len(), 1);
@@ -387,19 +409,19 @@ async fn restores_everything_to_a_new_server() {
     assert!(!data.path().join("restore").exists());
 
     let err = fresh
-        .restore(&usb, key.as_str(), "--help", |_| {})
+        .restore(&folder(&usb), key.as_str(), "--help", |_| {})
         .await
         .unwrap_err();
     assert!(matches!(err, Error::NoSuchSnapshot));
     let err = fresh
-        .restore(&usb, key.as_str(), "0123456789abcdef", |_| {})
+        .restore(&folder(&usb), key.as_str(), "0123456789abcdef", |_| {})
         .await
         .unwrap_err();
     assert!(matches!(err, Error::NoSuchSnapshot), "{err}");
     assert!(!data.path().join("restore").exists());
 
     let restored = fresh
-        .restore(&usb, key.as_str(), &snapshots[0].id, |done| {
+        .restore(&folder(&usb), key.as_str(), &snapshots[0].id, |done| {
             assert!((0.0..=1.0).contains(&done));
         })
         .await
@@ -490,7 +512,7 @@ async fn reports_how_backups_are_doing() {
 
     let target = server
         .backup
-        .add_folder("USB disk", &server.usb())
+        .add_target("USB disk", &folder(server.usb()))
         .await
         .unwrap();
     {
@@ -520,7 +542,7 @@ async fn runs_weekly_and_monthly_work_when_its_due() {
     server.backup.create_recovery_key().await.unwrap();
     server
         .backup
-        .add_folder("USB disk", &server.usb())
+        .add_target("USB disk", &folder(server.usb()))
         .await
         .unwrap();
 
@@ -566,7 +588,7 @@ async fn catches_up_on_a_missed_backup() {
     server.backup.create_recovery_key().await.unwrap();
     server
         .backup
-        .add_folder("USB disk", &server.usb())
+        .add_target("USB disk", &folder(server.usb()))
         .await
         .unwrap();
     // The server was off at backup time, so one starts 10 minutes after it
@@ -585,5 +607,237 @@ async fn catches_up_on_a_missed_backup() {
         server.backup.status().borrow().targets[0]
             .last_good_backup
             .is_some()
+    );
+}
+
+/// rclone, whose S3 server stands in for a storage provider. Set
+/// `ACCORDION_RCLONE` to its path, or put it on `PATH`.
+fn rclone() -> PathBuf {
+    if let Some(path) = std::env::var_os("ACCORDION_RCLONE") {
+        return path.into();
+    }
+    std::env::var_os("PATH")
+        .and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|dir| dir.join("rclone"))
+                .find(|path| path.is_file())
+        })
+        .expect(
+            "These tests run rclone's S3 server. Install rclone 1.75.2, or set ACCORDION_RCLONE.",
+        )
+}
+
+/// An S3 server on this machine, with one empty bucket. It stops when
+/// dropped.
+struct Provider {
+    _root: tempfile::TempDir,
+    server: std::process::Child,
+    endpoint: String,
+}
+
+const BUCKET: &str = "household-backups";
+const KEY_ID: &str = "test-key";
+const SECRET: &str = "test-secret-0123456789";
+
+impl Provider {
+    fn start() -> Self {
+        let root = tempfile::tempdir().unwrap();
+        // Before the server starts, which caches what it finds.
+        std::fs::create_dir(root.path().join(BUCKET)).unwrap();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let address = format!("127.0.0.1:{port}");
+        let server = Command::new(rclone())
+            .args(["serve", "s3", "--auth-key", &format!("{KEY_ID},{SECRET}")])
+            .args(["--addr", &address])
+            .arg(root.path())
+            .env("RCLONE_CONFIG", "/dev/null")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        while std::net::TcpStream::connect(&address).is_err() {
+            assert!(started.elapsed().as_secs() < 10, "rclone didn't start");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        Self {
+            _root: root,
+            server,
+            endpoint: format!("http://{address}"),
+        }
+    }
+
+    fn bucket(&self) -> S3Bucket {
+        S3Bucket {
+            endpoint: self.endpoint.clone(),
+            bucket: BUCKET.into(),
+            key_id: KEY_ID.into(),
+            secret_key: SECRET.into(),
+        }
+    }
+}
+
+impl Drop for Provider {
+    fn drop(&mut self) {
+        let _ = self.server.kill();
+        let _ = self.server.wait();
+    }
+}
+
+/// A server with no data yet, as the setup wizard's restore finds it.
+async fn fresh() -> (tempfile::TempDir, tempfile::TempDir, Backup) {
+    let data = tempfile::tempdir().unwrap();
+    let services = tempfile::tempdir().unwrap();
+    let db = Database::open(&services.path().join("accordion.db")).unwrap();
+    let identity = Identity::new(db.clone()).await.unwrap();
+    let storage = Storage::open(db.clone(), identity, &services.path().join("storage"))
+        .await
+        .unwrap();
+    let backup = Backup::open(db, storage, data.path(), restic())
+        .await
+        .unwrap();
+    (data, services, backup)
+}
+
+#[tokio::test]
+async fn backs_up_to_a_bucket_and_restores_from_it() {
+    let provider = Provider::start();
+    let server = start().await;
+    let key = server.backup.create_recovery_key().await.unwrap();
+    let target = server
+        .backup
+        .add_target("Backblaze", &Place::S3(provider.bucket()))
+        .await
+        .unwrap();
+    assert_eq!(target.kind, TargetKind::S3);
+    assert_eq!(
+        target.location,
+        format!("s3:{}/{BUCKET}", provider.endpoint)
+    );
+    // The secret stays out of logs.
+    assert!(!format!("{target:?}").contains(SECRET));
+    assert!(!format!("{:?}", provider.bucket()).contains(SECRET));
+
+    let runs = server.backup.back_up().await.unwrap();
+    assert!(runs.iter().all(|run| run.ok), "{runs:?}");
+    let run = server.backup.test_restore(&target).await.unwrap();
+    assert!(run.ok, "{run:?}");
+
+    let (data, _services, fresh) = fresh().await;
+    let place = Place::S3(provider.bucket());
+    let wrong = "abcde fghij klmno pqrst uvwxy zabcd";
+    let err = fresh.find_snapshots(&place, wrong).await.unwrap_err();
+    assert!(matches!(err, Error::KeyDoesntOpen(_)), "{err}");
+    let snapshots = fresh.find_snapshots(&place, key.as_str()).await.unwrap();
+    assert_eq!(snapshots.len(), 1);
+    fresh
+        .restore(&place, key.as_str(), &snapshots[0].id, |_| {})
+        .await
+        .unwrap();
+    drop(fresh);
+    assert!(backup::apply_restore(data.path()).unwrap());
+
+    // The restored server has the bucket and its key, so it goes on backing
+    // up without being set up again.
+    let db = Database::open(&data.path().join("accordion.db")).unwrap();
+    let identity = Identity::new(db.clone()).await.unwrap();
+    let storage = Storage::open(db.clone(), identity, &data.path().join("storage"))
+        .await
+        .unwrap();
+    let restored = Backup::open(db, storage, data.path(), restic())
+        .await
+        .unwrap();
+    let targets = restored.targets().await.unwrap();
+    assert_eq!(targets, [target]);
+    let runs = restored.back_up().await.unwrap();
+    assert!(runs.iter().all(|run| run.ok), "{runs:?}");
+}
+
+#[tokio::test]
+async fn explains_mistakes_in_a_buckets_details() {
+    let provider = Provider::start();
+    let server = start().await;
+    server.backup.create_recovery_key().await.unwrap();
+    let add = |bucket: S3Bucket| {
+        let backup = server.backup.clone();
+        async move { backup.add_target("Bucket", &Place::S3(bucket)).await }
+    };
+    let started = std::time::Instant::now();
+
+    let err = add(S3Bucket {
+        secret_key: "not-the-secret".into(),
+        ..provider.bucket()
+    })
+    .await
+    .unwrap_err();
+    assert!(matches!(err, Error::KeysRefused(_)), "{err}");
+
+    let err = add(S3Bucket {
+        bucket: "no-such-bucket".into(),
+        ..provider.bucket()
+    })
+    .await
+    .unwrap_err();
+    assert!(matches!(err, Error::NoBucket { .. }), "{err}");
+    assert!(err.to_string().contains("no-such-bucket"), "{err}");
+
+    // Nothing is listening on port 1.
+    let err = add(S3Bucket {
+        endpoint: "http://127.0.0.1:1".into(),
+        ..provider.bucket()
+    })
+    .await
+    .unwrap_err();
+    assert!(matches!(err, Error::Unreachable { .. }), "{err}");
+
+    // restic would try each of those again for minutes. Setup doesn't wait.
+    assert!(started.elapsed().as_secs() < 30, "{:?}", started.elapsed());
+
+    for endpoint in [
+        "",
+        "http://s3.example.com",
+        "ftp://s3.example.com",
+        "https://",
+    ] {
+        let err = add(S3Bucket {
+            endpoint: endpoint.into(),
+            ..provider.bucket()
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(err, Error::BadEndpoint), "{endpoint}: {err}");
+    }
+    for bucket in ["ab", "My_Bucket", "-backups", "backups-"] {
+        let err = add(S3Bucket {
+            bucket: bucket.into(),
+            ..provider.bucket()
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(err, Error::BadBucket), "{bucket}: {err}");
+    }
+    let err = add(S3Bucket {
+        key_id: " ".into(),
+        ..provider.bucket()
+    })
+    .await
+    .unwrap_err();
+    assert!(matches!(err, Error::NoKeys), "{err}");
+    assert!(server.backup.targets().await.unwrap().is_empty());
+
+    // Typed without https://, the address means HTTPS.
+    let err = add(S3Bucket {
+        endpoint: "localhost:1/".into(),
+        ..provider.bucket()
+    })
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("couldn't reach localhost:1"),
+        "{err}"
     );
 }

@@ -179,7 +179,8 @@ impl Identity {
                          a.last_used_at IS NULL OR a.last_used_at < ",
                         last_used_precision!(),
                         " FROM identity_app_passwords a JOIN identity_users u ON u.id = a.user_id
-                         WHERE a.password_hash = ?1 AND u.username = ?2 AND a.use_for = ?3"
+                         WHERE a.password_hash = ?1 AND u.username = ?2 AND a.use_for = ?3
+                           AND u.turned_off_at IS NULL"
                     ),
                     (hash, username, use_for.as_str()),
                     |row| {

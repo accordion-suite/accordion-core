@@ -75,11 +75,12 @@ impl From<identity::Error> for ApiError {
     fn from(err: identity::Error) -> Self {
         use identity::Error::*;
         let status = match err {
-            InvalidUsername | InvalidDisplayName | PasswordTooShort | PasswordTooLong => {
-                StatusCode::BAD_REQUEST
-            }
-            UsernameTaken | UsernameReserved | OwnerExists => StatusCode::CONFLICT,
+            InvalidUsername | InvalidDisplayName | PasswordTooShort | PasswordTooLong
+            | RoleNotAllowed => StatusCode::BAD_REQUEST,
+            UsernameTaken | UsernameReserved | OwnerExists | OwnerAccount => StatusCode::CONFLICT,
             UserNotFound => StatusCode::NOT_FOUND,
+            TurnedOff => StatusCode::FORBIDDEN,
+            LinkNotValid => StatusCode::GONE,
             WrongCredentials => StatusCode::UNAUTHORIZED,
             TooManyTries { wait } => {
                 return Self {

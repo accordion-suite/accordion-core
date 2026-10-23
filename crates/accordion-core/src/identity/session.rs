@@ -232,7 +232,7 @@ impl Identity {
                         ", s.last_used_at < ",
                         last_used_precision!(),
                         " FROM identity_sessions s JOIN identity_users u ON u.id = s.user_id
-                         WHERE s.token_hash = ?1 AND ",
+                         WHERE s.token_hash = ?1 AND u.turned_off_at IS NULL AND ",
                         not_expired!()
                     ),
                     [hash],

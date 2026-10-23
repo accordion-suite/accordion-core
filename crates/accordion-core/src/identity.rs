@@ -5,18 +5,20 @@
 
 mod app_password;
 pub mod limits;
+mod members;
 pub mod password;
 mod session;
 
 pub use app_password::{AppPassword, AppPasswordSecret, AppPasswordUse, UsingAppPassword};
 pub use limits::SignInFrom;
+pub use members::{AppPasswords, LinkPurpose, LinkToken, Member, PasswordLink};
 pub use session::{AuthMethod, Client, Session, SessionToken, SignedIn};
 
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use accordion_types::{Role, SessionId, UserId};
-use rusqlite::{Connection, OptionalExtension, Row};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction};
 use tokio::sync::broadcast;
 
 use crate::db::{self, Database, Migration};
@@ -88,6 +90,26 @@ static MIGRATIONS: &[Migration] = &[
         CREATE INDEX identity_app_passwords_user ON identity_app_passwords (user_id);
     ",
     },
+    Migration {
+        version: 4,
+        name: "Add password links and turning accounts off",
+        sql: "
+        -- Set while an admin has turned the account off. It can't sign in,
+        -- but its files and settings stay.
+        ALTER TABLE identity_users ADD COLUMN turned_off_at TEXT;
+
+        -- One unused link per account, for setting a first password or a
+        -- new one after a reset.
+        CREATE TABLE identity_password_links (
+            user_id BLOB PRIMARY KEY REFERENCES identity_users (id) ON DELETE CASCADE,
+            -- SHA-256 of the link's secret. The secret itself is never stored.
+            token_hash BLOB NOT NULL UNIQUE CHECK (length(token_hash) = 32),
+            purpose TEXT NOT NULL CHECK (purpose IN ('new_account', 'reset')),
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        ) STRICT, WITHOUT ROWID;
+    ",
+    },
 ];
 
 /// Names that can't be usernames. Storage's plain view keeps each user's
@@ -126,6 +148,18 @@ pub enum Error {
 
     #[error("That account doesn't exist.")]
     UserNotFound,
+
+    #[error("Choose admin or standard user for this account.")]
+    RoleNotAllowed,
+
+    #[error("The owner's account can't be turned off or given another role.")]
+    OwnerAccount,
+
+    #[error("This account is turned off. An admin can turn it back on.")]
+    TurnedOff,
+
+    #[error("This link has expired or was already used. Ask your admin for a new one.")]
+    LinkNotValid,
 
     /// Deliberately vague, so sign-in pages don't reveal which usernames exist.
     #[error("The username or password is incorrect.")]
@@ -209,41 +243,13 @@ impl Identity {
     }
 
     pub async fn create_user(&self, new: NewUser) -> Result<User, Error> {
-        let username = normalize_username(&new.username)?;
-        if RESERVED_USERNAMES.contains(&username.as_str()) {
-            return Err(Error::UsernameReserved);
-        }
-        let user = User {
-            id: UserId::generate(),
-            username,
-            display_name: validate_display_name(&new.display_name)?,
-            role: new.role,
-        };
+        let user = new_account(&new.username, &new.display_name, new.role)?;
         check_password_rules(&new.password)?;
         let hash = password::hash(new.password).await?;
 
         let created = user.clone();
         self.db
-            .write(move |tx| {
-                if user.role == Role::Owner && exists(tx, "role = 'owner'", ())? {
-                    return Err(Error::OwnerExists);
-                }
-                if exists(tx, "username = ?1", [&user.username])? {
-                    return Err(Error::UsernameTaken);
-                }
-                tx.execute(
-                    "INSERT INTO identity_users (id, username, display_name, role, password_hash)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    (
-                        user.id.as_uuid(),
-                        &user.username,
-                        &user.display_name,
-                        user.role.as_str(),
-                        &hash,
-                    ),
-                )?;
-                Ok(())
-            })
+            .write(move |tx| insert_user(tx, &user, Some(&hash)))
             .await?;
         Ok(created)
     }
@@ -311,10 +317,17 @@ impl Identity {
                 self.db
                     .read(move |conn| {
                         conn.query_row(
-                            "SELECT id, username, display_name, role, password_hash
+                            "SELECT id, username, display_name, role, password_hash,
+                                    turned_off_at IS NOT NULL
                              FROM identity_users WHERE username = ?1",
                             [username],
-                            |row| Ok((user_from_row(row, 0)?, row.get::<_, Option<String>>(4)?)),
+                            |row| {
+                                Ok((
+                                    user_from_row(row, 0)?,
+                                    row.get::<_, Option<String>>(4)?,
+                                    row.get::<_, bool>(5)?,
+                                ))
+                            },
                         )
                         .optional()
                     })
@@ -322,15 +335,18 @@ impl Identity {
             }
             Err(_) => None,
         };
-        let (user, hash) = match found {
-            Some((user, hash)) => (Some(user), hash),
-            None => (None, None),
+        let (user, hash, turned_off) = match found {
+            Some((user, hash, turned_off)) => (Some(user), hash, turned_off),
+            None => (None, None, false),
         };
         // Overlong input can't match a stored hash. Hashing it anyway keeps
         // the timing the same as any other wrong password.
         let password = password.chars().take(password::MAX_LEN + 1).collect();
+        let matched = password::verify(password, hash).await;
         match user {
-            Some(user) if password::verify(password, hash).await => Ok(user),
+            // Only someone with the right password learns the account is off.
+            Some(_) if matched && turned_off => Err(Error::TurnedOff),
+            Some(user) if matched => Ok(user),
             _ => Err(Error::WrongCredentials),
         }
     }
@@ -370,6 +386,43 @@ impl Identity {
         self.announce_ended(&ended);
         Ok(())
     }
+}
+
+/// Checks the details of a new account, before it has a password.
+fn new_account(username: &str, display_name: &str, role: Role) -> Result<User, Error> {
+    let username = normalize_username(username)?;
+    if RESERVED_USERNAMES.contains(&username.as_str()) {
+        return Err(Error::UsernameReserved);
+    }
+    Ok(User {
+        id: UserId::generate(),
+        username,
+        display_name: validate_display_name(display_name)?,
+        role,
+    })
+}
+
+/// Adds an account checked by [`new_account`]. `hash` is `None` for an
+/// account whose owner sets the password from a link.
+fn insert_user(tx: &Transaction<'_>, user: &User, hash: Option<&str>) -> Result<(), Error> {
+    if user.role == Role::Owner && exists(tx, "role = 'owner'", ())? {
+        return Err(Error::OwnerExists);
+    }
+    if exists(tx, "username = ?1", [&user.username])? {
+        return Err(Error::UsernameTaken);
+    }
+    tx.execute(
+        "INSERT INTO identity_users (id, username, display_name, role, password_hash)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        (
+            user.id.as_uuid(),
+            &user.username,
+            &user.display_name,
+            user.role.as_str(),
+            hash,
+        ),
+    )?;
+    Ok(())
 }
 
 fn exists(

@@ -206,16 +206,19 @@ impl Restic {
         Err(self.explain(repository, failure(status, &errors)).await)
     }
 
-    /// restic passes on what ssh says, but can stop before ssh has said it.
-    /// When an SFTP connection fails without ssh's reason, this asks ssh
-    /// directly, with the same command.
+    /// restic passes on what ssh says, but can stop before ssh has said all
+    /// of it. When an SFTP connection fails without ssh's reason, or with
+    /// only the start of what ssh said, this asks ssh directly, with the same
+    /// command.
     async fn explain(&self, repository: &Repository, failure: Failure) -> Failure {
-        let (Some(ssh), Failure::Failed { message, .. }) = (&repository.ssh, &failure) else {
+        let cut_off = match &failure {
+            Failure::Failed { message, .. } => message.contains("sftp session"),
+            Failure::Ssh(SshProblem::Other(_)) => true,
+            _ => false,
+        };
+        let (Some(ssh), true) = (&repository.ssh, cut_off) else {
             return failure;
         };
-        if !message.contains("sftp session") {
-            return failure;
-        }
         // Accordion builds the command, and none of its parts has a space.
         let mut parts = ssh.split_whitespace();
         let Some(program) = parts.next() else {
@@ -384,7 +387,12 @@ fn problem_in<'a>(lines: impl Iterator<Item = &'a str>) -> Option<SshProblem> {
         .filter(|line| !line.is_empty() && !line.starts_with("Warning:"))
         .collect();
     let has = |phrase: &str| lines.iter().any(|line| line.contains(phrase));
-    if has("Host key verification failed") || has("has changed") {
+    if has("Host key verification failed")
+        || has("has changed")
+        // The start of ssh's warning, which arrives even when the rest
+        // doesn't.
+        || has("REMOTE HOST IDENTIFICATION HAS CHANGED")
+    {
         return Some(SshProblem::HostKeyChanged);
     }
     if has("Permission denied") {
@@ -449,6 +457,13 @@ mod tests {
         let changed = "subprocess ssh: Host key for nas has changed and you have requested \
                        strict checking.\nsubprocess ssh: Host key verification failed.\n";
         assert_eq!(ssh_problem(changed), Some(SshProblem::HostKeyChanged));
+        // What restic passed on in CI before it stopped.
+        let cut_off = "subprocess ssh: @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n\
+                       subprocess ssh: @    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\n\
+                       subprocess ssh: @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n\
+                       subprocess ssh: The fingerprint for the ED25519 key sent by the remote host is\n\
+                       subprocess ssh: SHA256:4GTfW+vnArdtqNDhSO+aJjqi3OsZJG0DH8xRjh0JGsg.\n";
+        assert_eq!(ssh_problem(cut_off), Some(SshProblem::HostKeyChanged));
         let down = "subprocess ssh: ssh: connect to host nas port 22: Connection refused\n";
         assert_eq!(
             ssh_problem(down),
@@ -492,6 +507,12 @@ mod tests {
         };
         assert!(matches!(
             restic.explain(&repository, dropped()).await,
+            Failure::Ssh(SshProblem::KeyRefused)
+        ));
+        // Only the start of what ssh said, without its reason.
+        let cut_off = Failure::Ssh(SshProblem::Other("SHA256:4GTfW+vnArdtqNDhSO+aJjq".into()));
+        assert!(matches!(
+            restic.explain(&repository, cut_off).await,
             Failure::Ssh(SshProblem::KeyRefused)
         ));
         // Other failures are left as they are.

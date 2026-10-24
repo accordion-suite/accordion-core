@@ -42,7 +42,7 @@ use std::time::{Duration, SystemTime};
 use accordion_types::{BackupRunId, BackupTargetId};
 use rusqlite::{Connection, OptionalExtension, Row};
 use sha2::{Digest, Sha256};
-use tokio::sync::{Mutex, MutexGuard, Notify, watch};
+use tokio::sync::{Mutex, Notify, OwnedMutexGuard, watch};
 
 use crate::db::{self, Database, Migration};
 use crate::storage::{Blob, ContentHash, Storage};
@@ -660,7 +660,7 @@ struct Inner {
     dir: PathBuf,
     restic: Restic,
     /// Held while restic runs, so only one backup or test runs at a time.
-    running: Mutex<()>,
+    running: Arc<Mutex<()>>,
     status: watch::Sender<BackupStatus>,
     /// Wakes [`Backup::maintain`] when the backup hour changes.
     rescheduled: Notify,
@@ -668,14 +668,18 @@ struct Inner {
 
 /// Holds the `running` lock, and shows a run in progress in the status
 /// until it's dropped.
-struct Busy<'a> {
-    _lock: MutexGuard<'a, ()>,
-    status: &'a watch::Sender<BackupStatus>,
+/// Owned, so a run started in the background can hold it.
+struct Busy {
+    _lock: OwnedMutexGuard<()>,
+    backup: Backup,
 }
 
-impl Drop for Busy<'_> {
+impl Drop for Busy {
     fn drop(&mut self) {
-        self.status.send_modify(|status| status.running = false);
+        self.backup
+            .inner
+            .status
+            .send_modify(|status| status.running = false);
     }
 }
 
@@ -712,7 +716,7 @@ impl Backup {
                     temp: dir.join("temp"),
                 },
                 dir,
-                running: Mutex::new(()),
+                running: Arc::new(Mutex::new(())),
                 status: watch::Sender::new(BackupStatus::default()),
                 rescheduled: Notify::new(),
             }),
@@ -727,18 +731,26 @@ impl Backup {
     }
 
     /// Waits for the `running` lock.
-    async fn busy(&self) -> Busy<'_> {
-        let lock = self.inner.running.lock().await;
+    async fn busy(&self) -> Busy {
+        let lock = Arc::clone(&self.inner.running).lock_owned().await;
         self.mark_busy(lock)
     }
 
-    fn mark_busy<'a>(&'a self, lock: MutexGuard<'a, ()>) -> Busy<'a> {
+    /// The `running` lock if nothing else holds it.
+    fn try_busy(&self) -> Result<Busy, Error> {
+        let lock = Arc::clone(&self.inner.running)
+            .try_lock_owned()
+            .map_err(|_| Error::Busy)?;
+        Ok(self.mark_busy(lock))
+    }
+
+    fn mark_busy(&self, lock: OwnedMutexGuard<()>) -> Busy {
         self.inner
             .status
             .send_modify(|status| status.running = true);
         Busy {
             _lock: lock,
-            status: &self.inner.status,
+            backup: self.clone(),
         }
     }
 
@@ -1325,7 +1337,25 @@ impl Backup {
     /// keeping, and checks each repository's structure. A target that fails
     /// doesn't stop the others. Returns each backup and check.
     pub async fn back_up(&self) -> Result<Vec<Run>, Error> {
-        let _busy = self.mark_busy(self.inner.running.try_lock().map_err(|_| Error::Busy)?);
+        let busy = self.try_busy()?;
+        self.back_up_holding(busy).await
+    }
+
+    /// Starts [`Backup::back_up`] in the background. The status shows it
+    /// running before this returns, so a page that's watching never sees it
+    /// idle in between.
+    pub fn start_back_up(&self) -> Result<(), Error> {
+        let busy = self.try_busy()?;
+        let backup = self.clone();
+        tokio::spawn(async move {
+            if let Err(err) = backup.back_up_holding(busy).await {
+                tracing::warn!(%err, "a backup started by hand failed");
+            }
+        });
+        Ok(())
+    }
+
+    async fn back_up_holding(&self, _busy: Busy) -> Result<Vec<Run>, Error> {
         if self.recovery_key().await?.is_none() {
             return Err(Error::NoRecoveryKey);
         }
@@ -1441,7 +1471,24 @@ impl Backup {
     /// a target into a temporary folder, and checks them: the database with
     /// SQLite's integrity check, and each file against its SHA-256 hash.
     pub async fn test_restore(&self, target: &Target) -> Result<Run, Error> {
-        let _busy = self.busy().await;
+        let busy = self.busy().await;
+        self.test_restore_holding(target, busy).await
+    }
+
+    /// Starts [`Backup::test_restore`] in the background, like
+    /// [`Backup::start_back_up`].
+    pub fn start_test_restore(&self, target: Target) -> Result<(), Error> {
+        let busy = self.try_busy()?;
+        let backup = self.clone();
+        tokio::spawn(async move {
+            if let Err(err) = backup.test_restore_holding(&target, busy).await {
+                tracing::warn!(%err, "a restore test started by hand failed to run");
+            }
+        });
+        Ok(())
+    }
+
+    async fn test_restore_holding(&self, target: &Target, _busy: Busy) -> Result<Run, Error> {
         let started_at = now();
         let place = self.inner.dir.join("restore-test");
         let _ = tokio::fs::remove_dir_all(&place).await;

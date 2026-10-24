@@ -1067,3 +1067,43 @@ async fn explains_mistakes_in_an_sftp_folder() {
     let problem = runs[0].problem.as_deref().unwrap();
     assert!(problem.contains("didn't identify itself"), "{problem}");
 }
+
+#[tokio::test]
+async fn shows_a_backup_started_in_the_background_as_running_right_away() {
+    let server = start().await;
+    server.backup.create_recovery_key().await.unwrap();
+    let target = server
+        .backup
+        .add_target("USB disk", &folder(server.usb()))
+        .await
+        .unwrap();
+    let mut status = server.backup.status();
+
+    server.backup.start_back_up().unwrap();
+    // Before the background task has had a chance to run.
+    assert!(status.borrow_and_update().running);
+    assert!(matches!(server.backup.start_back_up(), Err(Error::Busy)));
+    assert!(matches!(
+        server.backup.start_test_restore(target.clone()),
+        Err(Error::Busy)
+    ));
+    status.wait_for(|status| !status.running).await.unwrap();
+    assert_eq!(
+        status.borrow().targets[0]
+            .last_backup
+            .as_ref()
+            .map(|run| run.ok),
+        Some(true)
+    );
+
+    server.backup.start_test_restore(target).unwrap();
+    assert!(status.borrow_and_update().running);
+    status.wait_for(|status| !status.running).await.unwrap();
+    assert_eq!(
+        status.borrow().targets[0]
+            .last_restore_test
+            .as_ref()
+            .map(|run| run.ok),
+        Some(true)
+    );
+}

@@ -23,13 +23,18 @@ const PROBLEM_LINES: usize = 3;
 /// again, followed by the error.
 const RETRYING: &str = " returned error, retrying after ";
 
-/// A repository restic opens: where it is and, for a bucket, its keys.
+/// A repository restic opens: where it is and how to reach it.
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct Repository {
-    /// In restic's form, such as `/media/usb/backups` or
-    /// `s3:https://s3.example.com/backups`.
+    /// In restic's form, such as `/media/usb/backups`,
+    /// `s3:https://s3.example.com/backups`, or `sftp:me@nas:backups`.
     pub location: String,
+    /// A bucket's access key.
     pub keys: Option<Keys>,
+    /// For SFTP, the ssh command restic connects with. Its paths are
+    /// relative to the data folder, because restic doesn't honor quotes in
+    /// it, so a path with a space would break it.
+    pub ssh: Option<String>,
 }
 
 /// The access key for an S3 bucket.
@@ -49,6 +54,8 @@ impl std::fmt::Debug for Keys {
 
 pub(super) struct Restic {
     pub program: PathBuf,
+    /// The data folder, which restic runs in unless told otherwise.
+    pub home: PathBuf,
     pub key_file: PathBuf,
     pub cache: PathBuf,
     pub temp: PathBuf,
@@ -64,11 +71,26 @@ pub(super) enum Failure {
     /// A request to the repository failed, and restic was stopped before it
     /// tried again. Holds the error restic gave.
     Retrying(String),
+    /// ssh couldn't connect to an SFTP server.
+    Ssh(SshProblem),
     /// Anything else, with restic's last lines of error output.
     Failed {
         code: Option<i32>,
         message: String,
     },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum SshProblem {
+    /// The server didn't accept Accordion's key.
+    KeyRefused,
+    /// The server's host key isn't the one recorded when the target was
+    /// added.
+    HostKeyChanged,
+    /// The server couldn't be reached, with ssh's description.
+    Unreachable(String),
+    /// Anything else ssh said.
+    Other(String),
 }
 
 impl Restic {
@@ -191,6 +213,9 @@ impl Restic {
                 .env("AWS_ACCESS_KEY_ID", &keys.id)
                 .env("AWS_SECRET_ACCESS_KEY", &keys.secret);
         }
+        if let Some(ssh) = &repository.ssh {
+            command.arg("-o").arg(format!("sftp.command={ssh}"));
+        }
         command
             .env("RESTIC_REPOSITORY", &repository.location)
             .env("RESTIC_PASSWORD_FILE", &self.key_file)
@@ -204,9 +229,7 @@ impl Restic {
             // If the server stops partway, restic stops too. Its repository
             // stays usable, and the next run carries on.
             .kill_on_drop(true);
-        if let Some(dir) = dir {
-            command.current_dir(dir);
-        }
+        command.current_dir(dir.unwrap_or(&self.home));
         command
     }
 }
@@ -219,11 +242,48 @@ fn failure(status: ExitStatus, stderr: &[u8]) -> Failure {
         Some(NO_REPOSITORY) => Failure::NoRepository,
         Some(LOCKED) => Failure::Locked,
         Some(WRONG_PASSWORD) => Failure::WrongKey,
-        code => Failure::Failed {
-            code,
-            message: last_lines(&stderr),
+        code => match ssh_problem(&stderr) {
+            Some(problem) => Failure::Ssh(problem),
+            None => Failure::Failed {
+                code,
+                message: last_lines(&stderr),
+            },
         },
     }
+}
+
+/// What went wrong connecting over SFTP, from the lines restic passes on
+/// from ssh, if any.
+fn ssh_problem(stderr: &str) -> Option<SshProblem> {
+    let lines: Vec<&str> = stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("subprocess ssh: "))
+        .map(|line| line.trim().trim_start_matches("ssh: "))
+        .filter(|line| !line.is_empty() && !line.starts_with("Warning:"))
+        .collect();
+    let has = |phrase: &str| lines.iter().any(|line| line.contains(phrase));
+    if has("Host key verification failed") || has("has changed") {
+        return Some(SshProblem::HostKeyChanged);
+    }
+    if has("Permission denied") {
+        return Some(SshProblem::KeyRefused);
+    }
+    for phrase in [
+        "Connection refused",
+        "Could not resolve hostname",
+        "No route to host",
+        "timed out",
+        "Network is unreachable",
+        "Connection closed",
+        "Connection reset",
+    ] {
+        if let Some(line) = lines.iter().find(|line| line.contains(phrase)) {
+            return Some(SshProblem::Unreachable((*line).to_owned()));
+        }
+    }
+    lines
+        .last()
+        .map(|line| SshProblem::Other((*line).to_owned()))
 }
 
 /// The last few lines restic wrote, which say what went wrong.
@@ -257,6 +317,24 @@ mod tests {
             "two three four"
         );
         assert_eq!(last_lines(""), "");
+    }
+
+    #[test]
+    fn reads_what_ssh_said() {
+        let refused = "subprocess ssh: nas@192.168.1.50: Permission denied (publickey).\n\
+                       Fatal: unable to open repository";
+        assert_eq!(ssh_problem(refused), Some(SshProblem::KeyRefused));
+        let changed = "subprocess ssh: Host key for nas has changed and you have requested \
+                       strict checking.\nsubprocess ssh: Host key verification failed.\n";
+        assert_eq!(ssh_problem(changed), Some(SshProblem::HostKeyChanged));
+        let down = "subprocess ssh: ssh: connect to host nas port 22: Connection refused\n";
+        assert_eq!(
+            ssh_problem(down),
+            Some(SshProblem::Unreachable(
+                "connect to host nas port 22: Connection refused".into()
+            ))
+        );
+        assert_eq!(ssh_problem("Fatal: wrong password or no key found\n"), None);
     }
 
     #[test]

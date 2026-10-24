@@ -8,10 +8,11 @@
 //! restic runs as a separate process, so a problem in a backup can't stop
 //! the server.
 //!
-//! A target is a folder, such as one on a USB disk, or an S3 bucket at a
-//! storage provider. A bucket's access key is kept in the database, so a
-//! restored server goes on backing up to it. It's read only when restic
-//! runs, so it never reaches the status that pages show.
+//! A target is a folder, such as one on a USB disk, an S3 bucket at a
+//! storage provider, or a folder on another computer over SFTP. A bucket's
+//! access key, Accordion's SSH key, and each SFTP server's host key are kept
+//! in the database, so a restored server goes on backing up to them. They're
+//! read only when restic runs, so they never reach the status pages show.
 //!
 //! Every repository is locked with the recovery key. The owner keeps a copy
 //! of it off the box, and `backup/recovery-key` in the data folder keeps
@@ -33,7 +34,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::future::Future;
 use std::io::{self, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -46,7 +47,7 @@ use tokio::sync::{Mutex, MutexGuard, Notify, watch};
 use crate::db::{self, Database, Migration};
 use crate::storage::{Blob, ContentHash, Storage};
 use crate::{random, sql_now, time};
-use restic::{Failure, Keys, Repository, Restic};
+use restic::{Failure, Keys, Repository, Restic, SshProblem};
 
 const OWNER: &str = "backup";
 
@@ -150,7 +151,72 @@ static MIGRATIONS: &[Migration] = &[
         CREATE INDEX backup_runs_latest ON backup_runs (target_id, kind, finished_at);
     ",
     },
+    Migration {
+        version: 4,
+        name: "Add SFTP folders as targets",
+        // Rebuilt like version 3, for the new kind.
+        sql: "
+        CREATE TABLE backup_targets_new (
+            id BLOB PRIMARY KEY CHECK (length(id) = 16),
+            name TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK (kind IN ('folder', 's3', 'sftp')),
+            -- In restic's form: a folder's path, s3:https://host/bucket, or
+            -- sftp:user@host:folder.
+            location TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            pruned_at TEXT,
+            next_part INTEGER NOT NULL DEFAULT 1 CHECK (next_part BETWEEN 1 AND 8),
+            -- A bucket's access key.
+            access_key_id TEXT,
+            secret_access_key TEXT,
+            -- An SFTP server's port, and its host key in known_hosts form,
+            -- as it was when the target was added.
+            ssh_port INTEGER CHECK (ssh_port BETWEEN 1 AND 65535),
+            host_key TEXT,
+            CHECK ((kind = 's3') = (access_key_id IS NOT NULL AND secret_access_key IS NOT NULL)),
+            CHECK ((kind = 'sftp') = (ssh_port IS NOT NULL AND host_key IS NOT NULL))
+        ) STRICT, WITHOUT ROWID;
+        INSERT INTO backup_targets_new (id, name, kind, location, created_at, pruned_at,
+                                        next_part, access_key_id, secret_access_key)
+            SELECT id, name, kind, location, created_at, pruned_at, next_part,
+                   access_key_id, secret_access_key
+            FROM backup_targets;
+
+        CREATE TABLE backup_runs_new (
+            id BLOB PRIMARY KEY CHECK (length(id) = 16),
+            target_id BLOB NOT NULL REFERENCES backup_targets_new (id) ON DELETE CASCADE,
+            kind TEXT NOT NULL CHECK (kind IN ('backup', 'check', 'restore_test')),
+            started_at TEXT NOT NULL,
+            finished_at TEXT NOT NULL,
+            ok INTEGER NOT NULL CHECK (ok IN (0, 1)),
+            snapshot TEXT,
+            bytes_added INTEGER CHECK (bytes_added >= 0),
+            problem TEXT
+        ) STRICT, WITHOUT ROWID;
+        INSERT INTO backup_runs_new SELECT * FROM backup_runs;
+
+        DROP TABLE backup_runs;
+        DROP TABLE backup_targets;
+        ALTER TABLE backup_targets_new RENAME TO backup_targets;
+        ALTER TABLE backup_runs_new RENAME TO backup_runs;
+        CREATE INDEX backup_runs_latest ON backup_runs (target_id, kind, finished_at);
+
+        -- Accordion's SSH key, which SFTP servers let in. Created the first
+        -- time it's needed, in OpenSSH's formats.
+        ALTER TABLE backup_settings ADD COLUMN ssh_private_key TEXT;
+        ALTER TABLE backup_settings ADD COLUMN ssh_public_key TEXT;
+    ",
+    },
 ];
+
+/// Where ssh finds Accordion's SSH key and each SFTP server's host key. restic
+/// runs in the data folder, and these paths are relative to it, because
+/// restic doesn't honor quotes in its ssh command.
+const SSH_DIR: &str = "backup/ssh";
+const SSH_KEY: &str = "backup/ssh/id_ed25519";
+/// The host key of a server that's being added or restored from, before
+/// it's recorded.
+const NEW_HOST_KEY: &str = "backup/ssh/new.known_hosts";
 
 /// Letters in a recovery key: about 141 bits.
 const KEY_LEN: usize = 30;
@@ -266,6 +332,40 @@ pub enum Error {
     )]
     Unreachable { host: String, problem: String },
 
+    #[error(
+        "Enter the other computer's name or address, such as nas.local or 192.168.1.50. \
+         Add :port at the end if its SSH port isn't 22."
+    )]
+    BadServer,
+
+    #[error("Enter the username Accordion signs in to the other computer with.")]
+    BadUsername,
+
+    #[error(
+        "Enter the folder on the other computer, such as /volume1/backups/accordion, or \
+         backups/accordion for one inside the user's home folder."
+    )]
+    BadRemoteFolder,
+
+    #[error(
+        "Accordion needs OpenSSH's ssh and ssh-keygen programs for backups over SFTP. \
+         Install the openssh-client package, then try again."
+    )]
+    NoSsh,
+
+    #[error(
+        "{host} didn't accept Accordion's SSH key. Add the key shown on this page to \
+         ~/.ssh/authorized_keys for {user} on {host}, then try again."
+    )]
+    SshKeyRefused { host: String, user: String },
+
+    #[error(
+        "{0} didn't identify itself the way it did before, so Accordion didn't send it \
+         anything. If you reinstalled or replaced that computer, remove this location \
+         and add it again. If you didn't, someone may be pretending to be it."
+    )]
+    HostKeyChanged(String),
+
     #[error("That backup location is already set up.")]
     TargetExists,
 
@@ -348,7 +448,15 @@ impl Target {
     pub fn bucket(&self) -> Option<(&str, &str)> {
         match self.kind {
             TargetKind::S3 => bucket_parts(&self.location),
-            TargetKind::Folder => None,
+            TargetKind::Folder | TargetKind::Sftp => None,
+        }
+    }
+
+    /// The username, host, and folder, for a folder over SFTP.
+    pub fn sftp(&self) -> Option<(&str, &str, &str)> {
+        match self.kind {
+            TargetKind::Sftp => sftp_parts(&self.location),
+            TargetKind::Folder | TargetKind::S3 => None,
         }
     }
 }
@@ -357,6 +465,7 @@ impl Target {
 pub enum TargetKind {
     Folder,
     S3,
+    Sftp,
 }
 
 impl TargetKind {
@@ -364,6 +473,7 @@ impl TargetKind {
         match self {
             Self::Folder => "folder",
             Self::S3 => "s3",
+            Self::Sftp => "sftp",
         }
     }
 }
@@ -374,6 +484,45 @@ pub enum Place {
     /// A folder's full path, such as one on a USB disk.
     Folder(PathBuf),
     S3(S3Bucket),
+    Sftp(SftpFolder),
+}
+
+/// A folder on another computer, reached over SFTP, as the owner types it
+/// in. Accordion signs in with its own SSH key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SftpFolder {
+    /// A name or address, with `:port` if SSH isn't on port 22.
+    pub server: String,
+    pub username: String,
+    /// A full path, or one inside the user's home folder.
+    pub folder: String,
+}
+
+/// A checked [`SftpFolder`].
+struct SftpServer {
+    user: String,
+    host: String,
+    port: u16,
+    folder: String,
+}
+
+impl SftpServer {
+    fn location(&self) -> String {
+        format!("sftp:{}@{}:{}", self.user, self.host, self.folder)
+    }
+
+    /// The command restic connects with. ssh reads only Accordion's key and
+    /// the given host keys, never asks anything, and with `accept-new`
+    /// records the key of a server it hasn't seen.
+    fn ssh(&self, known_hosts: &str, check: &str) -> String {
+        format!(
+            "ssh -F /dev/null -i {SSH_KEY} -o IdentitiesOnly=yes -o BatchMode=yes \
+             -o LogLevel=ERROR -o ConnectTimeout=30 -o ServerAliveInterval=60 \
+             -o UserKnownHostsFile={known_hosts} -o StrictHostKeyChecking={check} \
+             -p {} {}@{} -s sftp",
+            self.port, self.user, self.host
+        )
+    }
 }
 
 /// An S3 bucket at a storage provider, as the owner types it in.
@@ -547,6 +696,9 @@ impl Backup {
         for folder in [&dir, &dir.join("cache"), &dir.join("temp")] {
             std::fs::create_dir_all(folder)?;
         }
+        let ssh = data_dir.join(SSH_DIR);
+        std::fs::create_dir_all(&ssh)?;
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700))?;
         let backup = Self {
             inner: Arc::new(Inner {
                 db,
@@ -554,6 +706,7 @@ impl Backup {
                 data_dir: data_dir.to_owned(),
                 restic: Restic {
                     program: restic,
+                    home: data_dir.to_owned(),
                     key_file: dir.join("recovery-key"),
                     cache: dir.join("cache"),
                     temp: dir.join("temp"),
@@ -906,9 +1059,13 @@ impl Backup {
         if name.is_empty() || name.chars().count() > 100 {
             return Err(Error::BadName);
         }
-        let (kind, repository) = match place {
-            Place::Folder(path) => (TargetKind::Folder, self.new_folder(path).await?),
-            Place::S3(bucket) => (TargetKind::S3, s3_repository(bucket)?),
+        let (kind, repository, port) = match place {
+            Place::Folder(path) => (TargetKind::Folder, self.new_folder(path).await?, None),
+            Place::S3(bucket) => (TargetKind::S3, s3_repository(bucket)?, None),
+            Place::Sftp(folder) => {
+                let (repository, port) = self.new_sftp(folder).await?;
+                (TargetKind::Sftp, repository, Some(port))
+            }
         };
         if self.recovery_key().await?.is_none() {
             return Err(Error::NoRecoveryKey);
@@ -930,6 +1087,11 @@ impl Backup {
             Err(Failure::WrongKey) => return Err(Error::WrongKey(place_name(&repository))),
             Err(failure) => return Err(setup_failure(&failure, &repository)),
         }
+        // ssh recorded the server's host key on the way, to check from now on.
+        let host_key = match kind {
+            TargetKind::Sftp => Some(self.new_host_key().await?),
+            TargetKind::Folder | TargetKind::S3 => None,
+        };
 
         let id = BackupTargetId::generate();
         let target = self
@@ -948,10 +1110,11 @@ impl Backup {
                 tx.execute(
                     concat!(
                         "INSERT INTO backup_targets (id, name, kind, location, created_at,
-                                                     access_key_id, secret_access_key)
+                                                     access_key_id, secret_access_key,
+                                                     ssh_port, host_key)
                          VALUES (?1, ?2, ?3, ?4, ",
                         sql_now!(),
-                        ", ?5, ?6)"
+                        ", ?5, ?6, ?7, ?8)"
                     ),
                     (
                         id.as_uuid(),
@@ -960,6 +1123,8 @@ impl Backup {
                         &repository.location,
                         keys.map(|keys| &keys.id),
                         keys.map(|keys| &keys.secret),
+                        port,
+                        &host_key,
                     ),
                 )?;
                 target(tx, id)?.ok_or(Error::NotFound)
@@ -986,6 +1151,144 @@ impl Backup {
             return Err(Error::InsideData);
         }
         folder_repository(&path)
+    }
+
+    /// Checks a folder over SFTP, for adding or restoring from. ssh records
+    /// the server's host key in [`NEW_HOST_KEY`] when it first connects.
+    async fn new_sftp(&self, folder: &SftpFolder) -> Result<(Repository, u16), Error> {
+        let server = sftp_server(folder)?;
+        self.ready_ssh_key().await?;
+        ignore_missing(tokio::fs::remove_file(self.inner.data_dir.join(NEW_HOST_KEY)).await)?;
+        let repository = Repository {
+            location: server.location(),
+            keys: None,
+            ssh: Some(server.ssh(NEW_HOST_KEY, "accept-new")),
+        };
+        Ok((repository, server.port))
+    }
+
+    /// The host key ssh recorded for a new server.
+    async fn new_host_key(&self) -> Result<String, Error> {
+        let path = self.inner.data_dir.join(NEW_HOST_KEY);
+        let host_key = tokio::fs::read_to_string(&path).await?;
+        tokio::fs::remove_file(&path).await?;
+        if host_key.trim().is_empty() {
+            return Err(Error::Restic(
+                "ssh connected without recording the server's host key.".into(),
+            ));
+        }
+        Ok(host_key)
+    }
+
+    /// Accordion's SSH public key, for the owner to add to
+    /// `~/.ssh/authorized_keys` on an SFTP server. Creates the key the first
+    /// time.
+    pub async fn ssh_public_key(&self) -> Result<String, Error> {
+        if let Some((_, public)) = self.ssh_key().await? {
+            return Ok(public);
+        }
+        let new = self.inner.data_dir.join(SSH_DIR).join("new-key");
+        let new_public = new.with_extension("pub");
+        for path in [&new, &new_public] {
+            ignore_missing(tokio::fs::remove_file(path).await)?;
+        }
+        let mut command = tokio::process::Command::new("ssh-keygen");
+        command.env_clear();
+        if let Some(path) = std::env::var_os("PATH") {
+            command.env("PATH", path);
+        }
+        let output = command
+            .args([
+                "-q",
+                "-t",
+                "ed25519",
+                "-N",
+                "",
+                "-C",
+                "accordion-backups",
+                "-f",
+            ])
+            .arg(&new)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .await
+            .map_err(|err| match err.kind() {
+                io::ErrorKind::NotFound => Error::NoSsh,
+                _ => Error::Io(err),
+            })?;
+        if !output.status.success() {
+            return Err(Error::Restic(format!(
+                "ssh-keygen couldn't create Accordion's SSH key: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        let private = tokio::fs::read_to_string(&new).await?;
+        let public = tokio::fs::read_to_string(&new_public).await?;
+        for path in [&new, &new_public] {
+            tokio::fs::remove_file(path).await?;
+        }
+        let public = public.trim().to_owned();
+        // If two requests raced, the first key is kept.
+        self.inner
+            .db
+            .write(move |tx| {
+                tx.execute(
+                    "UPDATE backup_settings SET ssh_private_key = ?1, ssh_public_key = ?2
+                     WHERE id = 1 AND ssh_private_key IS NULL",
+                    (&private, &public),
+                )
+            })
+            .await?;
+        let (_, public) = self.ssh_key().await?.ok_or(Error::NotFound)?;
+        Ok(public)
+    }
+
+    async fn ssh_key(&self) -> Result<Option<(String, String)>, Error> {
+        Ok(self
+            .inner
+            .db
+            .read(|conn| {
+                conn.query_row(
+                    "SELECT ssh_private_key, ssh_public_key FROM backup_settings WHERE id = 1",
+                    [],
+                    |row| {
+                        Ok(match (row.get(0)?, row.get(1)?) {
+                            (Some(private), Some(public)) => Some((private, public)),
+                            _ => None,
+                        })
+                    },
+                )
+            })
+            .await?)
+    }
+
+    /// Puts Accordion's SSH key where ssh reads it, creating the key if
+    /// there isn't one. It's written each time, so a restored server's key
+    /// is the one used.
+    async fn ready_ssh_key(&self) -> Result<(), Error> {
+        self.ssh_public_key().await?;
+        let (private, _) = self.ssh_key().await?.ok_or(Error::NotFound)?;
+        self.write_private(SSH_KEY, private).await
+    }
+
+    /// Writes a file in the data folder that only Accordion can read.
+    async fn write_private(&self, path: &str, contents: String) -> Result<(), Error> {
+        let path = self.inner.data_dir.join(path);
+        tokio::task::spawn_blocking(move || {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&path)?;
+            // ssh refuses a key that others can read.
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            file.write_all(contents.as_bytes())?;
+            file.sync_all()
+        })
+        .await
+        .expect("writing a private file panicked")?;
+        Ok(())
     }
 
     /// Every place backups go, oldest first.
@@ -1357,6 +1660,7 @@ impl Backup {
                 folder_repository(&path)?
             }
             Place::S3(bucket) => s3_repository(bucket)?,
+            Place::Sftp(folder) => self.new_sftp(folder).await?.0,
         };
         let dir = self.restore_dir();
         let key_file = dir.join("recovery-key");
@@ -1376,6 +1680,7 @@ impl Backup {
         .expect("preparing the restore panicked")?;
         let restic = Restic {
             program: self.inner.restic.program.clone(),
+            home: self.inner.data_dir.clone(),
             key_file,
             cache: self.inner.restic.cache.clone(),
             temp: self.inner.restic.temp.clone(),
@@ -1383,10 +1688,14 @@ impl Backup {
         Ok((repository, restic))
     }
 
-    /// The repository for a target, with its keys if it's a bucket.
+    /// The repository for a target, with its keys if it's a bucket, or how to
+    /// connect if it's over SFTP.
     async fn repository(&self, target: &Target) -> Result<Repository, Error> {
+        if target.kind == TargetKind::Sftp {
+            return self.sftp_repository(target).await;
+        }
         let keys = match target.kind {
-            TargetKind::Folder => None,
+            TargetKind::Folder | TargetKind::Sftp => None,
             TargetKind::S3 => {
                 let id = target.id;
                 self.inner
@@ -1411,6 +1720,39 @@ impl Backup {
         Ok(Repository {
             location: target.location.clone(),
             keys,
+            ssh: None,
+        })
+    }
+
+    /// Connects to an SFTP target only if it still has the host key it had
+    /// when it was added.
+    async fn sftp_repository(&self, target: &Target) -> Result<Repository, Error> {
+        let id = target.id;
+        let (port, host_key): (u16, String) = self
+            .inner
+            .db
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT ssh_port, host_key FROM backup_targets WHERE id = ?1",
+                    [id.as_uuid()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+            })
+            .await?;
+        let (user, host, folder) = sftp_parts(&target.location).ok_or(Error::NotFound)?;
+        let server = SftpServer {
+            user: user.to_owned(),
+            host: host.to_owned(),
+            port,
+            folder: folder.to_owned(),
+        };
+        self.ready_ssh_key().await?;
+        let known_hosts = format!("{SSH_DIR}/{id}.known_hosts");
+        self.write_private(&known_hosts, host_key).await?;
+        Ok(Repository {
+            location: target.location.clone(),
+            keys: None,
+            ssh: Some(server.ssh(&known_hosts, "yes")),
         })
     }
 
@@ -1521,6 +1863,10 @@ fn describe(failure: &Failure, repository: &Repository) -> String {
             "There's no backup in {place}. Check that the bucket still exists at your \
              storage provider, then try again."
         ),
+        Failure::NoRepository if repository.ssh.is_some() => format!(
+            "There's no backup in {place}. Check that the folder is still there, then \
+             try again."
+        ),
         Failure::NoRepository => format!(
             "There's no backup in {place}. If it's on a USB disk, check that the \
              disk is plugged in, then try again."
@@ -1533,6 +1879,23 @@ fn describe(failure: &Failure, repository: &Repository) -> String {
             format!("The backup in {place} is locked with a different recovery key.")
         }
         Failure::Retrying(problem) => format!("restic couldn't reach {place}: {problem}"),
+        Failure::Ssh(problem) => {
+            let (user, host, _) = sftp_parts(&repository.location).unwrap_or(("", "", ""));
+            match problem {
+                SshProblem::KeyRefused => format!(
+                    "{host} didn't accept Accordion's SSH key. Check that the key from the \
+                     backups page is still in ~/.ssh/authorized_keys for {user} on {host}."
+                ),
+                SshProblem::HostKeyChanged => Error::HostKeyChanged(host.to_owned()).to_string(),
+                SshProblem::Unreachable(problem) => format!(
+                    "Accordion couldn't reach {host} ({problem}). Check that it's turned on \
+                     and connected to the network, then try again."
+                ),
+                SshProblem::Other(problem) => {
+                    format!("Accordion couldn't connect to {host} over SFTP: {problem}")
+                }
+            }
+        }
         Failure::Failed { code, message } => {
             let code =
                 code.map_or_else(|| "stopped".to_owned(), |code| format!("exit code {code}"));
@@ -1544,6 +1907,23 @@ fn describe(failure: &Failure, repository: &Repository) -> String {
 /// What a restic failure means while the owner sets up a target or looks
 /// for backups, with the common mistakes in a bucket's details spelled out.
 fn setup_failure(failure: &Failure, repository: &Repository) -> Error {
+    if let Failure::Ssh(problem) = failure
+        && let Some((user, host, _)) = sftp_parts(&repository.location)
+    {
+        let host = host.to_owned();
+        return match problem {
+            SshProblem::KeyRefused => Error::SshKeyRefused {
+                host,
+                user: user.to_owned(),
+            },
+            SshProblem::HostKeyChanged => Error::HostKeyChanged(host),
+            SshProblem::Unreachable(problem) => Error::Unreachable {
+                host,
+                problem: problem.clone(),
+            },
+            SshProblem::Other(_) => Error::Restic(describe(failure, repository)),
+        };
+    }
     let Failure::Retrying(problem) = failure else {
         return Error::Restic(describe(failure, repository));
     };
@@ -1583,15 +1963,70 @@ fn restore_failure(failure: &Failure, repository: &Repository) -> Error {
     }
 }
 
-/// How messages name a repository: a folder's path, or "the bucket b at
-/// host".
+/// How messages name a repository: a folder's path, "the bucket b at
+/// host", or "the folder f on host".
 fn place_name(repository: &Repository) -> String {
+    if repository.ssh.is_some()
+        && let Some((_, host, folder)) = sftp_parts(&repository.location)
+    {
+        return format!("the folder {folder} on {host}");
+    }
     match bucket_parts(&repository.location) {
         Some((host, bucket)) if repository.keys.is_some() => {
             format!("the bucket {bucket} at {host}")
         }
         _ => repository.location.clone(),
     }
+}
+
+/// The username, host, and folder in an `sftp:` location.
+fn sftp_parts(location: &str) -> Option<(&str, &str, &str)> {
+    let (user, rest) = location.strip_prefix("sftp:")?.split_once('@')?;
+    let (host, folder) = rest.split_once(':')?;
+    Some((user, host, folder))
+}
+
+/// Checks what the owner typed for a folder over SFTP. Nothing in it can
+/// start with a hyphen, which ssh would read as an option.
+fn sftp_server(folder: &SftpFolder) -> Result<SftpServer, Error> {
+    let server = folder.server.trim().to_ascii_lowercase();
+    let (host, port) = match server.rsplit_once(':') {
+        Some((host, port)) => (host, port.parse::<u16>().ok().filter(|&port| port > 0)),
+        None => (server.as_str(), Some(22)),
+    };
+    let host_ok = !host.is_empty()
+        && host.len() <= 253
+        && host.split('.').all(|label| {
+            !label.is_empty()
+                && !label.starts_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        });
+    let port = port.filter(|_| host_ok).ok_or(Error::BadServer)?;
+    let user = folder.username.trim();
+    let user_ok = (1..=32).contains(&user.len())
+        && !user.starts_with('-')
+        && user
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    if !user_ok {
+        return Err(Error::BadUsername);
+    }
+    let path = folder.folder.trim();
+    let path_ok = !path.is_empty()
+        && path.len() <= 4096
+        && !path.starts_with('-')
+        && !path.chars().any(char::is_control);
+    if !path_ok {
+        return Err(Error::BadRemoteFolder);
+    }
+    Ok(SftpServer {
+        user: user.to_owned(),
+        host: host.to_owned(),
+        port,
+        folder: path.to_owned(),
+    })
 }
 
 /// The host and bucket in an `s3:` location.
@@ -1611,6 +2046,7 @@ fn folder_repository(path: &Path) -> Result<Repository, Error> {
     Ok(Repository {
         location,
         keys: None,
+        ssh: None,
     })
 }
 
@@ -1631,6 +2067,7 @@ fn s3_repository(bucket: &S3Bucket) -> Result<Repository, Error> {
             id: id.to_owned(),
             secret: secret.to_owned(),
         }),
+        ssh: None,
     })
 }
 
@@ -1772,6 +2209,7 @@ fn target_from_row(row: &Row<'_>) -> rusqlite::Result<Target> {
         name: row.get(1)?,
         kind: match kind.as_str() {
             "s3" => TargetKind::S3,
+            "sftp" => TargetKind::Sftp,
             _ => TargetKind::Folder,
         },
         location: row.get(3)?,
@@ -1880,6 +2318,36 @@ mod tests {
         assert_eq!(runs, 0);
     }
 
+    #[tokio::test]
+    async fn adding_sftp_keeps_buckets_and_their_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("accordion.db")).unwrap();
+        db.migrate(OWNER, &MIGRATIONS[..3]).await.unwrap();
+        db.write(|tx| {
+            tx.execute_batch(
+                "INSERT INTO backup_targets (id, name, kind, location, created_at,
+                                             access_key_id, secret_access_key)
+                 VALUES (x'00000000000000000000000000000001', 'Backblaze', 's3',
+                         's3:https://s3.example.com/backups', '2026-10-01T03:00:00.000Z',
+                         'id', 'secret');",
+            )
+        })
+        .await
+        .unwrap();
+        db.migrate(OWNER, MIGRATIONS).await.unwrap();
+        let keys: (String, String) = db
+            .read(|conn| {
+                conn.query_row(
+                    "SELECT access_key_id, secret_access_key FROM backup_targets",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(keys, ("id".into(), "secret".into()));
+    }
+
     #[test]
     fn reads_s3_addresses() {
         for (typed, endpoint) in [
@@ -1921,5 +2389,21 @@ mod tests {
         );
         let folder = folder_repository(Path::new("/media/usb/backups")).unwrap();
         assert_eq!(place_name(&folder), "/media/usb/backups");
+        let server = sftp_server(&SftpFolder {
+            server: "NAS.local:2222".into(),
+            username: "accordion".into(),
+            folder: "/volume1/backups".into(),
+        })
+        .unwrap();
+        assert_eq!(server.port, 2222);
+        let sftp = Repository {
+            location: server.location(),
+            keys: None,
+            ssh: Some(server.ssh("known_hosts", "yes")),
+        };
+        assert_eq!(
+            place_name(&sftp),
+            "the folder /volume1/backups on nas.local"
+        );
     }
 }

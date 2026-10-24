@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use accordion_core::backup::{
-    self, Backup, CheckDepth, Error, KeyState, Place, RunKind, S3Bucket, TargetKind,
+    self, Backup, CheckDepth, Error, KeyState, Place, RunKind, S3Bucket, SftpFolder, TargetKind,
 };
 use accordion_core::db::Database;
 use accordion_core::identity::{Identity, NewUser};
@@ -840,4 +840,230 @@ async fn explains_mistakes_in_a_buckets_details() {
         err.to_string().contains("couldn't reach localhost:1"),
         "{err}"
     );
+}
+
+/// A key that isn't Accordion's. rclone's SFTP server doesn't start without
+/// at least one key to let in.
+const SOMEONE_ELSE: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOpxJSehVegSset/luntvtC4D8ejfU/a2K5lLh1qACf6";
+
+/// rclone's SFTP server, standing in for a NAS or another computer. It
+/// keeps its host key across restarts, like a real server, unless told to
+/// change it.
+struct SftpProvider {
+    dir: tempfile::TempDir,
+    server: Option<std::process::Child>,
+    address: String,
+}
+
+impl SftpProvider {
+    /// Starts with `authorized` as the keys it lets in.
+    fn start(authorized: &[&str]) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("root")).unwrap();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut provider = Self {
+            dir,
+            server: None,
+            address: format!("127.0.0.1:{port}"),
+        };
+        provider.new_host_key();
+        provider.restart(authorized);
+        provider
+    }
+
+    fn new_host_key(&self) {
+        let key = self.dir.path().join("host");
+        let _ = std::fs::remove_file(&key);
+        let _ = std::fs::remove_file(key.with_extension("pub"));
+        let status = Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+            .arg(&key)
+            .status()
+            .expect("These tests run ssh-keygen. Install OpenSSH's client.");
+        assert!(status.success());
+    }
+
+    fn restart(&mut self, authorized: &[&str]) {
+        self.stop();
+        let keys = self.dir.path().join("authorized_keys");
+        std::fs::write(&keys, authorized.join("\n") + "\n").unwrap();
+        let server = Command::new(rclone())
+            .args(["serve", "sftp", "--addr", &self.address, "--key"])
+            .arg(self.dir.path().join("host"))
+            .arg("--authorized-keys")
+            .arg(&keys)
+            .arg(self.dir.path().join("root"))
+            .env("RCLONE_CONFIG", "/dev/null")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        self.server = Some(server);
+        let started = std::time::Instant::now();
+        while std::net::TcpStream::connect(&self.address).is_err() {
+            assert!(started.elapsed().as_secs() < 10, "rclone didn't start");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    fn stop(&mut self) {
+        if let Some(mut server) = self.server.take() {
+            let _ = server.kill();
+            let _ = server.wait();
+        }
+    }
+
+    fn folder(&self) -> SftpFolder {
+        SftpFolder {
+            server: self.address.clone(),
+            username: "nas".into(),
+            folder: "backups/accordion".into(),
+        }
+    }
+}
+
+impl Drop for SftpProvider {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+#[tokio::test]
+async fn backs_up_over_sftp_and_restores_from_it() {
+    let server = start().await;
+    let key = server.backup.create_recovery_key().await.unwrap();
+    let public = server.backup.ssh_public_key().await.unwrap();
+    assert!(public.starts_with("ssh-ed25519 "), "{public}");
+    assert!(public.ends_with(" accordion-backups"), "{public}");
+    assert_eq!(server.backup.ssh_public_key().await.unwrap(), public);
+
+    let mut provider = SftpProvider::start(&[&public]);
+    let target = server
+        .backup
+        .add_target("NAS", &Place::Sftp(provider.folder()))
+        .await
+        .unwrap();
+    assert_eq!(target.kind, TargetKind::Sftp);
+    assert_eq!(
+        target.sftp(),
+        Some(("nas", "127.0.0.1", "backups/accordion"))
+    );
+    let runs = server.backup.back_up().await.unwrap();
+    assert!(runs.iter().all(|run| run.ok), "{runs:?}");
+    let run = server.backup.test_restore(&target).await.unwrap();
+    assert!(run.ok, "{run:?}");
+
+    // A fresh server has its own key, which the owner adds before restoring.
+    let (data, _services, fresh) = fresh().await;
+    let place = Place::Sftp(provider.folder());
+    let err = fresh
+        .find_snapshots(&place, key.as_str())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::SshKeyRefused { .. }), "{err}");
+    let fresh_public = fresh.ssh_public_key().await.unwrap();
+    assert_ne!(fresh_public, public);
+    provider.restart(&[&public, &fresh_public]);
+    let snapshots = fresh.find_snapshots(&place, key.as_str()).await.unwrap();
+    assert_eq!(snapshots.len(), 1);
+    fresh
+        .restore(&place, key.as_str(), &snapshots[0].id, |_| {})
+        .await
+        .unwrap();
+    drop(fresh);
+    assert!(backup::apply_restore(data.path()).unwrap());
+
+    // The restored server has the old key and the server's host key, so it
+    // goes on backing up.
+    let db = Database::open(&data.path().join("accordion.db")).unwrap();
+    let identity = Identity::new(db.clone()).await.unwrap();
+    let storage = Storage::open(db.clone(), identity, &data.path().join("storage"))
+        .await
+        .unwrap();
+    let restored = Backup::open(db, storage, data.path(), restic())
+        .await
+        .unwrap();
+    assert_eq!(restored.targets().await.unwrap(), [target]);
+    assert_eq!(restored.ssh_public_key().await.unwrap(), public);
+    let runs = restored.back_up().await.unwrap();
+    assert!(runs.iter().all(|run| run.ok), "{runs:?}");
+}
+
+#[tokio::test]
+async fn explains_mistakes_in_an_sftp_folder() {
+    let server = start().await;
+    server.backup.create_recovery_key().await.unwrap();
+    let public = server.backup.ssh_public_key().await.unwrap();
+    let add = |folder: SftpFolder| {
+        let backup = server.backup.clone();
+        async move { backup.add_target("NAS", &Place::Sftp(folder)).await }
+    };
+    let started = std::time::Instant::now();
+
+    // The owner hasn't added Accordion's key yet, only someone else's.
+    let mut provider = SftpProvider::start(&[SOMEONE_ELSE]);
+    let err = add(provider.folder()).await.unwrap_err();
+    assert!(matches!(err, Error::SshKeyRefused { .. }), "{err}");
+    assert!(err.to_string().contains("for nas on 127.0.0.1"), "{err}");
+
+    // Nothing is listening on port 1.
+    let err = add(SftpFolder {
+        server: "127.0.0.1:1".into(),
+        ..provider.folder()
+    })
+    .await
+    .unwrap_err();
+    assert!(matches!(err, Error::Unreachable { .. }), "{err}");
+    assert!(started.elapsed().as_secs() < 30, "{:?}", started.elapsed());
+
+    for typed in [
+        "",
+        "-oProxyCommand=x",
+        "nas:0",
+        "nas:70000",
+        "na s",
+        "nas..local",
+    ] {
+        let err = add(SftpFolder {
+            server: typed.into(),
+            ..provider.folder()
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(err, Error::BadServer), "{typed}: {err}");
+    }
+    for typed in ["", "-x", "a b"] {
+        let err = add(SftpFolder {
+            username: typed.into(),
+            ..provider.folder()
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(err, Error::BadUsername), "{typed}: {err}");
+    }
+    for typed in ["", " ", "-x"] {
+        let err = add(SftpFolder {
+            folder: typed.into(),
+            ..provider.folder()
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(err, Error::BadRemoteFolder), "{typed}: {err}");
+    }
+    assert!(server.backup.targets().await.unwrap().is_empty());
+
+    // Once it's added, a server with a different host key gets nothing.
+    provider.restart(&[&public]);
+    add(provider.folder()).await.unwrap();
+    provider.new_host_key();
+    provider.restart(&[&public]);
+    let runs = server.backup.back_up().await.unwrap();
+    assert!(!runs[0].ok);
+    let problem = runs[0].problem.as_deref().unwrap();
+    assert!(problem.contains("didn't identify itself"), "{problem}");
 }

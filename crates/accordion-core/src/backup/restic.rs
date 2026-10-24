@@ -19,6 +19,10 @@ const WRONG_PASSWORD: i32 = 12;
 /// The lines of restic's error output kept for a problem's description.
 const PROBLEM_LINES: usize = 3;
 
+/// How long to wait for ssh when asking it why a connection failed. Its own
+/// connection timeout is 30 seconds.
+const SSH_CHECK_TIME: std::time::Duration = std::time::Duration::from_secs(45);
+
 /// What restic prints before it tries a failed request to a repository
 /// again, followed by the error.
 const RETRYING: &str = " returned error, retrying after ";
@@ -111,7 +115,9 @@ impl Restic {
         if output.status.success() {
             return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
         }
-        Err(failure(output.status, &output.stderr))
+        Err(self
+            .explain(repository, failure(output.status, &output.stderr))
+            .await)
     }
 
     /// Like [`Restic::run`], but stops restic the first time a request
@@ -161,7 +167,9 @@ impl Restic {
         if status.success() {
             return Ok(String::from_utf8_lossy(&output).into_owned());
         }
-        Err(failure(status, errors.as_bytes()))
+        Err(self
+            .explain(repository, failure(status, errors.as_bytes()))
+            .await)
     }
 
     /// Like [`Restic::run`], but hands each line restic prints to `on_line`
@@ -197,7 +205,49 @@ impl Restic {
         if status.success() {
             return Ok(());
         }
-        Err(failure(status, &errors))
+        Err(self.explain(repository, failure(status, &errors)).await)
+    }
+
+    /// restic passes on what ssh says, but can stop before ssh has said it.
+    /// When an SFTP connection fails without ssh's reason, this asks ssh
+    /// directly, with the same command.
+    async fn explain(&self, repository: &Repository, failure: Failure) -> Failure {
+        let (Some(ssh), Failure::Failed { message, .. }) = (&repository.ssh, &failure) else {
+            return failure;
+        };
+        if !message.contains("sftp session") {
+            return failure;
+        }
+        // Accordion builds the command, and none of its parts has a space.
+        let mut parts = ssh.split_whitespace();
+        let Some(program) = parts.next() else {
+            return failure;
+        };
+        let mut command = Command::new(program);
+        command.env_clear();
+        if let Some(path) = std::env::var_os("PATH") {
+            command.env("PATH", path);
+        }
+        command
+            .args(parts)
+            .current_dir(&self.home)
+            // With no input, the SFTP session ends as soon as it starts.
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let output = match tokio::time::timeout(SSH_CHECK_TIME, command.output()).await {
+            Ok(Ok(output)) => output,
+            _ => return failure,
+        };
+        if output.status.success() {
+            return failure;
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        match problem_in(stderr.lines()) {
+            Some(problem) => Failure::Ssh(problem),
+            None => failure,
+        }
     }
 
     fn command(&self, repository: &Repository, dir: Option<&Path>, args: &[OsString]) -> Command {
@@ -255,9 +305,16 @@ fn failure(status: ExitStatus, stderr: &[u8]) -> Failure {
 /// What went wrong connecting over SFTP, from the lines restic passes on
 /// from ssh, if any.
 fn ssh_problem(stderr: &str) -> Option<SshProblem> {
-    let lines: Vec<&str> = stderr
-        .lines()
-        .filter_map(|line| line.strip_prefix("subprocess ssh: "))
+    problem_in(
+        stderr
+            .lines()
+            .filter_map(|line| line.strip_prefix("subprocess ssh: ")),
+    )
+}
+
+/// What went wrong, from what ssh printed.
+fn problem_in<'a>(lines: impl Iterator<Item = &'a str>) -> Option<SshProblem> {
+    let lines: Vec<&str> = lines
         .map(|line| line.trim().trim_start_matches("ssh: "))
         .filter(|line| !line.is_empty() && !line.starts_with("Warning:"))
         .collect();
@@ -335,6 +392,52 @@ mod tests {
             ))
         );
         assert_eq!(ssh_problem("Fatal: wrong password or no key found\n"), None);
+    }
+
+    #[tokio::test]
+    async fn asks_ssh_when_restic_drops_its_reason() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ssh = dir.path().join("ssh");
+        std::fs::write(
+            &ssh,
+            "#!/bin/sh\necho 'nas@192.168.1.50: Permission denied (publickey).' >&2\nexit 255\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let restic = Restic {
+            program: "restic".into(),
+            home: dir.path().to_owned(),
+            key_file: "key".into(),
+            cache: "cache".into(),
+            temp: "temp".into(),
+        };
+        let repository = Repository {
+            location: "sftp:nas@192.168.1.50:backups".into(),
+            keys: None,
+            ssh: Some(format!("{} -p 22 nas@192.168.1.50 -s sftp", ssh.display())),
+        };
+        // What restic said on CI, without ssh's lines.
+        let dropped = || Failure::Failed {
+            code: Some(1),
+            message: "unable to start the sftp session, error: error receiving version \
+                      packet from server: read |0: file already closed"
+                .into(),
+        };
+        assert!(matches!(
+            restic.explain(&repository, dropped()).await,
+            Failure::Ssh(SshProblem::KeyRefused)
+        ));
+        // Other failures are left as they are.
+        let folder = Repository {
+            ssh: None,
+            ..repository
+        };
+        assert!(matches!(
+            restic.explain(&folder, dropped()).await,
+            Failure::Failed { .. }
+        ));
     }
 
     #[test]

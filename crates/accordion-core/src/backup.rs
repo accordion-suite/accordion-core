@@ -845,7 +845,12 @@ impl Backup {
                 }
                 () = tokio::time::sleep(wait) => {}
             }
-            self.nightly().await;
+            // Stopping partway stops restic, which leaves each repository
+            // usable. Nothing is recorded, so the next start catches up.
+            tokio::select! {
+                () = &mut stopped => return,
+                () = self.nightly() => {}
+            }
             wait = self.until_next_backup();
         }
     }

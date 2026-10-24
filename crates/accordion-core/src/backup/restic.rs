@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
-use tokio::process::Command;
+use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 
 /// How restic exits when the repository doesn't exist.
 const NO_REPOSITORY: i32 = 10;
@@ -107,17 +107,20 @@ impl Restic {
         dir: Option<&Path>,
         args: &[OsString],
     ) -> Result<String, Failure> {
-        let output = self
-            .command(repository, dir, args)
-            .output()
-            .await
-            .map_err(Failure::Start)?;
-        if output.status.success() {
-            return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+        let mut restic = Running::start(self.command(repository, dir, args))?;
+        let (mut stdout, mut stderr) = restic.pipes();
+        // Both are read at once, so neither pipe fills up and stalls restic.
+        let mut output = Vec::new();
+        let mut errors = Vec::new();
+        let _ = tokio::join!(
+            stdout.read_to_end(&mut output),
+            stderr.read_to_end(&mut errors)
+        );
+        let status = restic.wait().await?;
+        if status.success() {
+            return Ok(String::from_utf8_lossy(&output).into_owned());
         }
-        Err(self
-            .explain(repository, failure(output.status, &output.stderr))
-            .await)
+        Err(self.explain(repository, failure(status, &errors)).await)
     }
 
     /// Like [`Restic::run`], but stops restic the first time a request
@@ -129,12 +132,8 @@ impl Restic {
         dir: Option<&Path>,
         args: &[OsString],
     ) -> Result<String, Failure> {
-        let mut child = self
-            .command(repository, dir, args)
-            .spawn()
-            .map_err(Failure::Start)?;
-        let mut stdout = child.stdout.take().expect("restic's output is piped");
-        let stderr = child.stderr.take().expect("restic's errors are piped");
+        let mut restic = Running::start(self.command(repository, dir, args))?;
+        let (mut stdout, stderr) = restic.pipes();
         let output = async {
             let mut output = Vec::new();
             let _ = stdout.read_to_end(&mut output).await;
@@ -151,7 +150,7 @@ impl Restic {
                     // After the wait, such as "1.2s: Access Denied."
                     let problem = rest.split_once(": ").map_or(rest, |(_, problem)| problem);
                     retrying = Some(problem.trim().to_owned());
-                    let _ = child.start_kill();
+                    restic.stop();
                 }
                 errors.push_str(&line);
                 errors.push('\n');
@@ -159,7 +158,7 @@ impl Restic {
             (errors, retrying)
         };
         let (output, (errors, retrying)) = tokio::join!(output, errors);
-        let status = child.wait().await.map_err(Failure::Start)?;
+        let status = restic.wait().await?;
         if let Some(problem) = retrying {
             tracing::debug!(%errors, "stopped restic at its first retry");
             return Err(Failure::Retrying(problem));
@@ -185,9 +184,8 @@ impl Restic {
         // About one progress line a second. Without a terminal, restic
         // otherwise prints dozens.
         command.env("RESTIC_PROGRESS_FPS", "1");
-        let mut child = command.spawn().map_err(Failure::Start)?;
-        let stdout = child.stdout.take().expect("restic's output is piped");
-        let mut stderr = child.stderr.take().expect("restic's errors are piped");
+        let mut restic = Running::start(command)?;
+        let (stdout, mut stderr) = restic.pipes();
         // Both are read at once, so neither pipe fills up and stalls restic.
         let errors = async {
             let mut errors = Vec::new();
@@ -201,7 +199,7 @@ impl Restic {
             }
         };
         let (errors, ()) = tokio::join!(errors, lines);
-        let status = child.wait().await.map_err(Failure::Start)?;
+        let status = restic.wait().await?;
         if status.success() {
             return Ok(());
         }
@@ -275,12 +273,79 @@ impl Restic {
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            // If the server stops partway, restic stops too. Its repository
-            // stays usable, and the next run carries on.
-            .kill_on_drop(true);
+            .stderr(Stdio::piped());
         command.current_dir(dir.unwrap_or(&self.home));
+        // In a session of its own, restic has no terminal. With one, restic
+        // hands the terminal to ssh for SFTP, in case ssh asks for a
+        // password, and doesn't always hand it back. Ctrl+C then stopped
+        // reaching Accordion.
+        // SAFETY: setsid is safe to call between fork and exec.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
         command
+    }
+}
+
+/// A restic process. Dropping it before it finishes, such as when the server
+/// stops partway through a backup, stops restic. Its repository stays
+/// usable, and the next run carries on.
+struct Running {
+    child: Child,
+    finished: bool,
+}
+
+impl Running {
+    fn start(mut command: Command) -> Result<Self, Failure> {
+        let child = command.spawn().map_err(Failure::Start)?;
+        Ok(Self {
+            child,
+            finished: false,
+        })
+    }
+
+    fn pipes(&mut self) -> (ChildStdout, ChildStderr) {
+        let stdout = self.child.stdout.take().expect("restic's output is piped");
+        let stderr = self.child.stderr.take().expect("restic's errors are piped");
+        (stdout, stderr)
+    }
+
+    async fn wait(&mut self) -> Result<ExitStatus, Failure> {
+        let status = self.child.wait().await.map_err(Failure::Start)?;
+        self.finished = true;
+        Ok(status)
+    }
+
+    /// Asks restic to stop. Unlike SIGKILL, SIGTERM lets restic remove its
+    /// lock from the repository first. A lock left behind blocks weekly
+    /// upkeep until restic decides it's stale.
+    fn stop(&self) {
+        // No ID once the process has been reaped, so the signal can't reach
+        // another process that reused the ID.
+        let Some(pid) = self
+            .child
+            .id()
+            .and_then(|pid| libc::pid_t::try_from(pid).ok())
+        else {
+            return;
+        };
+        // SAFETY: kill only sends a signal, and pid is restic's.
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.stop();
+        }
     }
 }
 
@@ -438,6 +503,70 @@ mod tests {
             restic.explain(&folder, dropped()).await,
             Failure::Failed { .. }
         ));
+    }
+
+    /// A Restic that runs `script` in place of restic, in `dir`.
+    fn fake_restic(dir: &Path, script: &str) -> Restic {
+        use std::os::unix::fs::PermissionsExt;
+
+        let program = dir.join("restic");
+        std::fs::write(&program, format!("#!/bin/sh\n{script}")).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Restic {
+            program,
+            home: dir.to_owned(),
+            key_file: "key".into(),
+            cache: "cache".into(),
+            temp: "temp".into(),
+        }
+    }
+
+    fn folder(dir: &Path) -> Repository {
+        Repository {
+            location: dir.join("repo").display().to_string(),
+            keys: None,
+            ssh: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn runs_restic_without_a_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        // The sixth field of stat is the session, which is the shell's own ID
+        // only in a session of its own.
+        let restic = fake_restic(dir.path(), "cut -d' ' -f6 /proc/$$/stat; echo $$\n");
+        let output = restic.run(&folder(dir.path()), None, &[]).await.unwrap();
+        let ids: Vec<_> = output.lines().collect();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0], ids[1]);
+    }
+
+    #[tokio::test]
+    async fn asks_restic_to_stop_when_a_run_is_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let restic = fake_restic(
+            dir.path(),
+            "trap 'kill $!; touch stopped; exit 1' TERM\ntouch started\nsleep 30 &\nwait\n",
+        );
+        let repository = folder(dir.path());
+        let run = restic.run(&repository, None, &[]);
+        let started = async {
+            while !dir.path().join("started").exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        };
+        tokio::select! {
+            _ = run => panic!("the fake restic finished by itself"),
+            () = started => {}
+        }
+        let stopped = async {
+            while !dir.path().join("stopped").exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), stopped)
+            .await
+            .expect("restic got SIGTERM");
     }
 
     #[test]

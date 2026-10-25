@@ -1,5 +1,5 @@
 //! Managing the people on a server: adding accounts, password links, roles,
-//! and turning accounts off.
+//! names, turning accounts off, and deleting them.
 //!
 //! Admins never choose or see anyone else's password. A new account starts
 //! without one, and its owner sets it from a one-time link the admin passes
@@ -19,7 +19,8 @@ use sha2::{Digest, Sha256};
 
 use super::session::{bad_value, delete_sessions};
 use super::{
-    Error, Identity, User, check_password_rules, insert_user, new_account, password, user_from_row,
+    Error, Identity, RESERVED_USERNAMES, User, check_password_rules, exists, insert_user,
+    new_account, normalize_username, password, user_from_row, validate_display_name,
 };
 use crate::sql_now;
 
@@ -328,6 +329,66 @@ impl Identity {
                     [id.as_uuid()],
                 )?;
                 Ok(delete_sessions(tx, "user_id = ?1", [id.as_uuid()])?)
+            })
+            .await?;
+        self.announce_ended(&ended);
+        Ok(())
+    }
+
+    /// Changes an account's username and the name people see.
+    ///
+    /// Everything else refers to the account by its ID, so only signing in
+    /// changes: it takes the new username right away, including on devices
+    /// that use app passwords. Storage's plain view names each person's
+    /// folder after their username, so rebuild it after a new username.
+    pub async fn rename_member(
+        &self,
+        id: UserId,
+        username: &str,
+        display_name: &str,
+    ) -> Result<User, Error> {
+        let username = normalize_username(username)?;
+        if RESERVED_USERNAMES.contains(&username.as_str()) {
+            return Err(Error::UsernameReserved);
+        }
+        let display_name = validate_display_name(display_name)?;
+        self.db
+            .write(move |tx| {
+                let user = current_user(tx, id)?;
+                if username != user.username && exists(tx, "username = ?1", [&username])? {
+                    return Err(Error::UsernameTaken);
+                }
+                tx.execute(
+                    "UPDATE identity_users SET username = ?2, display_name = ?3 WHERE id = ?1",
+                    (id.as_uuid(), &username, &display_name),
+                )?;
+                Ok(User {
+                    username,
+                    display_name,
+                    ..user
+                })
+            })
+            .await
+    }
+
+    /// Deletes an account, and signs it out everywhere. Its sessions, app
+    /// passwords, and password link go with it, and its username is free
+    /// for someone else.
+    ///
+    /// Anything else that belongs to the account has to be moved or deleted
+    /// first, such as its files, with `Storage::remove_owner`. Until then,
+    /// the database refuses, so nothing is left behind pointing at an
+    /// account that's gone.
+    pub async fn delete_member(&self, id: UserId) -> Result<(), Error> {
+        let ended = self
+            .db
+            .write(move |tx| {
+                if current_user(tx, id)?.role == Role::Owner {
+                    return Err(Error::OwnerAccount);
+                }
+                let ended = delete_sessions(tx, "user_id = ?1", [id.as_uuid()])?;
+                tx.execute("DELETE FROM identity_users WHERE id = ?1", [id.as_uuid()])?;
+                Ok(ended)
             })
             .await?;
         self.announce_ended(&ended);
@@ -756,6 +817,142 @@ mod tests {
         );
 
         let err = identity.turn_off_member(owner.id).await.unwrap_err();
+        assert!(matches!(err, Error::OwnerAccount));
+    }
+
+    #[tokio::test]
+    async fn renames_accounts() {
+        let (_dir, identity, owner) = start().await;
+        let (sam, token, _) = identity
+            .add_member("sam", "Sam Lee", Role::User)
+            .await
+            .unwrap();
+        identity
+            .use_password_link(token.as_str(), "battery staple".into())
+            .await
+            .unwrap();
+        let (app_password, _) = identity
+            .create_app_password(sam.id, AppPasswordUse::Dav, "Laptop")
+            .await
+            .unwrap();
+
+        let renamed = identity
+            .rename_member(sam.id, " Samuel ", "Samuel Lee")
+            .await
+            .unwrap();
+        assert_eq!(renamed.username, "samuel");
+        assert_eq!(renamed.display_name, "Samuel Lee");
+        assert_eq!(renamed.role, Role::User);
+        assert_eq!(identity.user(sam.id).await.unwrap(), Some(renamed));
+
+        // Sign-ins take the new username, app passwords included.
+        assert!(
+            identity
+                .check_password("samuel", "battery staple", HOME)
+                .await
+                .is_ok()
+        );
+        let err = identity
+            .check_password("sam", "battery staple", HOME)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::WrongCredentials));
+        assert!(
+            identity
+                .check_app_password("samuel", app_password.as_str(), AppPasswordUse::Dav)
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // Keeping the username and changing only the name is fine.
+        let renamed = identity
+            .rename_member(sam.id, "samuel", "Sam")
+            .await
+            .unwrap();
+        assert_eq!(renamed.display_name, "Sam");
+        // The owner can be renamed too. Who may do it is the server's call.
+        identity
+            .rename_member(owner.id, "alex", "Alex")
+            .await
+            .unwrap();
+
+        let err = identity
+            .rename_member(sam.id, "ALEX", "Sam")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::UsernameTaken));
+        let err = identity
+            .rename_member(sam.id, "shared", "Sam")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::UsernameReserved));
+        let err = identity
+            .rename_member(sam.id, "no spaces", "Sam")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidUsername));
+        let err = identity
+            .rename_member(sam.id, "samuel", " ")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidDisplayName));
+        let err = identity
+            .rename_member(UserId::generate(), "nobody", "Nobody")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::UserNotFound));
+    }
+
+    #[tokio::test]
+    async fn deletes_accounts_but_never_the_owners() {
+        let (_dir, identity, owner) = start().await;
+        let (sam, token, _) = identity
+            .add_member("sam", "Sam Lee", Role::User)
+            .await
+            .unwrap();
+        identity
+            .use_password_link(token.as_str(), "battery staple".into())
+            .await
+            .unwrap();
+        let (session, _) = identity
+            .create_session(sam.id, Client::Browser, "Firefox", AuthMethod::Password)
+            .await
+            .unwrap();
+        let (app_password, _) = identity
+            .create_app_password(sam.id, AppPasswordUse::Dav, "Laptop")
+            .await
+            .unwrap();
+        let mut ended = identity.ended_sessions();
+
+        identity.delete_member(sam.id).await.unwrap();
+        assert!(ended.try_recv().is_ok(), "open pages hear the sign-out");
+        assert_eq!(identity.user(sam.id).await.unwrap(), None);
+        assert_eq!(identity.members().await.unwrap().len(), 1);
+        assert_eq!(
+            identity.check_session(session.as_str()).await.unwrap(),
+            None
+        );
+        assert!(
+            identity
+                .check_app_password("sam", app_password.as_str(), AppPasswordUse::Dav)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let err = identity.delete_member(sam.id).await.unwrap_err();
+        assert!(matches!(err, Error::UserNotFound));
+
+        // The username is free again, for a new account with nothing of the
+        // old one's.
+        let (new_sam, _, _) = identity
+            .add_member("sam", "Sam Park", Role::User)
+            .await
+            .unwrap();
+        assert_ne!(new_sam.id, sam.id);
+        assert!(identity.app_passwords(new_sam.id).await.unwrap().is_empty());
+
+        let err = identity.delete_member(owner.id).await.unwrap_err();
         assert!(matches!(err, Error::OwnerAccount));
     }
 

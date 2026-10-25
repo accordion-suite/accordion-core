@@ -152,7 +152,7 @@ pub enum Error {
     #[error("Choose admin or standard user for this account.")]
     RoleNotAllowed,
 
-    #[error("The owner's account can't be turned off or given another role.")]
+    #[error("The owner's account can't be turned off, deleted, or given another role.")]
     OwnerAccount,
 
     #[error("This account is turned off. An admin can turn it back on.")]

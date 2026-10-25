@@ -188,6 +188,9 @@ pub enum Error {
     #[error("That user doesn't exist. They may have been removed.")]
     UserNotFound,
 
+    #[error("Someone's files can't be given to themselves. Choose someone else.")]
+    GiveToSelf,
+
     #[error(
         "That upload doesn't exist. It may have finished, been canceled, or been removed after \
          a day without progress. Start it again."
@@ -276,6 +279,20 @@ pub struct Usage {
     pub uploading: u64,
     /// `None` when there's no limit.
     pub quota: Option<u64>,
+}
+
+/// What happens to a user's files when [`Storage::remove_owner`] takes them
+/// out of storage.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LeaveFiles {
+    /// Move them, with their versions and trash, into a new folder in
+    /// another user's top folder. If `folder_name` is taken, the folder gets
+    /// a number after it, such as "Sam's files (2)". The other user's quota
+    /// doesn't stop this, like a quota set below what someone already uses.
+    GiveTo { owner: UserId, folder_name: String },
+    /// Delete them for good. Their contents are removed a day later, unless
+    /// something else uses them.
+    Delete,
 }
 
 /// The storage service. Cloning it is cheap.
@@ -883,6 +900,101 @@ impl Storage {
             .await
     }
 
+    /// Takes everything `owner` has out of storage, so their account can be
+    /// deleted: their files and trash, their quota, and their uploads in
+    /// progress. Returns the folder their files went into, if they were
+    /// given to someone and had any.
+    ///
+    /// Turn the account off first, so nothing new arrives while this runs.
+    pub async fn remove_owner(
+        &self,
+        owner: UserId,
+        files: LeaveFiles,
+    ) -> Result<Option<Item>, Error> {
+        let to = match files {
+            LeaveFiles::GiveTo {
+                owner: to,
+                folder_name,
+            } => {
+                if to == owner {
+                    return Err(Error::GiveToSelf);
+                }
+                self.inner
+                    .identity
+                    .user(to)
+                    .await?
+                    .ok_or(Error::UserNotFound)?;
+                Some((to, self.top_folder(to).await?, folder_name))
+            }
+            LeaveFiles::Delete => None,
+        };
+        let uploads: Vec<UploadId> = self
+            .inner
+            .db
+            .read(move |conn| {
+                conn.prepare("SELECT id FROM storage_uploads WHERE owner_id = ?1")?
+                    .query_map([owner.as_uuid()], |row| {
+                        Ok(UploadId::from_uuid(row.get(0)?))
+                    })?
+                    .collect::<Result<_, _>>()
+                    .map_err(Error::from)
+            })
+            .await?;
+        for id in uploads {
+            match self.cancel_upload(id).await {
+                Ok(()) | Err(Error::UploadNotFound) => {}
+                Err(err) => return Err(err),
+            }
+        }
+
+        let _changes = self.inner.changes.lock().await;
+        let folder = self
+            .inner
+            .db
+            .write(move |tx| {
+                let top: Option<ItemId> = tx
+                    .query_row(
+                        "SELECT id FROM storage_items WHERE owner_id = ?1 AND parent_id IS NULL",
+                        [owner.as_uuid()],
+                        |row| Ok(ItemId::from_uuid(row.get(0)?)),
+                    )
+                    .optional()?;
+                let mut folder = None;
+                match (top, to) {
+                    (Some(top), Some((to, their_top, wanted))) => {
+                        let id = ItemId::generate();
+                        let name = free_name(tx, their_top, &wanted)?;
+                        insert_item(tx, id, to, their_top, &name, "folder")?;
+                        tx.execute(
+                            "UPDATE storage_items SET parent_id = ?2 WHERE parent_id = ?1",
+                            (top.as_uuid(), id.as_uuid()),
+                        )?;
+                        tx.execute("DELETE FROM storage_items WHERE id = ?1", [top.as_uuid()])?;
+                        tx.execute(
+                            "UPDATE storage_items SET owner_id = ?2 WHERE owner_id = ?1",
+                            (owner.as_uuid(), to.as_uuid()),
+                        )?;
+                        folder = Some(item_or_missing(tx, id)?);
+                    }
+                    (Some(top), None) => delete_subtree(tx, top)?,
+                    (None, _) => {}
+                }
+                tx.execute(
+                    "DELETE FROM storage_quotas WHERE owner_id = ?1",
+                    [owner.as_uuid()],
+                )?;
+                Ok::<_, Error>(folder)
+            })
+            .await?;
+        // A whole top folder moved or went, so rebuild rather than patch.
+        // The database is already right, so a failure only leaves the view
+        // behind until the next rebuild.
+        if let Err(err) = self.rebuild_view_locked().await {
+            tracing::error!(%err, "couldn't rebuild the plain view");
+        }
+        Ok(folder)
+    }
+
     /// Stores contents for a module's own use under `key`, such as a
     /// thumbnail, replacing what was there. They stay until the module
     /// releases `key`, and don't count toward anyone's quota.
@@ -1102,6 +1214,26 @@ fn check_name(name: &str) -> Result<String, Error> {
     } else {
         Err(Error::InvalidName)
     }
+}
+
+/// `wanted`, or `wanted (2)`, `wanted (3)`, and so on, whichever is free in
+/// `parent`, shortened if it's too long to fit [`MAX_NAME_LEN`].
+fn free_name(conn: &Connection, parent: ItemId, wanted: &str) -> Result<String, Error> {
+    for number in 1u32.. {
+        let suffix = match number {
+            1 => String::new(),
+            _ => format!(" ({number})"),
+        };
+        let mut end = wanted.len().min(MAX_NAME_LEN - suffix.len());
+        while !wanted.is_char_boundary(end) {
+            end -= 1;
+        }
+        let name = check_name(&format!("{}{suffix}", &wanted[..end]))?;
+        if child_named(conn, parent, &name)?.is_none() {
+            return Ok(name);
+        }
+    }
+    unreachable!("some number is free")
 }
 
 /// Selects an item's columns and its current version, for [`item_from_row`].

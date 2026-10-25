@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use accordion_core::db::Database;
 use accordion_core::identity::{Identity, NewUser};
-use accordion_core::storage::{Error, ItemKind, Storage};
+use accordion_core::storage::{Error, ItemKind, LeaveFiles, Storage};
 use accordion_types::{Role, UserId};
 use tokio::io::AsyncReadExt;
 
@@ -382,4 +382,198 @@ async fn finds_items_by_path() {
 
     server.storage.delete(report.id).await.unwrap();
     assert_eq!(find(&["Documents", "report.pdf"]).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn gives_a_removed_users_files_to_someone_else() {
+    let server = start().await;
+    let alex = server.user("alex").await;
+    let sam = server.user("sam").await;
+    let alex_top = server.storage.top_folder(alex).await.unwrap();
+    server
+        .storage
+        .create_folder(alex_top, "Sam's files")
+        .await
+        .unwrap();
+    let sam_top = server.storage.top_folder(sam).await.unwrap();
+    let photos = server
+        .storage
+        .create_folder(sam_top, "Photos")
+        .await
+        .unwrap();
+    let beach = server
+        .storage
+        .write_file(photos.id, "beach.jpg", &b"first"[..])
+        .await
+        .unwrap();
+    server
+        .storage
+        .write_file(photos.id, "beach.jpg", &b"second"[..])
+        .await
+        .unwrap();
+    let old = server
+        .storage
+        .write_file(sam_top, "old.txt", &b"old"[..])
+        .await
+        .unwrap();
+    server.storage.delete(old.id).await.unwrap();
+    server.storage.set_quota(sam, Some(1000)).await.unwrap();
+    let upload = server.storage.start_upload(sam, 6).await.unwrap();
+    let alex_before = server.storage.usage(alex).await.unwrap().used;
+
+    // The database won't delete an account that still has files.
+    assert!(server.identity.delete_member(sam).await.is_err());
+
+    let folder = server
+        .storage
+        .remove_owner(
+            sam,
+            LeaveFiles::GiveTo {
+                owner: alex,
+                folder_name: "Sam's files".into(),
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(folder.name, "Sam's files (2)");
+    assert_eq!(folder.owner, alex);
+    assert_eq!(folder.parent, Some(alex_top));
+    assert_eq!(server.storage.top_folder(alex).await.unwrap(), alex_top);
+
+    // Everything arrives as it was: folders, versions, and the trash.
+    let names: Vec<_> = server
+        .storage
+        .children(folder.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|item| (item.name, item.owner))
+        .collect();
+    assert_eq!(names, [("Photos".to_owned(), alex)]);
+    assert_eq!(server.storage.versions(beach.id).await.unwrap().len(), 2);
+    assert_eq!(read(&server.storage, beach.id).await, "second");
+    let trash = server.storage.trash(alex).await.unwrap();
+    assert_eq!(trash.len(), 1);
+    assert_eq!(trash[0].name, "old.txt");
+    server.storage.restore(old.id).await.unwrap();
+    assert_eq!(
+        server.storage.usage(alex).await.unwrap().used,
+        alex_before + 14
+    );
+    assert_eq!(
+        std::fs::read(server.view().join("alex/Sam's files (2)/Photos/beach.jpg")).unwrap(),
+        b"second"
+    );
+    assert!(!server.view().join("sam").exists());
+    let err = server.storage.upload(upload.id).await.unwrap_err();
+    assert!(matches!(err, Error::UploadNotFound));
+
+    // Nothing refers to the account now, so it can go.
+    server.identity.delete_member(sam).await.unwrap();
+}
+
+#[tokio::test]
+async fn deletes_a_removed_users_files() {
+    let server = start().await;
+    let sam = server.user("sam").await;
+    let top = server.storage.top_folder(sam).await.unwrap();
+    let folder = server.storage.create_folder(top, "Taxes").await.unwrap();
+    let file = server
+        .storage
+        .write_file(folder.id, "2025.pdf", &b"pdf"[..])
+        .await
+        .unwrap();
+
+    let given = server
+        .storage
+        .remove_owner(sam, LeaveFiles::Delete)
+        .await
+        .unwrap();
+    assert_eq!(given, None);
+    assert_eq!(server.storage.item(file.id).await.unwrap(), None);
+    assert!(!server.view().join("sam").exists());
+    server.identity.delete_member(sam).await.unwrap();
+
+    // Someone who never stored anything has nothing to move.
+    let kim = server.user("kim").await;
+    let given = server
+        .storage
+        .remove_owner(kim, LeaveFiles::Delete)
+        .await
+        .unwrap();
+    assert_eq!(given, None);
+    server.identity.delete_member(kim).await.unwrap();
+}
+
+#[tokio::test]
+async fn checks_who_gets_a_removed_users_files() {
+    let server = start().await;
+    let alex = server.user("alex").await;
+    let sam = server.user("sam").await;
+    let top = server.storage.top_folder(sam).await.unwrap();
+    server
+        .storage
+        .write_file(top, "notes.txt", &b"notes"[..])
+        .await
+        .unwrap();
+    let give = |owner, folder_name: &str| LeaveFiles::GiveTo {
+        owner,
+        folder_name: folder_name.into(),
+    };
+
+    let err = server
+        .storage
+        .remove_owner(sam, give(sam, "Sam's files"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::GiveToSelf));
+    let err = server
+        .storage
+        .remove_owner(sam, give(UserId::generate(), "Sam's files"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::UserNotFound));
+    let err = server
+        .storage
+        .remove_owner(sam, give(alex, "Sam/Alex"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidName));
+    assert_eq!(server.storage.children(top).await.unwrap().len(), 1);
+
+    // A name too long for the plain view is shortened, never cut partway
+    // through a character.
+    let long = "é".repeat(200);
+    let folder = server
+        .storage
+        .remove_owner(sam, give(alex, &long))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(folder.name, "é".repeat(127));
+}
+
+#[tokio::test]
+async fn follows_a_new_username_after_a_rebuild() {
+    let server = start().await;
+    let alex = server.user("alex").await;
+    let top = server.storage.top_folder(alex).await.unwrap();
+    server
+        .storage
+        .write_file(top, "keep.txt", &b"keep"[..])
+        .await
+        .unwrap();
+
+    server
+        .identity
+        .rename_member(alex, "alexander", "Alexander")
+        .await
+        .unwrap();
+    server.storage.rebuild_view().await.unwrap();
+    assert_eq!(
+        std::fs::read(server.view().join("alexander/keep.txt")).unwrap(),
+        b"keep"
+    );
+    assert!(!server.view().join("alex").exists());
 }

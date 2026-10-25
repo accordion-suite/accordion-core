@@ -31,7 +31,8 @@ const RETRYING: &str = " returned error, retrying after ";
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct Repository {
     /// In restic's form, such as `/media/usb/backups`,
-    /// `s3:https://s3.example.com/backups`, or `sftp:me@nas:backups`.
+    /// `s3:https://s3.example.com/backups`, `sftp:me@nas:backups`, or
+    /// `rest:https://nas.local:8000/backups`.
     pub location: String,
     /// A bucket's access key.
     pub keys: Option<Keys>,
@@ -39,6 +40,41 @@ pub(super) struct Repository {
     /// relative to the data folder, because restic doesn't honor quotes in
     /// it, so a path with a space would break it.
     pub ssh: Option<String>,
+    /// For a REST server, the username and password from its password
+    /// file.
+    pub login: Option<Login>,
+    /// For a REST server, the certificate Accordion pinned, if the system
+    /// doesn't already trust the server's.
+    pub cacert: Option<PathBuf>,
+}
+
+impl Repository {
+    /// A repository restic reaches with nothing but its location, such as a
+    /// folder.
+    pub fn at(location: String) -> Self {
+        Self {
+            location,
+            keys: None,
+            ssh: None,
+            login: None,
+            cacert: None,
+        }
+    }
+}
+
+/// The username and password for a REST server.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct Login {
+    pub username: String,
+    pub password: String,
+}
+
+impl std::fmt::Debug for Login {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Login")
+            .field("username", &self.username)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The access key for an S3 bucket.
@@ -77,10 +113,12 @@ pub(super) enum Failure {
     Retrying(String),
     /// ssh couldn't connect to an SFTP server.
     Ssh(SshProblem),
-    /// Anything else, with restic's last lines of error output.
+    /// Anything else, with restic's last lines of error output to show,
+    /// and all of it to look through.
     Failed {
         code: Option<i32>,
         message: String,
+        output: String,
     },
 }
 
@@ -100,27 +138,20 @@ pub(super) enum SshProblem {
 impl Restic {
     /// Runs restic on `repository`, in `dir` if given, and returns what it
     /// printed. restic tries failed requests again for several minutes, which
-    /// rides out a network blip during a nightly backup.
+    /// rides out a network blip during a nightly backup. A REST server's
+    /// problem that waiting won't fix, such as a new certificate or a wrong
+    /// password, stops it right away.
     pub async fn run(
         &self,
         repository: &Repository,
         dir: Option<&Path>,
         args: &[OsString],
     ) -> Result<String, Failure> {
-        let mut restic = Running::start(self.command(repository, dir, args))?;
-        let (mut stdout, mut stderr) = restic.pipes();
-        // Both are read at once, so neither pipe fills up and stalls restic.
-        let mut output = Vec::new();
-        let mut errors = Vec::new();
-        let _ = tokio::join!(
-            stdout.read_to_end(&mut output),
-            stderr.read_to_end(&mut errors)
-        );
-        let status = restic.wait().await?;
-        if status.success() {
-            return Ok(String::from_utf8_lossy(&output).into_owned());
-        }
-        Err(self.explain(repository, failure(status, &errors)).await)
+        let lasting = |problem: &str| {
+            repository.login.is_some()
+                && super::rest::problem(&Failure::Retrying(problem.to_owned())).is_some()
+        };
+        self.run_until(repository, dir, args, lasting).await
     }
 
     /// Like [`Restic::run`], but stops restic the first time a request
@@ -132,8 +163,21 @@ impl Restic {
         dir: Option<&Path>,
         args: &[OsString],
     ) -> Result<String, Failure> {
+        self.run_until(repository, dir, args, |_| true).await
+    }
+
+    /// Runs restic, and stops it when it's about to try a failed request
+    /// again for a reason `give_up` accepts.
+    async fn run_until(
+        &self,
+        repository: &Repository,
+        dir: Option<&Path>,
+        args: &[OsString],
+        give_up: impl Fn(&str) -> bool,
+    ) -> Result<String, Failure> {
         let mut restic = Running::start(self.command(repository, dir, args))?;
         let (mut stdout, stderr) = restic.pipes();
+        // Both are read at once, so neither pipe fills up and stalls restic.
         let output = async {
             let mut output = Vec::new();
             let _ = stdout.read_to_end(&mut output).await;
@@ -149,8 +193,10 @@ impl Restic {
                 {
                     // After the wait, such as "1.2s: Access Denied."
                     let problem = rest.split_once(": ").map_or(rest, |(_, problem)| problem);
-                    retrying = Some(problem.trim().to_owned());
-                    restic.stop();
+                    if give_up(problem) {
+                        retrying = Some(problem.trim().to_owned());
+                        restic.stop();
+                    }
                 }
                 errors.push_str(&line);
                 errors.push('\n');
@@ -160,7 +206,7 @@ impl Restic {
         let (output, (errors, retrying)) = tokio::join!(output, errors);
         let status = restic.wait().await?;
         if let Some(problem) = retrying {
-            tracing::debug!(%errors, "stopped restic at its first retry");
+            tracing::debug!(%errors, "stopped restic at a retry");
             return Err(Failure::Retrying(problem));
         }
         if status.success() {
@@ -267,6 +313,18 @@ impl Restic {
         if let Some(ssh) = &repository.ssh {
             command.arg("-o").arg(format!("sftp.command={ssh}"));
         }
+        // In the environment, not the address, so they stay out of restic's
+        // messages and of process lists.
+        if let Some(login) = &repository.login
+            && !login.username.is_empty()
+        {
+            command
+                .env("RESTIC_REST_USERNAME", &login.username)
+                .env("RESTIC_REST_PASSWORD", &login.password);
+        }
+        if let Some(cacert) = &repository.cacert {
+            command.arg("--cacert").arg(cacert);
+        }
         command
             .env("RESTIC_REPOSITORY", &repository.location)
             .env("RESTIC_PASSWORD_FILE", &self.key_file)
@@ -365,6 +423,7 @@ fn failure(status: ExitStatus, stderr: &[u8]) -> Failure {
             None => Failure::Failed {
                 code,
                 message: last_lines(&stderr),
+                output: stderr.into_owned(),
             },
         },
     }
@@ -418,10 +477,20 @@ fn problem_in<'a>(lines: impl Iterator<Item = &'a str>) -> Option<SshProblem> {
 
 /// The last few lines restic wrote, which say what went wrong.
 fn last_lines(text: &str) -> String {
-    let lines: Vec<&str> = text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
+    let raw: Vec<&str> = text.lines().collect();
+    // Some errors end with a Go stack trace: a function's name, then a
+    // tab-indented line with its file. That says nothing to an admin.
+    let in_trace = |index: usize| {
+        let file = |line: &&str| line.starts_with('\t') && line.contains(".go:");
+        raw.get(index).is_some_and(file) || raw.get(index + 1).is_some_and(file)
+    };
+    let lines: Vec<&str> = raw
+        .iter()
+        .enumerate()
+        .filter(|&(index, _)| !in_trace(index))
+        .map(|(_, line)| line.trim())
+        // Progress, such as "[0:00] 0.00%  0 / 1 files deleted".
+        .filter(|line| !line.is_empty() && !line.starts_with('['))
         .collect();
     lines[lines.len().saturating_sub(PROBLEM_LINES)..].join(" ")
 }
@@ -447,6 +516,20 @@ mod tests {
             "two three four"
         );
         assert_eq!(last_lines(""), "");
+        // What restic 0.19.1 printed when a REST server refused a delete.
+        let refused = "Remove(<snapshot/97895728d8>) failed: unexpected HTTP response (403): \
+                       403 Forbidden\n\
+                       unable to remove snapshot/97895728d8 from the repository\n\
+                       [0:00] 0.00%  0 / 1 files deleted\n\
+                       failed to remove one or more snapshots\n\
+                       main.init\n\t/restic/cmd/restic/cmd_forget.go:67\n\
+                       runtime.main\n\t/usr/local/go/src/runtime/proc.go:258\n";
+        assert_eq!(
+            last_lines(refused),
+            "Remove(<snapshot/97895728d8>) failed: unexpected HTTP response (403): 403 Forbidden \
+             unable to remove snapshot/97895728d8 from the repository \
+             failed to remove one or more snapshots"
+        );
     }
 
     #[test]
@@ -494,9 +577,8 @@ mod tests {
             temp: "temp".into(),
         };
         let repository = Repository {
-            location: "sftp:nas@192.168.1.50:backups".into(),
-            keys: None,
             ssh: Some(format!("{} -p 22 nas@192.168.1.50 -s sftp", ssh.display())),
+            ..Repository::at("sftp:nas@192.168.1.50:backups".into())
         };
         // What restic said on CI, without ssh's lines.
         let dropped = || Failure::Failed {
@@ -504,6 +586,7 @@ mod tests {
             message: "unable to start the sftp session, error: error receiving version \
                       packet from server: read |0: file already closed"
                 .into(),
+            output: String::new(),
         };
         assert!(matches!(
             restic.explain(&repository, dropped()).await,
@@ -543,11 +626,7 @@ mod tests {
     }
 
     fn folder(dir: &Path) -> Repository {
-        Repository {
-            location: dir.join("repo").display().to_string(),
-            keys: None,
-            ssh: None,
-        }
+        Repository::at(dir.join("repo").display().to_string())
     }
 
     #[tokio::test]

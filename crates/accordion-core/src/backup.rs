@@ -9,10 +9,17 @@
 //! the server.
 //!
 //! A target is a folder, such as one on a USB disk, an S3 bucket at a
-//! storage provider, or a folder on another computer over SFTP. A bucket's
-//! access key, Accordion's SSH key, and each SFTP server's host key are kept
-//! in the database, so a restored server goes on backing up to them. They're
-//! read only when restic runs, so they never reach the status pages show.
+//! storage provider, a folder on another computer over SFTP, or a REST
+//! server on another computer. A bucket's access key, Accordion's SSH key,
+//! each SFTP server's host key, and each REST server's password and pinned
+//! certificate are kept in the database, so a restored server goes on
+//! backing up to them. They're read only when restic runs, so they never
+//! reach the status pages show.
+//!
+//! A REST server in append-only mode won't let Accordion delete anything,
+//! so a server taken over by an attacker can't delete its backups there
+//! (decision 10). Accordion finds out when the target is added, and never
+//! removes old snapshots from one.
 //!
 //! Every repository is locked with the recovery key. The owner keeps a copy
 //! of it off the box, and `backup/recovery-key` in the data folder keeps
@@ -28,6 +35,7 @@
 //! runs. Then the server starts again, and [`apply_restore`] moves the
 //! restored data into place before anything opens the database.
 
+mod rest;
 mod restic;
 
 use std::ffi::OsString;
@@ -47,7 +55,9 @@ use tokio::sync::{Mutex, Notify, OwnedMutexGuard, watch};
 use crate::db::{self, Database, Migration};
 use crate::storage::{Blob, ContentHash, Storage};
 use crate::{random, sql_now, time};
-use restic::{Failure, Keys, Repository, Restic, SshProblem};
+use rest::Problem;
+pub use rest::RestServer;
+use restic::{Failure, Keys, Login, Repository, Restic, SshProblem};
 
 const OWNER: &str = "backup";
 
@@ -207,6 +217,73 @@ static MIGRATIONS: &[Migration] = &[
         ALTER TABLE backup_settings ADD COLUMN ssh_public_key TEXT;
     ",
     },
+    Migration {
+        version: 5,
+        name: "Add REST servers as targets, and append-only targets",
+        // Rebuilt like version 3, for the new kind.
+        sql: "
+        CREATE TABLE backup_targets_new (
+            id BLOB PRIMARY KEY CHECK (length(id) = 16),
+            name TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK (kind IN ('folder', 's3', 'sftp', 'rest')),
+            -- In restic's form: a folder's path, s3:https://host/bucket,
+            -- sftp:user@host:folder, or rest:https://host:port/path.
+            location TEXT NOT NULL UNIQUE,
+            created_at TEXT NOT NULL,
+            pruned_at TEXT,
+            next_part INTEGER NOT NULL DEFAULT 1 CHECK (next_part BETWEEN 1 AND 8),
+            -- A bucket's access key.
+            access_key_id TEXT,
+            secret_access_key TEXT,
+            -- An SFTP server's port, and its host key in known_hosts form,
+            -- as it was when the target was added.
+            ssh_port INTEGER CHECK (ssh_port BETWEEN 1 AND 65535),
+            host_key TEXT,
+            -- A REST server's username and password, both empty if it
+            -- doesn't ask, and the certificate pinned when the target was
+            -- added, if the system didn't trust the server's.
+            rest_username TEXT,
+            rest_password TEXT,
+            certificate TEXT,
+            -- The target refuses deletes, so Accordion never removes old
+            -- snapshots from it.
+            append_only INTEGER NOT NULL DEFAULT 0 CHECK (append_only IN (0, 1)),
+            -- For an append-only target, measured at weekly upkeep: the
+            -- space the repository uses, and its oldest snapshot.
+            stored_bytes INTEGER CHECK (stored_bytes >= 0),
+            oldest_backup_at TEXT,
+            CHECK ((kind = 's3') = (access_key_id IS NOT NULL AND secret_access_key IS NOT NULL)),
+            CHECK ((kind = 'sftp') = (ssh_port IS NOT NULL AND host_key IS NOT NULL)),
+            CHECK ((kind = 'rest') = (rest_username IS NOT NULL AND rest_password IS NOT NULL)),
+            CHECK (kind = 'rest' OR certificate IS NULL)
+        ) STRICT, WITHOUT ROWID;
+        INSERT INTO backup_targets_new (id, name, kind, location, created_at, pruned_at,
+                                        next_part, access_key_id, secret_access_key,
+                                        ssh_port, host_key)
+            SELECT id, name, kind, location, created_at, pruned_at, next_part,
+                   access_key_id, secret_access_key, ssh_port, host_key
+            FROM backup_targets;
+
+        CREATE TABLE backup_runs_new (
+            id BLOB PRIMARY KEY CHECK (length(id) = 16),
+            target_id BLOB NOT NULL REFERENCES backup_targets_new (id) ON DELETE CASCADE,
+            kind TEXT NOT NULL CHECK (kind IN ('backup', 'check', 'restore_test')),
+            started_at TEXT NOT NULL,
+            finished_at TEXT NOT NULL,
+            ok INTEGER NOT NULL CHECK (ok IN (0, 1)),
+            snapshot TEXT,
+            bytes_added INTEGER CHECK (bytes_added >= 0),
+            problem TEXT
+        ) STRICT, WITHOUT ROWID;
+        INSERT INTO backup_runs_new SELECT * FROM backup_runs;
+
+        DROP TABLE backup_runs;
+        DROP TABLE backup_targets;
+        ALTER TABLE backup_targets_new RENAME TO backup_targets;
+        ALTER TABLE backup_runs_new RENAME TO backup_runs;
+        CREATE INDEX backup_runs_latest ON backup_runs (target_id, kind, finished_at);
+    ",
+    },
 ];
 
 /// Where ssh finds Accordion's SSH key and each SFTP server's host key. restic
@@ -217,6 +294,11 @@ const SSH_KEY: &str = "backup/ssh/id_ed25519";
 /// The host key of a server that's being added or restored from, before
 /// it's recorded.
 const NEW_HOST_KEY: &str = "backup/ssh/new.known_hosts";
+/// Where restic finds each REST server's pinned certificate.
+const CERT_DIR: &str = "backup/certs";
+/// The certificate of a REST server that's being added or restored from,
+/// before it's recorded.
+const NEW_CERT: &str = "backup/certs/new.pem";
 
 /// Letters in a recovery key: about 141 bits.
 const KEY_LEN: usize = 30;
@@ -242,6 +324,9 @@ const CATCH_UP: Duration = Duration::from_secs(10 * 60);
 /// Marks Accordion's snapshots, so they're grouped together however the
 /// box's hostname or data folder changes.
 const TAG: &str = "accordion";
+/// Marks the empty snapshot that tests whether a REST server is
+/// append-only. It's never listed for restoring.
+const PROBE_TAG: &str = "accordion-append-only-test";
 
 /// Where a restore waits in the data folder until the server starts again.
 const RESTORE_DIR: &str = "restore";
@@ -366,6 +451,46 @@ pub enum Error {
     )]
     HostKeyChanged(String),
 
+    #[error(
+        "Enter the REST server's address, starting with https://, such as \
+         https://nas.local:8000/accordion. Put the username and password in their own boxes."
+    )]
+    BadRestAddress,
+
+    #[error(
+        "Enter both the username and the password from the REST server's password file, \
+         or leave both empty if the server doesn't ask for them."
+    )]
+    RestLoginIncomplete,
+
+    #[error(
+        "{0} didn't accept the username and password. Check them against the REST \
+         server's password file, then try again."
+    )]
+    RestLoginRefused(String),
+
+    #[error(
+        "{0}'s certificate is for a different name. Enter the address the certificate \
+         was made for, or make a new certificate that includes this one."
+    )]
+    CertificateWrongName(String),
+
+    #[error(
+        "{0}'s certificate has expired, or its date is in the future. Make a new \
+         certificate for the REST server, or check its clock, then try again."
+    )]
+    CertificateExpired(String),
+
+    #[error("{0} isn't using HTTPS. Turn on TLS in the REST server, then try again.")]
+    NotHttps(String),
+
+    #[error(
+        "{0} showed a different certificate from the one it had before, so Accordion \
+         didn't send it anything. If you gave it a new certificate, remove this location \
+         and add it again. If you didn't, someone may be pretending to be it."
+    )]
+    CertificateChanged(String),
+
     #[error("That backup location is already set up.")]
     TargetExists,
 
@@ -438,9 +563,13 @@ pub struct Target {
     pub id: BackupTargetId,
     pub name: String,
     pub kind: TargetKind,
-    /// In restic's form: a folder's path, or `s3:https://host/bucket`.
+    /// In restic's form, such as a folder's path or
+    /// `s3:https://host/bucket`.
     pub location: String,
     pub created_at: String,
+    /// The target refuses deletes, so a compromised server can't delete the
+    /// backups there, and Accordion never removes old ones.
+    pub append_only: bool,
 }
 
 impl Target {
@@ -448,7 +577,7 @@ impl Target {
     pub fn bucket(&self) -> Option<(&str, &str)> {
         match self.kind {
             TargetKind::S3 => bucket_parts(&self.location),
-            TargetKind::Folder | TargetKind::Sftp => None,
+            TargetKind::Folder | TargetKind::Sftp | TargetKind::Rest => None,
         }
     }
 
@@ -456,7 +585,16 @@ impl Target {
     pub fn sftp(&self) -> Option<(&str, &str, &str)> {
         match self.kind {
             TargetKind::Sftp => sftp_parts(&self.location),
-            TargetKind::Folder | TargetKind::S3 => None,
+            TargetKind::Folder | TargetKind::S3 | TargetKind::Rest => None,
+        }
+    }
+
+    /// The address, such as `https://nas.local:8000/accordion`, for a REST
+    /// server.
+    pub fn rest(&self) -> Option<&str> {
+        match self.kind {
+            TargetKind::Rest => self.location.strip_prefix("rest:"),
+            TargetKind::Folder | TargetKind::S3 | TargetKind::Sftp => None,
         }
     }
 }
@@ -466,6 +604,7 @@ pub enum TargetKind {
     Folder,
     S3,
     Sftp,
+    Rest,
 }
 
 impl TargetKind {
@@ -474,6 +613,7 @@ impl TargetKind {
             Self::Folder => "folder",
             Self::S3 => "s3",
             Self::Sftp => "sftp",
+            Self::Rest => "rest",
         }
     }
 }
@@ -485,6 +625,7 @@ pub enum Place {
     Folder(PathBuf),
     S3(S3Bucket),
     Sftp(SftpFolder),
+    Rest(RestServer),
 }
 
 /// A folder on another computer, reached over SFTP, as the owner types it
@@ -638,6 +779,12 @@ pub struct TargetStatus {
     pub last_good_backup: Option<SystemTime>,
     pub last_check: Option<Outcome>,
     pub last_restore_test: Option<Outcome>,
+    /// For an append-only target, the space its backups use, as of the
+    /// last weekly upkeep.
+    pub stored_bytes: Option<u64>,
+    /// For an append-only target, its oldest backup, as of the last weekly
+    /// upkeep.
+    pub oldest_backup: Option<SystemTime>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -700,9 +847,11 @@ impl Backup {
         for folder in [&dir, &dir.join("cache"), &dir.join("temp")] {
             std::fs::create_dir_all(folder)?;
         }
-        let ssh = data_dir.join(SSH_DIR);
-        std::fs::create_dir_all(&ssh)?;
-        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700))?;
+        for private in [SSH_DIR, CERT_DIR] {
+            let private = data_dir.join(private);
+            std::fs::create_dir_all(&private)?;
+            std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o700))?;
+        }
         let backup = Self {
             inner: Arc::new(Inner {
                 db,
@@ -775,7 +924,16 @@ impl Backup {
                 let mut statuses = Vec::with_capacity(targets.len());
                 for target in targets {
                     let latest = |kind: RunKind| latest_outcome(conn, target.id, kind);
+                    let (stored_bytes, oldest_backup): (Option<i64>, Option<String>) = conn
+                        .query_row(
+                            "SELECT stored_bytes, oldest_backup_at FROM backup_targets
+                             WHERE id = ?1",
+                            [target.id.as_uuid()],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )?;
                     statuses.push(TargetStatus {
+                        stored_bytes: stored_bytes.and_then(|bytes| u64::try_from(bytes).ok()),
+                        oldest_backup: oldest_backup.as_deref().and_then(time::parse),
                         last_backup: latest(RunKind::Backup)?,
                         last_good_backup: conn
                             .query_row(
@@ -949,7 +1107,7 @@ impl Backup {
                     month_ago = sql_now!("-30 days"),
                 ))?
                 .query_map([], |row| {
-                    Ok((target_from_row(row)?, row.get(5)?, row.get(6)?))
+                    Ok((target_from_row(row)?, row.get(6)?, row.get(7)?))
                 })?
                 .collect::<Result<_, _>>()
             })
@@ -960,6 +1118,13 @@ impl Backup {
     /// left, and moves on to the next part for next week.
     async fn weekly(&self, target: &Target, part: u32) -> Result<(), Error> {
         self.prune(target).await?;
+        // Read again: pruning may have found the target refuses deletes.
+        let target = &self.target(target.id).await?;
+        if target.append_only
+            && let Err(err) = self.measure(target).await
+        {
+            tracing::warn!(target = %target.name, %err, "couldn't measure an append-only target");
+        }
         let run = self
             .check(target, CheckDepth::Data { part, of: PARTS })
             .await?;
@@ -1068,9 +1233,11 @@ impl Backup {
             .await?)
     }
 
-    /// Adds a place for backups: a folder, such as one on a USB disk, or an
-    /// S3 bucket. Sets up a new repository there, or uses the one already
-    /// there if the recovery key opens it.
+    /// Adds a place for backups: a folder, such as one on a USB disk, an S3
+    /// bucket, a folder over SFTP, or a REST server. Sets up a new repository
+    /// there, or uses the one already there if the recovery key opens it.
+    /// For a REST server, it also finds out whether the server is
+    /// append-only.
     pub async fn add_target(&self, name: &str, place: &Place) -> Result<Target, Error> {
         let name = name.trim().to_owned();
         if name.is_empty() || name.chars().count() > 100 {
@@ -1083,6 +1250,7 @@ impl Backup {
                 let (repository, port) = self.new_sftp(folder).await?;
                 (TargetKind::Sftp, repository, Some(port))
             }
+            Place::Rest(server) => (TargetKind::Rest, rest_repository(server)?, None),
         };
         if self.recovery_key().await?.is_none() {
             return Err(Error::NoRecoveryKey);
@@ -1090,6 +1258,11 @@ impl Backup {
 
         let _busy = self.busy().await;
         let restic = &self.inner.restic;
+        let mut repository = repository;
+        let certificate = match kind {
+            TargetKind::Rest => self.trust_rest(&mut repository, restic).await?,
+            TargetKind::Folder | TargetKind::S3 | TargetKind::Sftp => None,
+        };
         match restic
             .run_once(&repository, None, &args(["cat", "config"]))
             .await
@@ -1107,7 +1280,11 @@ impl Backup {
         // ssh recorded the server's host key on the way, to check from now on.
         let host_key = match kind {
             TargetKind::Sftp => Some(self.new_host_key().await?),
-            TargetKind::Folder | TargetKind::S3 => None,
+            TargetKind::Folder | TargetKind::S3 | TargetKind::Rest => None,
+        };
+        let append_only = match kind {
+            TargetKind::Rest => self.refuses_deletes(&repository).await?,
+            TargetKind::Folder | TargetKind::S3 | TargetKind::Sftp => false,
         };
 
         let id = BackupTargetId::generate();
@@ -1124,16 +1301,18 @@ impl Backup {
                     return Err(Error::TargetExists);
                 }
                 let keys = repository.keys.as_ref();
+                let login = repository.login.as_ref();
                 tx.execute(
                     concat!(
                         "INSERT INTO backup_targets (id, name, kind, location, created_at,
                                                      access_key_id, secret_access_key,
-                                                     ssh_port, host_key)
+                                                     ssh_port, host_key, rest_username,
+                                                     rest_password, certificate, append_only)
                          VALUES (?1, ?2, ?3, ?4, ",
                         sql_now!(),
-                        ", ?5, ?6, ?7, ?8)"
+                        ", ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"
                     ),
-                    (
+                    rusqlite::params![
                         id.as_uuid(),
                         &name,
                         kind.as_str(),
@@ -1142,11 +1321,16 @@ impl Backup {
                         keys.map(|keys| &keys.secret),
                         port,
                         &host_key,
-                    ),
+                        login.map(|login| &login.username),
+                        login.map(|login| &login.password),
+                        &certificate,
+                        append_only,
+                    ],
                 )?;
                 target(tx, id)?.ok_or(Error::NotFound)
             })
             .await?;
+        ignore_missing(tokio::fs::remove_file(self.inner.data_dir.join(NEW_CERT)).await)?;
         self.refresh().await?;
         Ok(target)
     }
@@ -1177,11 +1361,73 @@ impl Backup {
         self.ready_ssh_key().await?;
         ignore_missing(tokio::fs::remove_file(self.inner.data_dir.join(NEW_HOST_KEY)).await)?;
         let repository = Repository {
-            location: server.location(),
-            keys: None,
             ssh: Some(server.ssh(NEW_HOST_KEY, "accept-new")),
+            ..Repository::at(server.location())
         };
         Ok((repository, server.port))
+    }
+
+    /// Trusts a REST server's certificate the first time Accordion connects,
+    /// if the system doesn't trust it already. Points `repository` at the
+    /// certificate, and returns it in PEM form to record.
+    async fn trust_rest(
+        &self,
+        repository: &mut Repository,
+        restic: &Restic,
+    ) -> Result<Option<String>, Error> {
+        let failure = match restic
+            .run_once(repository, None, &args(["cat", "config"]))
+            .await
+        {
+            Err(failure) if rest::problem(&failure) == Some(Problem::Untrusted) => failure,
+            // Anything else comes up again when the repository is opened.
+            _ => return Ok(None),
+        };
+        let address = rest::location_address(&repository.location).ok_or(Error::BadRestAddress)?;
+        let certificate = rest::certificate(&address.host, address.port)
+            .await
+            .map_err(|problem| Error::Unreachable {
+                host: address.host.clone(),
+                problem,
+            })?;
+        tracing::info!(
+            host = %address.host,
+            fingerprint = %rest::fingerprint(&certificate),
+            after = ?failure,
+            "trusting a REST server's certificate"
+        );
+        let pem = rest::pem(&certificate);
+        self.write_private(NEW_CERT, pem.clone()).await?;
+        repository.cacert = Some(self.inner.data_dir.join(NEW_CERT));
+        Ok(Some(pem))
+    }
+
+    /// Whether a repository refuses deletes, as an append-only REST server
+    /// does. Backs up an empty folder with its own tag, then tries to remove
+    /// that snapshot. On an append-only server, the empty snapshot stays.
+    async fn refuses_deletes(&self, repository: &Repository) -> Result<bool, Error> {
+        let empty = self.inner.dir.join("append-only-test");
+        ignore_missing(tokio::fs::remove_dir_all(&empty).await)?;
+        tokio::fs::create_dir(&empty).await?;
+        let restic = &self.inner.restic;
+        let mut command = args(["backup", "--json", "--host", TAG, "--tag", PROBE_TAG]);
+        command.push(empty.clone().into());
+        let result = restic.run_once(repository, None, &command).await;
+        ignore_missing(tokio::fs::remove_dir_all(&empty).await)?;
+        let stdout = result.map_err(|failure| setup_failure(&failure, repository))?;
+        let snapshot = restic::message(&stdout, "summary")
+            .and_then(|summary| summary["snapshot_id"].as_str().map(str::to_owned))
+            .ok_or_else(|| {
+                Error::Restic("restic finished without saying which snapshot it made.".into())
+            })?;
+        match restic
+            .run_once(repository, None, &args(["forget", &snapshot]))
+            .await
+        {
+            Ok(_) => Ok(false),
+            Err(failure) if rest::problem(&failure) == Some(Problem::Forbidden) => Ok(true),
+            Err(failure) => Err(setup_failure(&failure, repository)),
+        }
     }
 
     /// The host key ssh recorded for a new server.
@@ -1308,6 +1554,14 @@ impl Backup {
         Ok(())
     }
 
+    async fn target(&self, id: BackupTargetId) -> Result<Target, Error> {
+        self.inner
+            .db
+            .read(move |conn| target(conn, id))
+            .await?
+            .ok_or(Error::NotFound)
+    }
+
     /// Every place backups go, oldest first.
     pub async fn targets(&self) -> Result<Vec<Target>, Error> {
         Ok(self
@@ -1420,31 +1674,125 @@ impl Backup {
         if run.snapshot.is_none() {
             return run.failed("restic finished without saying which snapshot it made.".into());
         }
+        // An append-only target keeps everything.
+        if target.append_only {
+            return run.finish();
+        }
         let mut forget = args(["forget", "--json", "--group-by", "host,tags", "--tag", TAG]);
         for (flag, count) in KEEP {
             forget.extend(args([flag, count]));
         }
-        if let Err(failure) = restic.run(&repository, None, &forget).await {
-            // The backup itself worked, so this is only worth a warning.
-            tracing::warn!(
-                target = %target.name,
-                problem = describe(&failure, &repository),
-                "couldn't remove old snapshots"
-            );
+        match restic.run(&repository, None, &forget).await {
+            Ok(_) => {}
+            Err(failure) if refused_delete(&failure, &repository) => {
+                self.became_append_only(target).await;
+            }
+            Err(failure) => {
+                // The backup itself worked, so this is only worth a warning.
+                tracing::warn!(
+                    target = %target.name,
+                    problem = describe(&failure, &repository),
+                    "couldn't remove old snapshots"
+                );
+            }
         }
         run.finish()
     }
 
+    /// Records that a target now refuses deletes, such as a REST server
+    /// switched to append-only after it was added.
+    async fn became_append_only(&self, target: &Target) {
+        let id = target.id;
+        let marked = self
+            .inner
+            .db
+            .write(move |tx| {
+                tx.execute(
+                    "UPDATE backup_targets SET append_only = 1 WHERE id = ?1",
+                    [id.as_uuid()],
+                )
+            })
+            .await;
+        match marked {
+            Ok(_) => tracing::info!(
+                target = %target.name,
+                "the target refused to delete old snapshots, so it's treated as append-only now"
+            ),
+            Err(err) => {
+                tracing::warn!(target = %target.name, %err, "couldn't record an append-only target")
+            }
+        }
+        if let Err(err) = self.refresh().await {
+            tracing::warn!(%err, "couldn't refresh the backup status");
+        }
+    }
+
     /// Removes the data that only expired snapshots used. It takes a while,
-    /// so it runs weekly rather than after every backup.
+    /// so it runs weekly rather than after every backup. An append-only
+    /// target keeps everything, so there's nothing to do there.
     pub async fn prune(&self, target: &Target) -> Result<(), Error> {
+        if target.append_only {
+            return Ok(());
+        }
         let _busy = self.busy().await;
         let repository = self.repository(target).await?;
-        self.inner
+        match self
+            .inner
             .restic
             .run(&repository, None, &args(["prune"]))
             .await
-            .map_err(|failure| Error::Restic(describe(&failure, &repository)))?;
+        {
+            Ok(_) => Ok(()),
+            Err(failure) if refused_delete(&failure, &repository) => {
+                self.became_append_only(target).await;
+                Ok(())
+            }
+            Err(failure) => Err(Error::Restic(describe(&failure, &repository))),
+        }
+    }
+
+    /// Measures an append-only target, which only grows: the space its
+    /// backups use, and its oldest backup.
+    async fn measure(&self, target: &Target) -> Result<(), Error> {
+        let _busy = self.busy().await;
+        let repository = self.repository(target).await?;
+        let restic = &self.inner.restic;
+        let failed = |failure| Error::Restic(describe(&failure, &repository));
+        let stats = restic
+            .run(
+                &repository,
+                None,
+                &args(["stats", "--json", "--mode", "raw-data"]),
+            )
+            .await
+            .map_err(failed)?;
+        let stored_bytes = serde_json::from_str::<serde_json::Value>(stats.trim())
+            .ok()
+            .and_then(|stats| stats["total_size"].as_u64())
+            .and_then(|bytes| i64::try_from(bytes).ok());
+        let snapshots = restic
+            .run(
+                &repository,
+                None,
+                &args(["snapshots", "--json", "--tag", TAG]),
+            )
+            .await
+            .map_err(failed)?;
+        let oldest = parse_snapshots(&snapshots)
+            .and_then(|snapshots| snapshots.into_iter().map(|snapshot| snapshot.time).min())
+            .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map(time::format);
+        let id = target.id;
+        self.inner
+            .db
+            .write(move |tx| {
+                tx.execute(
+                    "UPDATE backup_targets SET stored_bytes = ?2, oldest_backup_at = ?3
+                     WHERE id = ?1",
+                    (id.as_uuid(), stored_bytes, &oldest),
+                )
+            })
+            .await?;
         Ok(())
     }
 
@@ -1713,6 +2061,7 @@ impl Backup {
             }
             Place::S3(bucket) => s3_repository(bucket)?,
             Place::Sftp(folder) => self.new_sftp(folder).await?.0,
+            Place::Rest(server) => rest_repository(server)?,
         };
         let dir = self.restore_dir();
         let key_file = dir.join("recovery-key");
@@ -1737,17 +2086,24 @@ impl Backup {
             cache: self.inner.restic.cache.clone(),
             temp: self.inner.restic.temp.clone(),
         };
+        let mut repository = repository;
+        if let Place::Rest(_) = place {
+            // The restored database has the certificate for later backups.
+            self.trust_rest(&mut repository, &restic).await?;
+        }
         Ok((repository, restic))
     }
 
     /// The repository for a target, with its keys if it's a bucket, or how to
     /// connect if it's over SFTP.
     async fn repository(&self, target: &Target) -> Result<Repository, Error> {
-        if target.kind == TargetKind::Sftp {
-            return self.sftp_repository(target).await;
+        match target.kind {
+            TargetKind::Sftp => return self.sftp_repository(target).await,
+            TargetKind::Rest => return self.rest_target_repository(target).await,
+            TargetKind::Folder | TargetKind::S3 => {}
         }
         let keys = match target.kind {
-            TargetKind::Folder | TargetKind::Sftp => None,
+            TargetKind::Folder | TargetKind::Sftp | TargetKind::Rest => None,
             TargetKind::S3 => {
                 let id = target.id;
                 self.inner
@@ -1770,9 +2126,47 @@ impl Backup {
             }
         };
         Ok(Repository {
-            location: target.location.clone(),
             keys,
-            ssh: None,
+            ..Repository::at(target.location.clone())
+        })
+    }
+
+    /// Connects to a REST target with its username and password, trusting
+    /// only the certificate pinned when it was added, if there is one.
+    async fn rest_target_repository(&self, target: &Target) -> Result<Repository, Error> {
+        let id = target.id;
+        let (login, certificate) = self
+            .inner
+            .db
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT rest_username, rest_password, certificate FROM backup_targets
+                     WHERE id = ?1",
+                    [id.as_uuid()],
+                    |row| {
+                        Ok((
+                            Login {
+                                username: row.get(0)?,
+                                password: row.get(1)?,
+                            },
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    },
+                )
+            })
+            .await?;
+        let cacert = match certificate {
+            Some(certificate) => {
+                let path = format!("{CERT_DIR}/{id}.pem");
+                self.write_private(&path, certificate).await?;
+                Some(self.inner.data_dir.join(path))
+            }
+            None => None,
+        };
+        Ok(Repository {
+            login: Some(login),
+            cacert,
+            ..Repository::at(target.location.clone())
         })
     }
 
@@ -1802,9 +2196,8 @@ impl Backup {
         let known_hosts = format!("{SSH_DIR}/{id}.known_hosts");
         self.write_private(&known_hosts, host_key).await?;
         Ok(Repository {
-            location: target.location.clone(),
-            keys: None,
             ssh: Some(server.ssh(&known_hosts, "yes")),
+            ..Repository::at(target.location.clone())
         })
     }
 
@@ -1906,6 +2299,12 @@ impl Run {
 /// What a restic failure means for the admin.
 fn describe(failure: &Failure, repository: &Repository) -> String {
     let place = place_name(repository);
+    if repository.login.is_some()
+        && let Some(problem) = rest::problem(failure)
+        && let Some(error) = rest_error(&problem, repository)
+    {
+        return error.to_string();
+    }
     match failure {
         Failure::Start(err) => format!(
             "Accordion couldn't start restic, the program that makes backups: {err}. \
@@ -1915,10 +2314,12 @@ fn describe(failure: &Failure, repository: &Repository) -> String {
             "There's no backup in {place}. Check that the bucket still exists at your \
              storage provider, then try again."
         ),
-        Failure::NoRepository if repository.ssh.is_some() => format!(
-            "There's no backup in {place}. Check that the folder is still there, then \
-             try again."
-        ),
+        Failure::NoRepository if repository.ssh.is_some() || repository.login.is_some() => {
+            format!(
+                "There's no backup in {place}. Check that the folder is still there, then \
+                 try again."
+            )
+        }
         Failure::NoRepository => format!(
             "There's no backup in {place}. If it's on a USB disk, check that the \
              disk is plugged in, then try again."
@@ -1948,7 +2349,7 @@ fn describe(failure: &Failure, repository: &Repository) -> String {
                 }
             }
         }
-        Failure::Failed { code, message } => {
+        Failure::Failed { code, message, .. } => {
             let code =
                 code.map_or_else(|| "stopped".to_owned(), |code| format!("exit code {code}"));
             format!("restic couldn't finish ({code}): {message}")
@@ -1959,6 +2360,22 @@ fn describe(failure: &Failure, repository: &Repository) -> String {
 /// What a restic failure means while the owner sets up a target or looks
 /// for backups, with the common mistakes in a bucket's details spelled out.
 fn setup_failure(failure: &Failure, repository: &Repository) -> Error {
+    if repository.login.is_some() {
+        if let Some(problem) = rest::problem(failure)
+            && let Some(error) = rest_error(&problem, repository)
+        {
+            return error;
+        }
+        if let (Failure::Retrying(problem), Some(address)) =
+            (failure, rest::location_address(&repository.location))
+        {
+            return Error::Unreachable {
+                host: address.host,
+                problem: problem.clone(),
+            };
+        }
+        return Error::Restic(describe(failure, repository));
+    }
     if let Failure::Ssh(problem) = failure
         && let Some((user, host, _)) = sftp_parts(&repository.location)
     {
@@ -2022,6 +2439,11 @@ fn place_name(repository: &Repository) -> String {
         && let Some((_, host, folder)) = sftp_parts(&repository.location)
     {
         return format!("the folder {folder} on {host}");
+    }
+    if repository.login.is_some()
+        && let Some(address) = rest::location_address(&repository.location)
+    {
+        return format!("the REST server at {}", address.url);
     }
     match bucket_parts(&repository.location) {
         Some((host, bucket)) if repository.keys.is_some() => {
@@ -2095,11 +2517,7 @@ fn folder_repository(path: &Path) -> Result<Repository, Error> {
             "Accordion can only use folders whose path is valid UTF-8.".into(),
         ))?
         .to_owned();
-    Ok(Repository {
-        location,
-        keys: None,
-        ssh: None,
-    })
+    Ok(Repository::at(location))
 }
 
 /// Checks what the owner typed for a bucket, and puts it in restic's form.
@@ -2114,12 +2532,48 @@ fn s3_repository(bucket: &S3Bucket) -> Result<Repository, Error> {
         return Err(Error::NoKeys);
     }
     Ok(Repository {
-        location: format!("s3:{endpoint}/{name}"),
         keys: Some(Keys {
             id: id.to_owned(),
             secret: secret.to_owned(),
         }),
-        ssh: None,
+        ..Repository::at(format!("s3:{endpoint}/{name}"))
+    })
+}
+
+/// Checks what the owner typed for a REST server, and puts it in restic's
+/// form. A username needs a password, and the other way around.
+fn rest_repository(server: &RestServer) -> Result<Repository, Error> {
+    let address = rest::address(&server.address).ok_or(Error::BadRestAddress)?;
+    let username = server.username.trim();
+    if username.is_empty() != server.password.is_empty() {
+        return Err(Error::RestLoginIncomplete);
+    }
+    Ok(Repository {
+        login: Some(Login {
+            username: username.to_owned(),
+            password: server.password.clone(),
+        }),
+        ..Repository::at(format!("rest:{}", address.url))
+    })
+}
+
+/// Whether a failure is a REST server refusing a delete, as an append-only
+/// one does.
+fn refused_delete(failure: &Failure, repository: &Repository) -> bool {
+    repository.login.is_some() && rest::problem(failure) == Some(Problem::Forbidden)
+}
+
+/// What a REST server's problem means, as an error to show.
+fn rest_error(problem: &Problem, repository: &Repository) -> Option<Error> {
+    let host = rest::location_address(&repository.location)?.host;
+    Some(match problem {
+        Problem::Untrusted if repository.cacert.is_some() => Error::CertificateChanged(host),
+        // Accordion pins an untrusted certificate before it gets this far.
+        Problem::Untrusted | Problem::Forbidden => return None,
+        Problem::WrongName => Error::CertificateWrongName(host),
+        Problem::Expired => Error::CertificateExpired(host),
+        Problem::NotHttps => Error::NotHttps(host),
+        Problem::LoginRefused => Error::RestLoginRefused(host),
     })
 }
 
@@ -2242,7 +2696,7 @@ fn now() -> String {
     time::format(now)
 }
 
-const TARGET_COLUMNS: &str = "t.id, t.name, t.kind, t.location, t.created_at";
+const TARGET_COLUMNS: &str = "t.id, t.name, t.kind, t.location, t.created_at, t.append_only";
 
 fn target(conn: &Connection, id: BackupTargetId) -> rusqlite::Result<Option<Target>> {
     conn.query_row(
@@ -2253,7 +2707,7 @@ fn target(conn: &Connection, id: BackupTargetId) -> rusqlite::Result<Option<Targ
     .optional()
 }
 
-/// A target from the first five columns of `row`, as in [`TARGET_COLUMNS`].
+/// A target from the first six columns of `row`, as in [`TARGET_COLUMNS`].
 fn target_from_row(row: &Row<'_>) -> rusqlite::Result<Target> {
     let kind: String = row.get(2)?;
     Ok(Target {
@@ -2262,10 +2716,12 @@ fn target_from_row(row: &Row<'_>) -> rusqlite::Result<Target> {
         kind: match kind.as_str() {
             "s3" => TargetKind::S3,
             "sftp" => TargetKind::Sftp,
+            "rest" => TargetKind::Rest,
             _ => TargetKind::Folder,
         },
         location: row.get(3)?,
         created_at: row.get(4)?,
+        append_only: row.get(5)?,
     })
 }
 
@@ -2449,13 +2905,91 @@ mod tests {
         .unwrap();
         assert_eq!(server.port, 2222);
         let sftp = Repository {
-            location: server.location(),
-            keys: None,
             ssh: Some(server.ssh("known_hosts", "yes")),
+            ..Repository::at(server.location())
         };
         assert_eq!(
             place_name(&sftp),
             "the folder /volume1/backups on nas.local"
         );
+        let rest = rest_repository(&RestServer {
+            address: "https://NAS.local:8000/accordion/".into(),
+            username: "household".into(),
+            password: "hunter2".into(),
+        })
+        .unwrap();
+        assert_eq!(rest.location, "rest:https://nas.local:8000/accordion");
+        assert_eq!(
+            place_name(&rest),
+            "the REST server at https://nas.local:8000/accordion"
+        );
+    }
+
+    #[test]
+    fn checks_rest_servers() {
+        let server = |address: &str, username: &str, password: &str| {
+            rest_repository(&RestServer {
+                address: address.into(),
+                username: username.into(),
+                password: password.into(),
+            })
+        };
+        // A server that doesn't ask for a username and password.
+        let open = server("https://nas.local:8000", "", "").unwrap();
+        assert_eq!(open.login.unwrap().username, "");
+        assert!(matches!(
+            server("https://nas.local", "household", ""),
+            Err(Error::RestLoginIncomplete)
+        ));
+        assert!(matches!(
+            server("http://nas.local", "household", "hunter2"),
+            Err(Error::BadRestAddress)
+        ));
+        assert_eq!(
+            format!(
+                "{:?}",
+                RestServer {
+                    address: "https://nas.local".into(),
+                    username: "household".into(),
+                    password: "hunter2".into(),
+                }
+            ),
+            "RestServer { address: \"https://nas.local\", username: \"household\", .. }"
+        );
+
+        // A refused delete only means append-only on a REST server.
+        let forbidden = Failure::Failed {
+            code: Some(3),
+            message: String::new(),
+            output: "Remove(<snapshot/97895728d8>) failed: unexpected HTTP response (403)".into(),
+        };
+        assert!(refused_delete(
+            &forbidden,
+            &server("https://nas.local", "", "").unwrap()
+        ));
+        assert!(!refused_delete(
+            &forbidden,
+            &Repository::at("/media/usb".into())
+        ));
+
+        // Messages name the server and say what to do.
+        let rest = server("https://nas.local:8000/accordion", "household", "hunter2").unwrap();
+        let refused = Failure::Retrying("unexpected HTTP response (401): 401 Unauthorized".into());
+        assert!(matches!(
+            setup_failure(&refused, &rest),
+            Error::RestLoginRefused(host) if host == "nas.local"
+        ));
+        let untrusted = Failure::Retrying("x509: certificate signed by unknown authority".into());
+        let pinned = Repository {
+            cacert: Some("cert.pem".into()),
+            ..rest.clone()
+        };
+        assert!(describe(&untrusted, &pinned).contains("showed a different certificate"));
+        let off =
+            Failure::Retrying("dial tcp 192.168.1.50:8000: connect: connection refused".into());
+        assert!(matches!(
+            setup_failure(&off, &rest),
+            Error::Unreachable { host, .. } if host == "nas.local"
+        ));
     }
 }

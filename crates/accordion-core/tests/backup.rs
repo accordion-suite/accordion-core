@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use accordion_core::backup::{
-    self, Backup, CheckDepth, Error, KeyState, Place, RunKind, S3Bucket, SftpFolder, TargetKind,
+    self, Backup, CheckDepth, Error, KeyState, Place, RestServer, RunKind, S3Bucket, SftpFolder,
+    TargetKind,
 };
 use accordion_core::db::Database;
 use accordion_core::identity::{Identity, NewUser};
@@ -1105,5 +1106,293 @@ async fn shows_a_backup_started_in_the_background_as_running_right_away() {
             .as_ref()
             .map(|run| run.ok),
         Some(true)
+    );
+}
+
+/// A REST server on this machine, rclone's, standing in for rest-server on
+/// a NAS. Like most servers on a home network, it has a self-signed
+/// certificate. It stops when dropped.
+struct RestHost {
+    root: tempfile::TempDir,
+    port: u16,
+    server: Option<std::process::Child>,
+}
+
+const REST_USER: &str = "household";
+const REST_PASSWORD: &str = "rest-password-0123";
+
+impl RestHost {
+    fn start(append_only: bool) -> Self {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("repos")).unwrap();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut host = Self {
+            root,
+            port,
+            server: None,
+        };
+        host.certify(&["127.0.0.1"]);
+        host.serve(append_only);
+        host
+    }
+
+    /// Gives the server a new self-signed certificate for `names`, as
+    /// replacing its certificate would. It takes effect when the server
+    /// starts again.
+    fn certify(&self, names: &[&str]) {
+        let names: Vec<String> = names.iter().map(|&name| name.to_owned()).collect();
+        let certified = rcgen::generate_simple_self_signed(names).unwrap();
+        std::fs::write(self.root.path().join("cert.pem"), certified.cert.pem()).unwrap();
+        std::fs::write(
+            self.root.path().join("key.pem"),
+            certified.signing_key.serialize_pem(),
+        )
+        .unwrap();
+    }
+
+    /// Starts the server, or starts it again, append-only or not.
+    fn serve(&mut self, append_only: bool) {
+        self.stop();
+        let address = format!("127.0.0.1:{}", self.port);
+        let mut command = Command::new(rclone());
+        command
+            .args(["serve", "restic", "--addr", &address])
+            .arg("--cert")
+            .arg(self.root.path().join("cert.pem"))
+            .arg("--key")
+            .arg(self.root.path().join("key.pem"))
+            .args(["--user", REST_USER, "--pass", REST_PASSWORD]);
+        if append_only {
+            command.arg("--append-only");
+        }
+        self.server = Some(
+            command
+                .arg(self.root.path().join("repos"))
+                .env("RCLONE_CONFIG", "/dev/null")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let started = std::time::Instant::now();
+        while std::net::TcpStream::connect(&address).is_err() {
+            assert!(started.elapsed().as_secs() < 10, "rclone didn't start");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    fn stop(&mut self) {
+        if let Some(mut server) = self.server.take() {
+            let _ = server.kill();
+            let _ = server.wait();
+        }
+    }
+
+    fn server(&self) -> RestServer {
+        RestServer {
+            address: format!("https://127.0.0.1:{}/household", self.port),
+            username: REST_USER.into(),
+            password: REST_PASSWORD.into(),
+        }
+    }
+
+    fn place(&self) -> Place {
+        Place::Rest(self.server())
+    }
+
+    /// The repository's folder on the server, for opening it directly as an
+    /// admin cleaning up would.
+    fn repository(&self) -> PathBuf {
+        self.root.path().join("repos/household")
+    }
+}
+
+impl Drop for RestHost {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+#[tokio::test]
+async fn backs_up_to_an_append_only_rest_server_and_restores_from_it() {
+    let host = RestHost::start(true);
+    let server = start().await;
+    let key = server.backup.create_recovery_key().await.unwrap();
+    let target = server
+        .backup
+        .add_target("NAS", &host.place())
+        .await
+        .unwrap();
+    assert_eq!(target.kind, TargetKind::Rest);
+    assert!(target.append_only);
+    assert_eq!(
+        target.rest(),
+        Some(format!("https://127.0.0.1:{}/household", host.port).as_str())
+    );
+    // The password stays out of logs.
+    assert!(!format!("{target:?}").contains(REST_PASSWORD));
+    assert!(!format!("{:?}", host.server()).contains(REST_PASSWORD));
+
+    // Two backups on one day: the usual retention would remove the first.
+    for _ in 0..2 {
+        let runs = server.backup.back_up().await.unwrap();
+        assert!(runs.iter().all(|run| run.ok), "{runs:?}");
+    }
+    let count = |tag: &str| {
+        let listed = server.restic(&host.repository(), &["snapshots", "--json", "--tag", tag]);
+        serde_json::from_str::<Vec<serde_json::Value>>(&listed)
+            .unwrap()
+            .len()
+    };
+    assert_eq!(count("accordion"), 2);
+    assert_eq!(count("accordion-append-only-test"), 1);
+
+    // Weekly upkeep removes nothing, and measures what's there.
+    server.backup.nightly().await;
+    assert_eq!(count("accordion"), 3);
+    let status = server.backup.status().borrow().clone();
+    let target_status = &status.targets[0];
+    assert!(target_status.stored_bytes.is_some_and(|bytes| bytes > 0));
+    assert!(target_status.oldest_backup.is_some());
+    assert!(
+        target_status
+            .last_check
+            .as_ref()
+            .is_some_and(|check| check.ok)
+    );
+    let run = server.backup.test_restore(&target).await.unwrap();
+    assert!(run.ok, "{run:?}");
+
+    // A fresh server trusts the certificate again, and never lists the
+    // append-only test.
+    let (data, _services, fresh) = fresh().await;
+    let place = host.place();
+    let snapshots = fresh.find_snapshots(&place, key.as_str()).await.unwrap();
+    assert_eq!(snapshots.len(), 3);
+    fresh
+        .restore(&place, key.as_str(), &snapshots[0].id, |_| {})
+        .await
+        .unwrap();
+    drop(fresh);
+    assert!(backup::apply_restore(data.path()).unwrap());
+
+    // The restored server has the address, password, and certificate, so it
+    // goes on backing up without being set up again.
+    let db = Database::open(&data.path().join("accordion.db")).unwrap();
+    let identity = Identity::new(db.clone()).await.unwrap();
+    let storage = Storage::open(db.clone(), identity, &data.path().join("storage"))
+        .await
+        .unwrap();
+    let restored = Backup::open(db, storage, data.path(), restic())
+        .await
+        .unwrap();
+    assert_eq!(restored.targets().await.unwrap(), [target]);
+    let runs = restored.back_up().await.unwrap();
+    assert!(runs.iter().all(|run| run.ok), "{runs:?}");
+}
+
+#[tokio::test]
+async fn notices_when_a_rest_server_turns_append_only() {
+    let mut host = RestHost::start(false);
+    let server = start().await;
+    server.backup.create_recovery_key().await.unwrap();
+    let target = server
+        .backup
+        .add_target("NAS", &host.place())
+        .await
+        .unwrap();
+    assert!(!target.append_only);
+    for _ in 0..2 {
+        let runs = server.backup.back_up().await.unwrap();
+        assert!(runs.iter().all(|run| run.ok), "{runs:?}");
+    }
+
+    // restic keeps the newest and oldest backup of a day, so the third
+    // backup today replaces the second. Removing it is refused, and
+    // Accordion stops trying.
+    host.serve(true);
+    let runs = server.backup.back_up().await.unwrap();
+    assert!(runs.iter().all(|run| run.ok), "{runs:?}");
+    assert!(server.backup.targets().await.unwrap()[0].append_only);
+    assert!(
+        server.backup.status().borrow().targets[0]
+            .target
+            .append_only
+    );
+}
+
+#[tokio::test]
+async fn explains_mistakes_in_a_rest_servers_details() {
+    let mut host = RestHost::start(true);
+    let server = start().await;
+    server.backup.create_recovery_key().await.unwrap();
+    let add = |rest: RestServer| {
+        let backup = server.backup.clone();
+        async move { backup.add_target("NAS", &Place::Rest(rest)).await }
+    };
+    let started = std::time::Instant::now();
+
+    let err = add(RestServer {
+        password: "not-the-password".into(),
+        ..host.server()
+    })
+    .await
+    .unwrap_err();
+    assert!(matches!(err, Error::RestLoginRefused(_)), "{err}");
+    assert!(
+        err.to_string().starts_with("127.0.0.1 didn't accept"),
+        "{err}"
+    );
+
+    let err = add(RestServer {
+        address: "https://127.0.0.1:1/household".into(),
+        ..host.server()
+    })
+    .await
+    .unwrap_err();
+    assert!(matches!(err, Error::Unreachable { .. }), "{err}");
+
+    for address in ["", "http://127.0.0.1:8000", "https://u:p@127.0.0.1:8000"] {
+        let err = add(RestServer {
+            address: address.into(),
+            ..host.server()
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(err, Error::BadRestAddress), "{address}: {err}");
+    }
+    let err = add(RestServer {
+        password: String::new(),
+        ..host.server()
+    })
+    .await
+    .unwrap_err();
+    assert!(matches!(err, Error::RestLoginIncomplete), "{err}");
+
+    // A certificate made for another name.
+    host.certify(&["nas.example"]);
+    host.serve(true);
+    let err = add(host.server()).await.unwrap_err();
+    assert!(matches!(err, Error::CertificateWrongName(_)), "{err}");
+    assert!(server.backup.targets().await.unwrap().is_empty());
+    // restic would try each of those again for minutes. Setup doesn't wait.
+    assert!(started.elapsed().as_secs() < 30, "{:?}", started.elapsed());
+
+    // A new certificate after the target was added stops backups there.
+    host.certify(&["127.0.0.1"]);
+    host.serve(true);
+    add(host.server()).await.unwrap();
+    host.certify(&["127.0.0.1"]);
+    host.serve(true);
+    let runs = server.backup.back_up().await.unwrap();
+    let problem = runs[0].problem.as_deref().unwrap_or_default();
+    assert!(!runs[0].ok);
+    assert!(
+        problem.starts_with("127.0.0.1 showed a different certificate"),
+        "{problem}"
     );
 }

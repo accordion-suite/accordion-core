@@ -321,6 +321,11 @@ const PARTS: u32 = 8;
 /// backup time. Long enough for everything else to start first.
 const CATCH_UP: Duration = Duration::from_secs(10 * 60);
 
+/// How long a new location has to answer while the admin waits. A computer
+/// at home answers in milliseconds, and a storage provider in well under a
+/// second.
+const ANSWER_TIME: Duration = Duration::from_secs(10);
+
 /// Marks Accordion's snapshots, so they're grouped together however the
 /// box's hostname or data folder changes.
 const TAG: &str = "accordion";
@@ -1281,6 +1286,7 @@ impl Backup {
         if self.recovery_key().await?.is_none() {
             return Err(Error::NoRecoveryKey);
         }
+        check_answers(place, ANSWER_TIME).await?;
 
         let _busy = self.busy().await;
         let restic = &self.inner.restic;
@@ -2090,6 +2096,7 @@ impl Backup {
             Place::Sftp(folder) => self.new_sftp(folder).await?.0,
             Place::Rest(server) => rest_repository(server)?,
         };
+        check_answers(place, ANSWER_TIME).await?;
         let dir = self.restore_dir();
         let key_file = dir.join("recovery-key");
         let path = key_file.clone();
@@ -2460,6 +2467,77 @@ fn setup_failure(failure: &Failure, repository: &Repository) -> Error {
             host: host.to_owned(),
             problem: why_unreachable(problem),
             reach: Reach::Internet,
+        }
+    }
+}
+
+/// Checks that a location on another machine answers at all, before restic
+/// tries it. restic waits 30 seconds for each connection and says nothing
+/// meanwhile, and adding a location can take it three tries, so someone
+/// waiting on the page would see nothing happen for a minute or more.
+async fn check_answers(place: &Place, within: Duration) -> Result<(), Error> {
+    let Some((shown, host, port, reach)) = place_address(place) else {
+        return Ok(());
+    };
+    // Through a proxy, as some servers reach the internet, the bucket's
+    // own address isn't reachable directly, so leave the check to restic.
+    let proxied = ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some_and(|value| !value.is_empty()));
+    if reach == Reach::Internet && proxied {
+        return Ok(());
+    }
+    let problem = match tokio::time::timeout(
+        within,
+        tokio::net::TcpStream::connect((host.as_str(), port)),
+    )
+    .await
+    {
+        Ok(Ok(_)) => return Ok(()),
+        Ok(Err(err)) => why_unreachable(&err.to_string()),
+        Err(_) => why_unreachable("didn't answer"),
+    };
+    Err(Error::Unreachable {
+        host: shown,
+        problem,
+        reach,
+    })
+}
+
+/// Where a place on another machine is: its name as messages show it, the
+/// host and port to connect to, and whether it's on the internet. `None`
+/// for a folder on this server, or an address that doesn't parse, which
+/// gets its own error later.
+fn place_address(place: &Place) -> Option<(String, String, u16, Reach)> {
+    match place {
+        Place::Folder(_) => None,
+        Place::Rest(server) => {
+            let address = rest::address(&server.address)?;
+            let host = address.host.trim_start_matches('[').trim_end_matches(']');
+            Some((
+                address.host.clone(),
+                host.to_owned(),
+                address.port,
+                Reach::Network,
+            ))
+        }
+        Place::Sftp(folder) => {
+            let server = sftp_server(folder).ok()?;
+            Some((
+                server.host.clone(),
+                server.host,
+                server.port,
+                Reach::Network,
+            ))
+        }
+        Place::S3(bucket) => {
+            let endpoint = s3_endpoint(&bucket.endpoint)?;
+            let (scheme, shown) = endpoint.split_once("://")?;
+            let (host, port) = match shown.rsplit_once(':') {
+                Some((host, port)) => (host, port.parse().ok()?),
+                None => (shown, if scheme == "http" { 80 } else { 443 }),
+            };
+            Some((shown.to_owned(), host.to_owned(), port, Reach::Internet))
         }
     }
 }
@@ -3070,6 +3148,91 @@ mod tests {
             setup_failure(&off, &rest),
             Error::Unreachable { host, .. } if host == "nas.local"
         ));
+    }
+
+    #[test]
+    fn finds_where_a_place_is() {
+        let rest = Place::Rest(RestServer {
+            address: "https://[fd00::50]:8000/accordion".into(),
+            username: String::new(),
+            password: String::new(),
+        });
+        assert_eq!(
+            place_address(&rest),
+            Some(("[fd00::50]".into(), "fd00::50".into(), 8000, Reach::Network))
+        );
+        let sftp = Place::Sftp(SftpFolder {
+            server: "NAS.local".into(),
+            username: "backup".into(),
+            folder: "accordion".into(),
+        });
+        assert_eq!(
+            place_address(&sftp),
+            Some(("nas.local".into(), "nas.local".into(), 22, Reach::Network))
+        );
+        let bucket = |endpoint: &str| {
+            place_address(&Place::S3(S3Bucket {
+                endpoint: endpoint.into(),
+                bucket: "family".into(),
+                key_id: "id".into(),
+                secret_key: "secret".into(),
+            }))
+        };
+        assert_eq!(
+            bucket("s3.us-west-004.backblazeb2.com"),
+            Some((
+                "s3.us-west-004.backblazeb2.com".into(),
+                "s3.us-west-004.backblazeb2.com".into(),
+                443,
+                Reach::Internet
+            ))
+        );
+        assert_eq!(
+            bucket("http://localhost:9000"),
+            Some((
+                "localhost:9000".into(),
+                "localhost".into(),
+                9000,
+                Reach::Internet
+            ))
+        );
+        assert_eq!(place_address(&Place::Folder("/media/usb".into())), None);
+    }
+
+    #[tokio::test]
+    async fn checks_that_a_place_answers() {
+        let at = |address: String| {
+            Place::Rest(RestServer {
+                address,
+                username: String::new(),
+                password: String::new(),
+            })
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let open = at(format!("https://127.0.0.1:{port}/accordion"));
+        check_answers(&open, Duration::from_secs(5)).await.unwrap();
+        drop(listener);
+
+        let closed = check_answers(&open, Duration::from_secs(5)).await;
+        assert!(
+            matches!(&closed, Err(Error::Unreachable { problem, .. })
+                if problem == "nothing is listening on that port"),
+            "{closed:?}"
+        );
+
+        // A documentation address, which no network routes, so the
+        // connection either hangs or fails at once.
+        let started = std::time::Instant::now();
+        let nowhere = at("https://192.0.2.1:8444/accordion".into());
+        let silent = check_answers(&nowhere, Duration::from_millis(300)).await;
+        assert!(
+            matches!(&silent, Err(Error::Unreachable { problem, reach: Reach::Network, .. })
+                if problem == "it didn't answer"
+                    || problem == "this server has no network route to it"),
+            "{silent:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

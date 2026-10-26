@@ -1394,6 +1394,18 @@ async fn explains_mistakes_in_a_rest_servers_details() {
     // restic would try each of those again for minutes. Setup doesn't wait.
     assert!(started.elapsed().as_secs() < 30, "{:?}", started.elapsed());
 
+    // An address no network routes, like a computer that's turned off.
+    // restic would wait 30 seconds for each of its tries.
+    let waited = std::time::Instant::now();
+    let err = add(RestServer {
+        address: "https://192.0.2.1:8444/household".into(),
+        ..host.server()
+    })
+    .await
+    .unwrap_err();
+    assert!(matches!(err, Error::Unreachable { .. }), "{err}");
+    assert!(waited.elapsed().as_secs() < 20, "{:?}", waited.elapsed());
+
     // A new certificate after the target was added stops backups there.
     host.certify(&["127.0.0.1"]);
     host.serve(true);

@@ -559,16 +559,12 @@ mod tests {
 
     #[tokio::test]
     async fn asks_ssh_when_restic_drops_its_reason() {
-        use std::os::unix::fs::PermissionsExt;
-
         let dir = tempfile::tempdir().unwrap();
         let ssh = dir.path().join("ssh");
-        std::fs::write(
+        write_script(
             &ssh,
-            "#!/bin/sh\necho 'nas@192.168.1.50: Permission denied (publickey).' >&2\nexit 255\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+            "echo 'nas@192.168.1.50: Permission denied (publickey).' >&2\nexit 255\n",
+        );
         let restic = Restic {
             program: "restic".into(),
             home: dir.path().to_owned(),
@@ -609,13 +605,29 @@ mod tests {
         ));
     }
 
-    /// A Restic that runs `script` in place of restic, in `dir`.
-    fn fake_restic(dir: &Path, script: &str) -> Restic {
+    /// Writes a shell script that can run. Writing it here and running it
+    /// straight away fails now and then with "Text file busy": a program
+    /// another test starts at that moment holds the file open for writing
+    /// until it's running. So `cp` writes the script, and has finished
+    /// before anything runs it.
+    fn write_script(path: &Path, script: &str) {
         use std::os::unix::fs::PermissionsExt;
 
+        let draft = path.with_extension("draft");
+        std::fs::write(&draft, format!("#!/bin/sh\n{script}")).unwrap();
+        let copied = std::process::Command::new("cp")
+            .arg(&draft)
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(copied.success());
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// A Restic that runs `script` in place of restic, in `dir`.
+    fn fake_restic(dir: &Path, script: &str) -> Restic {
         let program = dir.join("restic");
-        std::fs::write(&program, format!("#!/bin/sh\n{script}")).unwrap();
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        write_script(&program, script);
         Restic {
             program,
             home: dir.to_owned(),

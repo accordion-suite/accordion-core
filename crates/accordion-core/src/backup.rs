@@ -3214,7 +3214,10 @@ mod tests {
         check_answers(&open, Duration::from_secs(5)).await.unwrap();
         drop(listener);
 
-        let closed = check_answers(&open, Duration::from_secs(5)).await;
+        // Not the listener's port, which another test can take as soon as
+        // it's free.
+        let closed = at("https://127.0.0.1:1/accordion".into());
+        let closed = check_answers(&closed, Duration::from_secs(5)).await;
         assert!(
             matches!(&closed, Err(Error::Unreachable { problem, .. })
                 if problem == "nothing is listening on that port"),

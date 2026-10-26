@@ -411,11 +411,13 @@ pub enum Error {
     )]
     NoBucket { bucket: String, host: String },
 
-    #[error(
-        "Accordion couldn't reach {host} ({problem}). Check the address, and that the \
-         server is connected to the internet, then try again."
-    )]
-    Unreachable { host: String, problem: String },
+    /// `problem` is already in plain words, from `why_unreachable`.
+    #[error("Accordion couldn't reach {host}: {problem}. {reach}")]
+    Unreachable {
+        host: String,
+        problem: String,
+        reach: Reach,
+    },
 
     #[error(
         "Enter the other computer's name or address, such as nas.local or 192.168.1.50. \
@@ -532,6 +534,30 @@ pub enum Error {
          restored. Choose an earlier backup."
     )]
     DamagedDatabase(String),
+}
+
+/// Where a target is reached, which decides what to check when it can't be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    /// A storage provider's bucket.
+    Internet,
+    /// Another computer, usually at home, over SFTP or a REST server.
+    Network,
+}
+
+impl fmt::Display for Reach {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Reach::Internet => {
+                "Check the address, and that this server is connected to the internet, then \
+                 try again."
+            }
+            Reach::Network => {
+                "Check the address, and that the other computer is turned on and connected \
+                 to the network, then try again."
+            }
+        })
+    }
 }
 
 /// The password that locks every backup. Shown to the owner in groups of
@@ -1388,7 +1414,8 @@ impl Backup {
             .await
             .map_err(|problem| Error::Unreachable {
                 host: address.host.clone(),
-                problem,
+                problem: why_unreachable(&problem),
+                reach: Reach::Network,
             })?;
         tracing::info!(
             host = %address.host,
@@ -2331,7 +2358,15 @@ fn describe(failure: &Failure, repository: &Repository) -> String {
         Failure::WrongKey => {
             format!("The backup in {place} is locked with a different recovery key.")
         }
-        Failure::Retrying(problem) => format!("restic couldn't reach {place}: {problem}"),
+        Failure::Retrying(problem) => format!(
+            "Accordion couldn't reach {place}: {}. {}",
+            why_unreachable(problem),
+            if repository.keys.is_some() {
+                Reach::Internet
+            } else {
+                Reach::Network
+            }
+        ),
         Failure::Ssh(problem) => {
             let (user, host, _) = sftp_parts(&repository.location).unwrap_or(("", "", ""));
             match problem {
@@ -2340,10 +2375,12 @@ fn describe(failure: &Failure, repository: &Repository) -> String {
                      backups page is still in ~/.ssh/authorized_keys for {user} on {host}."
                 ),
                 SshProblem::HostKeyChanged => Error::HostKeyChanged(host.to_owned()).to_string(),
-                SshProblem::Unreachable(problem) => format!(
-                    "Accordion couldn't reach {host} ({problem}). Check that it's turned on \
-                     and connected to the network, then try again."
-                ),
+                SshProblem::Unreachable(problem) => Error::Unreachable {
+                    host: host.to_owned(),
+                    problem: why_unreachable(problem),
+                    reach: Reach::Network,
+                }
+                .to_string(),
                 SshProblem::Other(problem) => {
                     format!("Accordion couldn't connect to {host} over SFTP: {problem}")
                 }
@@ -2371,7 +2408,8 @@ fn setup_failure(failure: &Failure, repository: &Repository) -> Error {
         {
             return Error::Unreachable {
                 host: address.host,
-                problem: problem.clone(),
+                problem: why_unreachable(problem),
+                reach: Reach::Network,
             };
         }
         return Error::Restic(describe(failure, repository));
@@ -2388,7 +2426,8 @@ fn setup_failure(failure: &Failure, repository: &Repository) -> Error {
             SshProblem::HostKeyChanged => Error::HostKeyChanged(host),
             SshProblem::Unreachable(problem) => Error::Unreachable {
                 host,
-                problem: problem.clone(),
+                problem: why_unreachable(problem),
+                reach: Reach::Network,
             },
             SshProblem::Other(_) => Error::Restic(describe(failure, repository)),
         };
@@ -2419,9 +2458,49 @@ fn setup_failure(failure: &Failure, repository: &Repository) -> Error {
     } else {
         Error::Unreachable {
             host: host.to_owned(),
-            problem: problem.clone(),
+            problem: why_unreachable(problem),
+            reach: Reach::Internet,
         }
     }
+}
+
+/// Why a connection failed, in plain words. restic, ssh, and rustls each
+/// describe it their own way, often with the whole request in front, such
+/// as `Head "https://user:***@nas:8000/config": dial tcp …: i/o timeout`.
+fn why_unreachable(problem: &str) -> String {
+    let lower = problem.to_ascii_lowercase();
+    let has = |phrases: &[&str]| phrases.iter().any(|phrase| lower.contains(phrase));
+    let reason = if has(&["timeout", "timed out", "deadline exceeded", "didn't answer"]) {
+        "it didn't answer"
+    } else if has(&["connection refused"]) {
+        "nothing is listening on that port"
+    } else if has(&[
+        "no such host",
+        "could not resolve hostname",
+        "name or service not known",
+        "temporary failure in name resolution",
+    ]) {
+        "no computer on the network has that name"
+    } else if has(&["no route to host", "network is unreachable"]) {
+        "this server has no network route to it"
+    } else if has(&[
+        "connection reset",
+        "connection closed",
+        "broken pipe",
+        "eof",
+    ]) {
+        "it closed the connection"
+    } else {
+        // Drop the request, which repeats the address and can name the
+        // username, and keep the reason after it.
+        return problem
+            .rsplit_once("\": ")
+            .map_or(problem, |(_, reason)| reason)
+            .trim()
+            .trim_end_matches('.')
+            .to_owned();
+    };
+    reason.to_owned()
 }
 
 /// What a restic failure means while restoring.
@@ -2991,5 +3070,48 @@ mod tests {
             setup_failure(&off, &rest),
             Error::Unreachable { host, .. } if host == "nas.local"
         ));
+    }
+
+    #[test]
+    fn says_why_a_target_is_unreachable() {
+        // From the first try at a REST server on a Raspberry Pi.
+        let timeout = "Head \"https://accordion-test:***@192.168.1.57:8444/accordion/config\": \
+                       dial tcp 192.168.1.57:8444: i/o timeout";
+        assert_eq!(why_unreachable(timeout), "it didn't answer");
+        let error = Error::Unreachable {
+            host: "192.168.1.57".into(),
+            problem: why_unreachable(timeout),
+            reach: Reach::Network,
+        };
+        assert_eq!(
+            error.to_string(),
+            "Accordion couldn't reach 192.168.1.57: it didn't answer. Check the address, and \
+             that the other computer is turned on and connected to the network, then try again."
+        );
+        for (problem, reason) in [
+            (
+                "connect to host nas port 22: Connection refused",
+                "nothing is listening on that port",
+            ),
+            (
+                "ssh: Could not resolve hostname nas: Name or service not known",
+                "no computer on the network has that name",
+            ),
+            (
+                "Get \"https://nas.local:8000/config\": dial tcp: lookup nas.local: no such host",
+                "no computer on the network has that name",
+            ),
+            (
+                "connect to host 10.0.0.9 port 22: No route to host",
+                "this server has no network route to it",
+            ),
+            ("it didn't answer", "it didn't answer"),
+            (
+                "Head \"https://u:***@nas:8000/config\": something new went wrong.",
+                "something new went wrong",
+            ),
+        ] {
+            assert_eq!(why_unreachable(problem), reason, "{problem}");
+        }
     }
 }

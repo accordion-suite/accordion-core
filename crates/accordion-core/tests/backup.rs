@@ -794,6 +794,9 @@ async fn explains_mistakes_in_a_buckets_details() {
     .await
     .unwrap_err();
     assert!(matches!(err, Error::Unreachable { .. }), "{err}");
+    let message = err.to_string();
+    assert!(message.contains("nothing is listening"), "{message}");
+    assert!(message.contains("connected to the internet"), "{message}");
 
     // restic would try each of those again for minutes. Setup doesn't wait.
     assert!(started.elapsed().as_secs() < 30, "{:?}", started.elapsed());
@@ -1020,6 +1023,12 @@ async fn explains_mistakes_in_an_sftp_folder() {
     .await
     .unwrap_err();
     assert!(matches!(err, Error::Unreachable { .. }), "{err}");
+    let message = err.to_string();
+    assert!(message.contains("nothing is listening"), "{message}");
+    assert!(
+        message.contains("the other computer is turned on"),
+        "{message}"
+    );
     assert!(started.elapsed().as_secs() < 30, "{:?}", started.elapsed());
 
     for typed in [
@@ -1355,6 +1364,9 @@ async fn explains_mistakes_in_a_rest_servers_details() {
     .await
     .unwrap_err();
     assert!(matches!(err, Error::Unreachable { .. }), "{err}");
+    let message = err.to_string();
+    assert!(message.contains("nothing is listening"), "{message}");
+    assert!(!message.contains("dial tcp"), "{message}");
 
     for address in ["", "http://127.0.0.1:8000", "https://u:p@127.0.0.1:8000"] {
         let err = add(RestServer {

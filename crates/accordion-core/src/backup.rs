@@ -789,6 +789,27 @@ pub struct BackupStatus {
     /// A backup, check, or restore test is running.
     pub running: bool,
     pub targets: Vec<TargetStatus>,
+    /// How the last night's work went, since the server started. Updates
+    /// install right after it (decision 12 in the suite's docs).
+    pub last_nightly: Option<NightlyRun>,
+}
+
+/// One night's backup, weekly upkeep, and restore tests, once they're all
+/// done.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NightlyRun {
+    pub finished_at: SystemTime,
+    pub backup: NightlyBackup,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NightlyBackup {
+    /// Every location got a backup.
+    Worked,
+    /// At least one location didn't, or the backup couldn't start.
+    Failed,
+    /// Backups are off, or there's nowhere for them to go.
+    Off,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1092,10 +1113,26 @@ impl Backup {
     /// The night's work: a backup, then weekly upkeep and monthly restore
     /// tests where they're due. Problems are recorded, not returned.
     pub async fn nightly(&self) {
-        match self.back_up().await {
-            Ok(_) | Err(Error::NoRecoveryKey | Error::NoTargets) => {}
-            Err(err) => tracing::warn!(%err, "the nightly backup failed"),
-        }
+        let backup = match self.back_up().await {
+            Ok(runs) if runs.iter().all(|run| run.ok) => NightlyBackup::Worked,
+            Ok(_) => NightlyBackup::Failed,
+            Err(Error::NoRecoveryKey | Error::NoTargets) => NightlyBackup::Off,
+            Err(err) => {
+                tracing::warn!(%err, "the nightly backup failed");
+                NightlyBackup::Failed
+            }
+        };
+        self.upkeep().await;
+        self.inner.status.send_modify(|status| {
+            status.last_nightly = Some(NightlyRun {
+                finished_at: SystemTime::now(),
+                backup,
+            });
+        });
+    }
+
+    /// Weekly upkeep and monthly restore tests, where they're due.
+    async fn upkeep(&self) {
         let due = match self.due().await {
             Ok(due) => due,
             Err(err) => {

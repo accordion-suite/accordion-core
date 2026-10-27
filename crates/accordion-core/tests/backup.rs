@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use accordion_core::backup::{
-    self, Backup, CheckDepth, Error, KeyState, Place, RestServer, RunKind, S3Bucket, SftpFolder,
-    TargetKind,
+    self, Backup, CheckDepth, Error, KeyState, NightlyBackup, Place, RestServer, RunKind, S3Bucket,
+    SftpFolder, TargetKind,
 };
 use accordion_core::db::Database;
 use accordion_core::identity::{Identity, NewUser};
@@ -578,9 +578,59 @@ async fn runs_weekly_and_monthly_work_when_its_due() {
             .all(|run| run.ok)
     );
 
+    let night = server
+        .backup
+        .status()
+        .borrow()
+        .last_nightly
+        .clone()
+        .unwrap();
+    assert_eq!(night.backup, NightlyBackup::Worked);
+
     // The next night, only the backup and its check are due.
     server.backup.nightly().await;
     assert_eq!(server.backup.runs(10).await.unwrap().len(), 6);
+    let next = server
+        .backup
+        .status()
+        .borrow()
+        .last_nightly
+        .clone()
+        .unwrap();
+    assert!(next.finished_at > night.finished_at);
+
+    // A location that's gone makes the night's backup a failure.
+    let second = server.disk.path().join("second");
+    server
+        .backup
+        .add_target("Second disk", &folder(&second))
+        .await
+        .unwrap();
+    std::fs::rename(&second, server.disk.path().join("unplugged")).unwrap();
+    server.backup.nightly().await;
+    let failed = server
+        .backup
+        .status()
+        .borrow()
+        .last_nightly
+        .clone()
+        .unwrap();
+    assert_eq!(failed.backup, NightlyBackup::Failed);
+}
+
+#[tokio::test]
+async fn a_night_without_backups_still_finishes() {
+    let server = start().await;
+    assert_eq!(server.backup.status().borrow().last_nightly, None);
+    server.backup.nightly().await;
+    let night = server
+        .backup
+        .status()
+        .borrow()
+        .last_nightly
+        .clone()
+        .unwrap();
+    assert_eq!(night.backup, NightlyBackup::Off);
 }
 
 #[tokio::test(start_paused = true)]

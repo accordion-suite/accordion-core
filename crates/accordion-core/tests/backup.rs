@@ -633,6 +633,57 @@ async fn a_night_without_backups_still_finishes() {
     assert_eq!(night.backup, NightlyBackup::Off);
 }
 
+#[tokio::test]
+async fn skips_a_paused_target() {
+    let server = start().await;
+    server.backup.create_recovery_key().await.unwrap();
+    let usb = server
+        .backup
+        .add_target("USB disk", &folder(server.usb()))
+        .await
+        .unwrap();
+    let second = server
+        .backup
+        .add_target("Second disk", &folder(server.disk.path().join("second")))
+        .await
+        .unwrap();
+
+    server.backup.set_paused(usb.id, true).await.unwrap();
+    let paused = server.backup.status().borrow().targets[0].target.clone();
+    assert!(paused.paused);
+    let runs = server.backup.back_up().await.unwrap();
+    assert!(runs.iter().all(|run| run.target == second.id && run.ok));
+    let err = server.backup.test_restore(&paused).await.unwrap_err();
+    assert!(matches!(err, Error::Paused(ref name) if name == "USB disk"));
+    assert!(server.backup.start_test_restore(paused).is_err());
+
+    // With every target paused, there's nothing to back up, and the night
+    // counts as one without backups.
+    server.backup.set_paused(second.id, true).await.unwrap();
+    let err = server.backup.back_up().await.unwrap_err();
+    assert!(matches!(err, Error::AllPaused));
+    server.backup.nightly().await;
+    let night = server
+        .backup
+        .status()
+        .borrow()
+        .last_nightly
+        .clone()
+        .unwrap();
+    assert_eq!(night.backup, NightlyBackup::Off);
+
+    server.backup.set_paused(usb.id, false).await.unwrap();
+    let runs = server.backup.back_up().await.unwrap();
+    assert!(runs.iter().all(|run| run.target == usb.id && run.ok));
+    server.backup.remove_target(second.id).await.unwrap();
+    let err = server
+        .backup
+        .set_paused(second.id, false)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::NotFound));
+}
+
 #[tokio::test(start_paused = true)]
 async fn catches_up_on_a_missed_backup() {
     let server = start().await;

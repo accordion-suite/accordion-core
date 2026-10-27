@@ -284,6 +284,11 @@ static MIGRATIONS: &[Migration] = &[
         CREATE INDEX backup_runs_latest ON backup_runs (target_id, kind, finished_at);
     ",
     },
+    Migration {
+        version: 6,
+        name: "Let the admin pause a target",
+        sql: "ALTER TABLE backup_targets ADD COLUMN paused INTEGER NOT NULL DEFAULT 0;",
+    },
 ];
 
 /// Where ssh finds Accordion's SSH key and each SFTP server's host key. restic
@@ -507,6 +512,15 @@ pub enum Error {
     #[error("Accordion couldn't find that backup location.")]
     NotFound,
 
+    #[error(
+        "Backups are paused for every location. Turn one back on, on the Network page, \
+         then try again."
+    )]
+    AllPaused,
+
+    #[error("Backups to {0} are paused. Turn them back on, on the Network page, then try again.")]
+    Paused(String),
+
     #[error("Choose an hour from 0 to 23.")]
     BadHour,
 
@@ -601,6 +615,9 @@ pub struct Target {
     /// The target refuses deletes, so a compromised server can't delete the
     /// backups there, and Accordion never removes old ones.
     pub append_only: bool,
+    /// The admin turned off connections to it on the Network page, so
+    /// nothing backs up to it, checks it, or tests restoring from it.
+    pub paused: bool,
 }
 
 impl Target {
@@ -1097,7 +1114,8 @@ impl Backup {
                 conn.query_row(
                     concat!(
                         "SELECT EXISTS (SELECT 1 FROM backup_targets t
-                         WHERE NOT EXISTS (SELECT 1 FROM backup_runs r
+                         WHERE NOT t.paused
+                           AND NOT EXISTS (SELECT 1 FROM backup_runs r
                                            WHERE r.target_id = t.id AND r.kind = 'backup'
                                              AND r.finished_at > ",
                         sql_now!("-1 day"),
@@ -1116,7 +1134,7 @@ impl Backup {
         let backup = match self.back_up().await {
             Ok(runs) if runs.iter().all(|run| run.ok) => NightlyBackup::Worked,
             Ok(_) => NightlyBackup::Failed,
-            Err(Error::NoRecoveryKey | Error::NoTargets) => NightlyBackup::Off,
+            Err(Error::NoRecoveryKey | Error::NoTargets | Error::AllPaused) => NightlyBackup::Off,
             Err(err) => {
                 tracing::warn!(%err, "the nightly backup failed");
                 NightlyBackup::Failed
@@ -1168,14 +1186,15 @@ impl Backup {
                                         WHERE r.target_id = t.id AND r.kind = 'restore_test'
                                           AND r.finished_at > {month_ago})
                      FROM backup_targets t
-                     WHERE EXISTS (SELECT 1 FROM backup_runs r
+                     WHERE NOT t.paused
+                       AND EXISTS (SELECT 1 FROM backup_runs r
                                    WHERE r.target_id = t.id AND r.kind = 'backup' AND r.ok = 1)
                      ORDER BY t.created_at, t.id",
                     week_ago = sql_now!("-7 days"),
                     month_ago = sql_now!("-30 days"),
                 ))?
                 .query_map([], |row| {
-                    Ok((target_from_row(row)?, row.get(6)?, row.get(7)?))
+                    Ok((target_from_row(row)?, row.get(7)?, row.get(8)?))
                 })?
                 .collect::<Result<_, _>>()
             })
@@ -1647,6 +1666,26 @@ impl Backup {
             .await?)
     }
 
+    /// Pauses or resumes backups to a target. A paused target keeps its
+    /// backups and history, and nothing connects to it until it's resumed.
+    pub async fn set_paused(&self, id: BackupTargetId, paused: bool) -> Result<(), Error> {
+        let changed = self
+            .inner
+            .db
+            .write(move |tx| {
+                tx.execute(
+                    "UPDATE backup_targets SET paused = ?2 WHERE id = ?1",
+                    (id.as_uuid(), paused),
+                )
+            })
+            .await?;
+        if changed == 0 {
+            return Err(Error::NotFound);
+        }
+        self.refresh().await?;
+        Ok(())
+    }
+
     /// Stops backing up to a target, and forgets its history. The backups
     /// already there stay, so they can still be restored.
     pub async fn remove_target(&self, id: BackupTargetId) -> Result<(), Error> {
@@ -1688,9 +1727,13 @@ impl Backup {
         if self.recovery_key().await?.is_none() {
             return Err(Error::NoRecoveryKey);
         }
-        let targets = self.targets().await?;
+        let mut targets = self.targets().await?;
         if targets.is_empty() {
             return Err(Error::NoTargets);
+        }
+        targets.retain(|target| !target.paused);
+        if targets.is_empty() {
+            return Err(Error::AllPaused);
         }
 
         // Held before the copy, so every stored file the copy refers to stays
@@ -1868,6 +1911,7 @@ impl Backup {
 
     /// Checks a repository, and reads back part of its data if `depth` asks.
     pub async fn check(&self, target: &Target, depth: CheckDepth) -> Result<Run, Error> {
+        refuse_paused(target)?;
         let _busy = self.busy().await;
         let run = self.check_target(target, depth).await;
         self.record(run).await
@@ -1894,6 +1938,7 @@ impl Backup {
     /// a target into a temporary folder, and checks them: the database with
     /// SQLite's integrity check, and each file against its SHA-256 hash.
     pub async fn test_restore(&self, target: &Target) -> Result<Run, Error> {
+        refuse_paused(target)?;
         let busy = self.busy().await;
         self.test_restore_holding(target, busy).await
     }
@@ -1901,6 +1946,7 @@ impl Backup {
     /// Starts [`Backup::test_restore`] in the background, like
     /// [`Backup::start_back_up`].
     pub fn start_test_restore(&self, target: Target) -> Result<(), Error> {
+        refuse_paused(&target)?;
         let busy = self.try_busy()?;
         let backup = self.clone();
         tokio::spawn(async move {
@@ -2890,7 +2936,8 @@ fn now() -> String {
     time::format(now)
 }
 
-const TARGET_COLUMNS: &str = "t.id, t.name, t.kind, t.location, t.created_at, t.append_only";
+const TARGET_COLUMNS: &str =
+    "t.id, t.name, t.kind, t.location, t.created_at, t.append_only, t.paused";
 
 fn target(conn: &Connection, id: BackupTargetId) -> rusqlite::Result<Option<Target>> {
     conn.query_row(
@@ -2901,7 +2948,15 @@ fn target(conn: &Connection, id: BackupTargetId) -> rusqlite::Result<Option<Targ
     .optional()
 }
 
-/// A target from the first six columns of `row`, as in [`TARGET_COLUMNS`].
+/// Turns away work on a target the admin paused.
+fn refuse_paused(target: &Target) -> Result<(), Error> {
+    if target.paused {
+        return Err(Error::Paused(target.name.clone()));
+    }
+    Ok(())
+}
+
+/// A target from the first seven columns of `row`, as in [`TARGET_COLUMNS`].
 fn target_from_row(row: &Row<'_>) -> rusqlite::Result<Target> {
     let kind: String = row.get(2)?;
     Ok(Target {
@@ -2916,6 +2971,7 @@ fn target_from_row(row: &Row<'_>) -> rusqlite::Result<Target> {
         location: row.get(3)?,
         created_at: row.get(4)?,
         append_only: row.get(5)?,
+        paused: row.get(6)?,
     })
 }
 

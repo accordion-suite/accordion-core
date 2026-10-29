@@ -152,8 +152,14 @@ pub enum Error {
     )]
     InvalidName,
 
-    #[error("Something with that name is already in this folder. Choose a different name.")]
-    NameTaken,
+    #[error(
+        "This folder already has a {} with that name. Choose a different name.",
+        if *.folder { "folder" } else { "file" }
+    )]
+    NameTaken {
+        /// Whether a folder has the name, rather than a file.
+        folder: bool,
+    },
 
     #[error("That file or folder doesn't exist. It may have been deleted.")]
     NotFound,
@@ -247,6 +253,15 @@ pub struct Item {
     /// When it was deleted, if it's in the trash itself. Items inside a
     /// deleted folder don't have this set.
     pub trashed_at: Option<String>,
+}
+
+impl Item {
+    /// The error for another item wanting this one's name.
+    fn name_taken(&self) -> Error {
+        Error::NameTaken {
+            folder: self.kind == ItemKind::Folder,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -489,8 +504,8 @@ impl Storage {
             .db
             .write(move |tx| {
                 let parent = writable_folder(tx, parent)?;
-                if child_named(tx, parent.id, &name)?.is_some() {
-                    return Err(Error::NameTaken);
+                if let Some(other) = child_named(tx, parent.id, &name)? {
+                    return Err(other.name_taken());
                 }
                 insert_item(tx, id, parent.owner, parent.id, &name, "folder")?;
                 item(tx, id)?.ok_or(Error::NotFound)
@@ -746,8 +761,10 @@ impl Storage {
                 if is_inside(tx, parent.id, id)? {
                     return Err(Error::MoveIntoItself);
                 }
-                if child_named(tx, parent.id, &new_name)?.is_some_and(|other| other.id != id) {
-                    return Err(Error::NameTaken);
+                if let Some(other) = child_named(tx, parent.id, &new_name)?
+                    && other.id != id
+                {
+                    return Err(other.name_taken());
                 }
                 tx.execute(
                     concat!(
@@ -806,8 +823,8 @@ impl Storage {
                     return Err(Error::NotInTrash);
                 }
                 let parent = item.parent.ok_or(Error::NotInTrash)?;
-                if child_named(tx, parent, &item.name)?.is_some() {
-                    return Err(Error::NameTaken);
+                if let Some(other) = child_named(tx, parent, &item.name)? {
+                    return Err(other.name_taken());
                 }
                 tx.execute(
                     "UPDATE storage_items SET trashed_at = NULL WHERE id = ?1",
@@ -1385,7 +1402,7 @@ fn check_save(
 ) -> Result<(Item, Option<ItemId>), Error> {
     let parent = writable_folder(conn, parent)?;
     let existing = match child_named(conn, parent.id, name)? {
-        Some(existing) if existing.kind == ItemKind::Folder => return Err(Error::NameTaken),
+        Some(existing) if existing.kind == ItemKind::Folder => return Err(existing.name_taken()),
         existing => existing.map(|existing| existing.id),
     };
     if let Some(upload) = upload {

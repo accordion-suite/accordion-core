@@ -256,7 +256,21 @@ async fn renames_and_moves() {
         .move_item(photos.id, top, "Archive")
         .await
         .unwrap_err();
-    assert!(matches!(err, Error::NameTaken));
+    assert!(matches!(err, Error::NameTaken { folder: true }));
+    assert_eq!(
+        err.to_string(),
+        "This folder already has a folder with that name. Choose a different name."
+    );
+    let err = server
+        .storage
+        .create_folder(summer, "beach.jpg")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::NameTaken { folder: false }));
+    assert_eq!(
+        err.to_string(),
+        "This folder already has a file with that name. Choose a different name."
+    );
     let err = server
         .storage
         .move_item(top, top, "Mine")
@@ -303,7 +317,7 @@ async fn deletes_to_the_trash_and_restores() {
     // restore until one of them is renamed.
     let replacement = server.storage.create_folder(top, "Taxes").await.unwrap();
     let err = server.storage.restore(folder.id).await.unwrap_err();
-    assert!(matches!(err, Error::NameTaken));
+    assert!(matches!(err, Error::NameTaken { folder: true }));
     server.storage.delete(replacement.id).await.unwrap();
 
     server.storage.restore(folder.id).await.unwrap();

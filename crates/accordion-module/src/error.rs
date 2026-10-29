@@ -104,7 +104,7 @@ impl From<storage::Error> for ApiError {
         let status = match err {
             InvalidName | GiveToSelf => StatusCode::BAD_REQUEST,
             NotFound | UserNotFound | UploadNotFound => StatusCode::NOT_FOUND,
-            NameTaken
+            NameTaken { .. }
             | NotAFolder
             | NotAFile
             | TopFolder

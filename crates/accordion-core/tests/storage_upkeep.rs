@@ -226,7 +226,7 @@ async fn resumes_uploads_after_a_dropped_connection_or_a_restart() {
         .finish_upload(upload.id, top, "taken")
         .await
         .unwrap_err();
-    assert!(matches!(err, Error::NameTaken));
+    assert!(matches!(err, Error::NameTaken { folder: true }));
     let item = storage
         .finish_upload(upload.id, top, "greeting.txt")
         .await

@@ -284,6 +284,41 @@ pub struct Version {
     pub created_at: String,
 }
 
+/// What [`Storage::search`] looks for. Every part that's set has to match.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Search {
+    /// Part of the name, ignoring case, such as "tax" for "Taxes 2025.pdf".
+    /// Empty matches every name.
+    pub text: String,
+    pub only: Option<Only>,
+    /// Changed at or after this time, in the database's timestamp format
+    /// (see [`sql_now`]).
+    pub modified_since: Option<String>,
+    /// Changed before this time.
+    pub modified_before: Option<String>,
+    /// The most results to return, newest first.
+    pub limit: usize,
+}
+
+/// Which kinds of item a [`Search`] finds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Only {
+    Folders,
+    Files,
+    /// Files whose names end in one of these extensions, lowercase and
+    /// without the dot, such as "jpg".
+    Extensions(Vec<String>),
+}
+
+/// An item that a search or list found, with where it is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Found {
+    pub item: Item,
+    /// The names of the folders it's in, outermost first, not counting the
+    /// top folder. Empty for an item in the top folder.
+    pub folders: Vec<String>,
+}
+
 /// How much space a user's files take, and their limit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Usage {
@@ -491,6 +526,100 @@ impl Storage {
                     .query_map([owner.as_uuid()], item_from_row)?
                     .collect::<Result<_, _>>()?;
                 Ok(items)
+            })
+            .await
+    }
+
+    /// `owner`'s files outside the trash, most recently changed first.
+    pub async fn recent(&self, owner: UserId, limit: usize) -> Result<Vec<Found>, Error> {
+        self.inner
+            .db
+            .read(move |conn| {
+                let mut statement = conn.prepare(&format!(
+                    "{FOUND_SELECT} WHERE i.kind = 'file' ORDER BY i.modified_at DESC, i.name LIMIT ?2"
+                ))?;
+                let found = statement
+                    .query_map((owner.as_uuid(), limit as i64), found_from_row)?
+                    .collect::<Result<_, _>>()?;
+                Ok(found)
+            })
+            .await
+    }
+
+    /// `owner`'s items outside the trash that match `search`, most recently
+    /// changed first. Names are matched in Rust, because SQLite only ignores
+    /// case for ASCII, and names are in every language.
+    pub async fn search(&self, owner: UserId, search: Search) -> Result<Vec<Found>, Error> {
+        self.inner
+            .db
+            .read(move |conn| {
+                let text = search.text.to_lowercase();
+                let kind = match search.only {
+                    Some(Only::Folders) => "AND i.kind = 'folder'",
+                    Some(_) => "AND i.kind = 'file'",
+                    None => "",
+                };
+                let mut statement = conn.prepare(&format!(
+                    "{FOUND_SELECT}
+                     WHERE i.parent_id IS NOT NULL {kind}
+                       AND (?2 IS NULL OR i.modified_at >= ?2)
+                       AND (?3 IS NULL OR i.modified_at < ?3)
+                     ORDER BY i.modified_at DESC, i.name"
+                ))?;
+                let rows = statement.query_map(
+                    (
+                        owner.as_uuid(),
+                        &search.modified_since,
+                        &search.modified_before,
+                    ),
+                    found_from_row,
+                )?;
+                let mut found = Vec::new();
+                for row in rows {
+                    let row = row?;
+                    let name = row.item.name.to_lowercase();
+                    let extension_matches = match &search.only {
+                        Some(Only::Extensions(extensions)) => {
+                            name.rsplit_once('.').is_some_and(|(stem, ext)| {
+                                !stem.is_empty() && extensions.iter().any(|e| e == ext)
+                            })
+                        }
+                        _ => true,
+                    };
+                    if name.contains(&text) && extension_matches {
+                        found.push(row);
+                        if found.len() == search.limit {
+                            break;
+                        }
+                    }
+                }
+                Ok(found)
+            })
+            .await
+    }
+
+    /// The items among `ids` that exist and are outside the trash, in the
+    /// same order, with where each one is. An item inside a deleted folder
+    /// is in the trash too.
+    pub async fn live_items(&self, ids: Vec<ItemId>) -> Result<Vec<Found>, Error> {
+        self.inner
+            .db
+            .read(move |conn| {
+                let mut found = Vec::new();
+                for id in ids {
+                    let Some(item) = item(conn, id)? else {
+                        continue;
+                    };
+                    let mut location = location(conn, id)?;
+                    if location.visible {
+                        location.names.pop();
+                        found.push(Found {
+                            item,
+                            folders: location.names,
+                        });
+                    }
+                }
+                Ok(found)
             })
             .await
     }
@@ -727,6 +856,42 @@ impl Storage {
                 check_space(tx, item.owner, blob.size, None)?;
                 add_version(tx, id, blob)?;
                 item_or_missing(tx, id)
+            })
+            .await?;
+        self.update_view(Change::Show(item.id)).await;
+        Ok(item)
+    }
+
+    /// Copies a file's current version into `parent` as a new file named
+    /// `name`. The copy shares the stored contents, but counts toward the
+    /// owner's quota like any other file. Folders can't be copied, as in
+    /// Google Drive.
+    pub async fn copy_file(&self, id: ItemId, parent: ItemId, name: &str) -> Result<Item, Error> {
+        let name = check_name(name)?;
+        let _changes = self.inner.changes.lock().await;
+        let new_id = ItemId::generate();
+        let item = self
+            .inner
+            .db
+            .write(move |tx| {
+                let original = item(tx, id)?.ok_or(Error::NotFound)?;
+                let ItemKind::File { blob, .. } = original.kind else {
+                    return Err(Error::NotAFile);
+                };
+                if !location(tx, id)?.visible {
+                    return Err(Error::InTrash);
+                }
+                let parent = writable_folder(tx, parent)?;
+                if parent.owner != original.owner {
+                    return Err(Error::DifferentOwner);
+                }
+                if let Some(other) = child_named(tx, parent.id, &name)? {
+                    return Err(other.name_taken());
+                }
+                check_space(tx, parent.owner, blob.size, None)?;
+                insert_item(tx, new_id, parent.owner, parent.id, &name, "file")?;
+                add_version(tx, new_id, blob)?;
+                item_or_missing(tx, new_id)
             })
             .await?;
         self.update_view(Change::Show(item.id)).await;
@@ -1253,14 +1418,59 @@ fn free_name(conn: &Connection, parent: ItemId, wanted: &str) -> Result<String, 
     unreachable!("some number is free")
 }
 
-/// Selects an item's columns and its current version, for [`item_from_row`].
-const ITEM_SELECT: &str = "
+/// Selects items as `i`, from `$from`, with their current versions, for
+/// [`item_from_row`]. `$extra` adds columns after the item's.
+macro_rules! item_select {
+    ($with:literal, $extra:literal, $from:literal) => {
+        concat!(
+            $with,
+            "
     SELECT i.id, i.owner_id, i.parent_id, i.name, i.kind, i.created_at, i.modified_at,
-           i.trashed_at, v.id, v.blob, b.size
-    FROM storage_items i
+           i.trashed_at, v.id, v.blob, b.size",
+            $extra,
+            "
+    FROM ",
+            $from,
+            "
     LEFT JOIN storage_versions v ON v.item_id = i.id
         AND v.number = (SELECT max(number) FROM storage_versions WHERE item_id = i.id)
-    LEFT JOIN storage_blobs b ON b.hash = v.blob";
+    LEFT JOIN storage_blobs b ON b.hash = v.blob"
+        )
+    };
+}
+
+const ITEM_SELECT: &str = item_select!("", "", "storage_items i");
+
+/// Selects the user `?1`'s items outside the trash, for [`found_from_row`].
+/// `live` walks down from their top folder, skipping deleted items, so it
+/// leaves out what's inside a deleted folder too. It carries each item's
+/// path, its folder names joined by "/", which names can't contain, and the
+/// path of the folder it's in: null for the top folder, and empty for
+/// what's in it.
+const FOUND_SELECT: &str = item_select!(
+    "
+    WITH RECURSIVE live (id, path, inside) AS (
+        SELECT id, '', NULL FROM storage_items WHERE owner_id = ?1 AND parent_id IS NULL
+        UNION ALL
+        SELECT i.id, CASE live.path WHEN '' THEN i.name ELSE live.path || '/' || i.name END,
+               live.path
+        FROM storage_items i JOIN live ON i.parent_id = live.id
+        WHERE i.trashed_at IS NULL
+    )",
+    ", l.inside",
+    "live l JOIN storage_items i ON i.id = l.id"
+);
+
+fn found_from_row(row: &Row<'_>) -> rusqlite::Result<Found> {
+    let inside: Option<String> = row.get(11)?;
+    Ok(Found {
+        item: item_from_row(row)?,
+        folders: match inside.as_deref() {
+            None | Some("") => Vec::new(),
+            Some(path) => path.split('/').map(str::to_owned).collect(),
+        },
+    })
+}
 
 fn item_from_row(row: &Row<'_>) -> rusqlite::Result<Item> {
     let kind: String = row.get(4)?;

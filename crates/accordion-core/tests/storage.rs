@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use accordion_core::db::Database;
 use accordion_core::identity::{Identity, NewUser};
-use accordion_core::storage::{Error, ItemKind, LeaveFiles, Storage};
+use accordion_core::storage::{Error, Found, ItemKind, LeaveFiles, Only, Search, Storage};
 use accordion_types::{Role, UserId};
 use tokio::io::AsyncReadExt;
 
@@ -590,4 +590,255 @@ async fn follows_a_new_username_after_a_rebuild() {
         b"keep"
     );
     assert!(!server.view().join("alex").exists());
+}
+
+/// Timestamps count milliseconds, so this keeps two changes in order.
+async fn tick() {
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+}
+
+fn names(found: &[Found]) -> Vec<String> {
+    found
+        .iter()
+        .map(|found| {
+            [&found.folders[..], std::slice::from_ref(&found.item.name)]
+                .concat()
+                .join("/")
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn lists_recent_files_outside_the_trash() {
+    let server = start().await;
+    let alex = server.user("alex").await;
+    let sam = server.user("sam").await;
+    let top = server.storage.top_folder(alex).await.unwrap();
+    let trip = server.storage.create_folder(top, "Trip").await.unwrap();
+    let old = server.storage.create_folder(top, "Old").await.unwrap();
+    for (folder, name) in [(top, "a.txt"), (trip.id, "b.jpg"), (old.id, "c.txt")] {
+        server
+            .storage
+            .write_file(folder, name, &b"x"[..])
+            .await
+            .unwrap();
+        tick().await;
+    }
+    server
+        .storage
+        .write_file(top, "a.txt", &b"newer"[..])
+        .await
+        .unwrap();
+    server.storage.delete(old.id).await.unwrap();
+    let sams = server.storage.top_folder(sam).await.unwrap();
+    server
+        .storage
+        .write_file(sams, "sam.txt", &b"x"[..])
+        .await
+        .unwrap();
+
+    let recent = server.storage.recent(alex, 10).await.unwrap();
+    assert_eq!(names(&recent), ["a.txt", "Trip/b.jpg"]);
+    assert_eq!(
+        names(&server.storage.recent(alex, 1).await.unwrap()),
+        ["a.txt"]
+    );
+}
+
+#[tokio::test]
+async fn searches_names_kinds_and_dates() {
+    let server = start().await;
+    let alex = server.user("alex").await;
+    let top = server.storage.top_folder(alex).await.unwrap();
+    let taxes = server.storage.create_folder(top, "Taxes").await.unwrap();
+    let trashed = server
+        .storage
+        .create_folder(top, "Old taxes")
+        .await
+        .unwrap();
+    tick().await;
+    for (folder, name) in [
+        (taxes.id, "Return 2025.PDF"),
+        (taxes.id, "Receipt.jpg"),
+        (top, "Ölgemälde.png"),
+        (top, ".tax"),
+        (trashed.id, "Return 2019.pdf"),
+    ] {
+        server
+            .storage
+            .write_file(folder, name, &b"x"[..])
+            .await
+            .unwrap();
+        tick().await;
+    }
+    server.storage.delete(trashed.id).await.unwrap();
+    let search = |search: Search| {
+        server.storage.search(
+            alex,
+            Search {
+                limit: 10,
+                ..search
+            },
+        )
+    };
+
+    let found = search(Search {
+        text: "TAX".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    assert_eq!(names(&found), [".tax", "Taxes"]);
+    // Case is ignored beyond ASCII.
+    let found = search(Search {
+        text: "ölge".into(),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    assert_eq!(names(&found), ["Ölgemälde.png"]);
+    let found = search(Search {
+        only: Some(Only::Folders),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    assert_eq!(names(&found), ["Taxes"]);
+    // A name that starts with its only dot has no extension.
+    let only = Only::Extensions(vec!["pdf".into(), "tax".into()]);
+    let found = search(Search {
+        only: Some(only),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    assert_eq!(names(&found), ["Taxes/Return 2025.PDF"]);
+
+    let all = search(Search::default()).await.unwrap();
+    assert_eq!(all.len(), 5);
+    let since = all[1].item.modified_at.clone();
+    let found = search(Search {
+        modified_since: Some(since.clone()),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    assert_eq!(names(&found), [".tax", "Ölgemälde.png"]);
+    let found = search(Search {
+        modified_before: Some(since),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        names(&found),
+        ["Taxes/Receipt.jpg", "Taxes/Return 2025.PDF", "Taxes"]
+    );
+    let found = server
+        .storage
+        .search(
+            alex,
+            Search {
+                limit: 2,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(found.len(), 2);
+}
+
+#[tokio::test]
+async fn copies_a_file() {
+    let server = start().await;
+    let alex = server.user("alex").await;
+    let sam = server.user("sam").await;
+    let top = server.storage.top_folder(alex).await.unwrap();
+    let photos = server.storage.create_folder(top, "Photos").await.unwrap();
+    let beach = server
+        .storage
+        .write_file(top, "Beach.jpg", &b"sand"[..])
+        .await
+        .unwrap();
+
+    let copy = server
+        .storage
+        .copy_file(beach.id, photos.id, "Copy of Beach.jpg")
+        .await
+        .unwrap();
+    assert_ne!(copy.id, beach.id);
+    assert_eq!(read(&server.storage, copy.id).await, "sand");
+    assert_eq!(server.storage.versions(copy.id).await.unwrap().len(), 1);
+    assert_eq!(blob_count(server.dir.path()), 1);
+    assert_eq!(server.storage.usage(alex).await.unwrap().used, 8);
+    assert_eq!(
+        std::fs::read(server.view().join("alex/Photos/Copy of Beach.jpg")).unwrap(),
+        b"sand"
+    );
+
+    let taken = server
+        .storage
+        .copy_file(beach.id, top, "Beach.jpg")
+        .await
+        .unwrap_err();
+    assert!(matches!(taken, Error::NameTaken { folder: false }));
+    let folder = server
+        .storage
+        .copy_file(photos.id, top, "Photos 2")
+        .await
+        .unwrap_err();
+    assert!(matches!(folder, Error::NotAFile));
+    let sams = server.storage.top_folder(sam).await.unwrap();
+    let theirs = server
+        .storage
+        .copy_file(beach.id, sams, "Beach.jpg")
+        .await
+        .unwrap_err();
+    assert!(matches!(theirs, Error::DifferentOwner));
+    server.storage.set_quota(alex, Some(10)).await.unwrap();
+    let full = server
+        .storage
+        .copy_file(beach.id, top, "Again.jpg")
+        .await
+        .unwrap_err();
+    assert!(matches!(full, Error::QuotaFull));
+}
+
+#[tokio::test]
+async fn finds_live_items_by_id() {
+    let server = start().await;
+    let alex = server.user("alex").await;
+    let top = server.storage.top_folder(alex).await.unwrap();
+    let trip = server.storage.create_folder(top, "Trip").await.unwrap();
+    let day = server
+        .storage
+        .create_folder(trip.id, "Day 1")
+        .await
+        .unwrap();
+    let photo = server
+        .storage
+        .write_file(day.id, "a.jpg", &b"x"[..])
+        .await
+        .unwrap();
+    let old = server.storage.create_folder(top, "Old").await.unwrap();
+    let inside = server
+        .storage
+        .write_file(old.id, "b.jpg", &b"x"[..])
+        .await
+        .unwrap();
+    let gone = server
+        .storage
+        .write_file(top, "c.jpg", &b"x"[..])
+        .await
+        .unwrap();
+    server.storage.delete(old.id).await.unwrap();
+    server.storage.delete(gone.id).await.unwrap();
+    server.storage.delete_forever(gone.id).await.unwrap();
+
+    let found = server
+        .storage
+        .live_items(vec![photo.id, inside.id, gone.id, trip.id])
+        .await
+        .unwrap();
+    assert_eq!(names(&found), ["Trip/Day 1/a.jpg", "Trip"]);
 }

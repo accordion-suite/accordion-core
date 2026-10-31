@@ -1,4 +1,6 @@
 //! API errors, returned as JSON: `{"error": "<message for the user>"}`.
+//! Some also carry a `code` that apps check instead of the message, which
+//! can change and will be translated: `{"error": "...", "code": "..."}`.
 
 use std::time::Duration;
 
@@ -12,8 +14,12 @@ use axum::response::{IntoResponse, Response};
 pub struct ApiError {
     status: StatusCode,
     message: String,
+    code: Option<&'static str>,
     retry_after: Option<Duration>,
 }
+
+/// The code for [`ApiError::password_needed`].
+pub const PASSWORD_NEEDED: &str = "password_needed";
 
 impl ApiError {
     /// An error with a message for the user. Say what happened and what to
@@ -22,7 +28,20 @@ impl ApiError {
         Self {
             status,
             message: message.into(),
+            code: None,
             retry_after: None,
+        }
+    }
+
+    /// A sensitive action needs a sign-in from the last 15 minutes. Apps ask
+    /// for the password, confirm it with `POST /api/session/confirm`, and
+    /// try again. The message says what the password is for, such as
+    /// "For your security, enter your password again before you see the
+    /// recovery key."
+    pub fn password_needed(message: impl Into<String>) -> Self {
+        Self {
+            code: Some(PASSWORD_NEEDED),
+            ..Self::new(StatusCode::FORBIDDEN, message)
         }
     }
 
@@ -32,6 +51,10 @@ impl ApiError {
 
     pub fn message(&self) -> &str {
         &self.message
+    }
+
+    pub fn code(&self) -> Option<&'static str> {
+        self.code
     }
 
     pub fn server_problem() -> Self {
@@ -59,7 +82,10 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let body = Json(serde_json::json!({ "error": self.message }));
+        let body = match self.code {
+            Some(code) => Json(serde_json::json!({ "error": self.message, "code": code })),
+            None => Json(serde_json::json!({ "error": self.message })),
+        };
         match self.retry_after {
             Some(wait) => {
                 // Round up, so a client that waits exactly this long gets in.
@@ -123,5 +149,31 @@ impl From<storage::Error> for ApiError {
             }
         };
         Self::new(status, err.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn body(error: ApiError) -> (StatusCode, serde_json::Value) {
+        let response = error.into_response();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn sends_a_code_only_with_errors_that_have_one() {
+        let (status, json) = body(ApiError::not_found()).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(json.get("code"), None);
+
+        let (status, json) = body(ApiError::password_needed("Enter it again.")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(json["error"], "Enter it again.");
+        assert_eq!(json["code"], PASSWORD_NEEDED);
     }
 }

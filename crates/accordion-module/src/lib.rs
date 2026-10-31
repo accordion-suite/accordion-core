@@ -10,7 +10,7 @@ pub mod auth;
 mod error;
 
 pub use auth::{Authenticated, DavUser};
-pub use error::ApiError;
+pub use error::{ApiError, PASSWORD_NEEDED};
 
 use std::error::Error as StdError;
 use std::pin::Pin;

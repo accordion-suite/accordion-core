@@ -513,12 +513,12 @@ pub enum Error {
     NotFound,
 
     #[error(
-        "Backups are paused for every location. Turn one back on, on the Network page, \
-         then try again."
+        "Backups are paused for every location. Turn one back on in Network settings, then \
+         try again."
     )]
     AllPaused,
 
-    #[error("Backups to {0} are paused. Turn them back on, on the Network page, then try again.")]
+    #[error("Backups to {0} are paused. Turn them back on in Network settings, then try again.")]
     Paused(String),
 
     #[error("Choose an hour from 0 to 23.")]

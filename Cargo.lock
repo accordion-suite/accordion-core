@@ -6,6 +6,7 @@ version = 4
 name = "accordion-core"
 version = "0.1.0"
 dependencies = [
+ "accordion-sandbox",
  "accordion-types",
  "argon2",
  "base64ct",

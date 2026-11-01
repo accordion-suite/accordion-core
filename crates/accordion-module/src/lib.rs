@@ -18,6 +18,7 @@ use std::pin::Pin;
 use accordion_core::db::Database;
 use accordion_core::identity::Identity;
 use accordion_core::storage::Storage;
+use accordion_core::thumbnails::Thumbnails;
 use axum::Router;
 use tokio::sync::watch;
 
@@ -63,6 +64,8 @@ pub struct Services {
     pub db: Database,
     pub identity: Identity,
     pub storage: Storage,
+    /// Thumbnails of stored files, by their contents' hash.
+    pub thumbnails: Thumbnails,
 }
 
 /// What a module gives the server when it starts.

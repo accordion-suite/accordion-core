@@ -363,6 +363,8 @@ struct Inner {
     changes: tokio::sync::Mutex<()>,
     uploads: uploads::InProgress,
     status: watch::Sender<StorageStatus>,
+    /// Counts files saved, so services such as thumbnails know to look.
+    saved: watch::Sender<u64>,
     /// How many [`ContentsHold`]s there are.
     holds: AtomicUsize,
 }
@@ -399,6 +401,7 @@ impl Storage {
                 changes: tokio::sync::Mutex::new(()),
                 uploads: uploads::InProgress::default(),
                 status: watch::Sender::new(StorageStatus::default()),
+                saved: watch::Sender::new(0),
                 holds: AtomicUsize::new(0),
             }),
         })
@@ -712,7 +715,13 @@ impl Storage {
         } else {
             self.update_view(Change::Show(item.id)).await;
         }
+        self.inner.saved.send_modify(|count| *count += 1);
         Ok(item)
+    }
+
+    /// Changes each time a file is saved, including new versions.
+    pub fn saved(&self) -> watch::Receiver<u64> {
+        self.inner.saved.subscribe()
     }
 
     /// Stores received contents under their hash. Call it holding the
@@ -1232,6 +1241,12 @@ impl Storage {
                 Ok(())
             })
             .await
+    }
+
+    /// The full path of stored contents, for a worker that has to be given
+    /// a path rather than an open file. Nothing may write to it.
+    pub fn contents_file(&self, hash: ContentHash) -> PathBuf {
+        self.inner.blobs.path(hash)
     }
 
     /// Opens stored contents by their hash, such as what [`Storage::store`]

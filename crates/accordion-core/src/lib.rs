@@ -1,5 +1,5 @@
-//! Core services that hold state: identity, search, jobs, storage, and
-//! backups.
+//! Core services that hold state: identity, search, jobs, storage,
+//! thumbnails, and backups.
 //!
 //! Modules use core only through this crate's public API. They never read
 //! core's database tables directly, so any module can move into its own
@@ -10,4 +10,5 @@ pub mod db;
 pub mod identity;
 mod random;
 pub mod storage;
+pub mod thumbnails;
 mod time;

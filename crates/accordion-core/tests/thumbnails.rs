@@ -1,6 +1,6 @@
 //! Makes thumbnails with the real programs in the sandbox. The tests need
 //! libvips (libvips-tools, with libheif's AV1 encoder for test images),
-//! poppler-utils, and a kernel with Landlock, as CI has.
+//! poppler-utils, ffmpeg, and a kernel with Landlock, as CI has.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -14,6 +14,7 @@ use accordion_types::{ItemId, Role};
 
 struct Server {
     dir: tempfile::TempDir,
+    db: Database,
     storage: Storage,
     thumbnails: Thumbnails,
     top: ItemId,
@@ -39,11 +40,12 @@ async fn start_with(tools: impl FnOnce(Tools) -> Tools) -> Server {
     let tools = tools(Tools::installed(env!(
         "CARGO_BIN_EXE_accordion-core-sandbox"
     )));
-    let thumbnails = Thumbnails::open(db, storage.clone(), dir.path(), tools)
+    let thumbnails = Thumbnails::open(db.clone(), storage.clone(), dir.path(), tools)
         .await
         .unwrap();
     Server {
         dir,
+        db,
         storage,
         thumbnails,
         top,
@@ -80,6 +82,35 @@ impl Server {
         assert!(made.success(), "libvips couldn't make {name}");
         std::fs::read(path).unwrap()
     }
+
+    /// Makes a two-second video with ffmpeg, outside the sandbox, from its
+    /// moving test pattern, with `options` for the encoder and format.
+    fn video(&self, name: &str, options: &[&str]) -> Vec<u8> {
+        let path = self.dir.path().join(name);
+        let made = Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi"])
+            .args(["-i", "testsrc2=size=640x360:rate=30:duration=2"])
+            .args(options)
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(made.success(), "ffmpeg couldn't make {name}");
+        std::fs::read(path).unwrap()
+    }
+}
+
+/// Starts the background worker, and returns how to stop it.
+fn start_worker(
+    thumbnails: &Thumbnails,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let worker = tokio::spawn(thumbnails.clone().run(async {
+        let _ = stopped.await;
+    }));
+    (stop, worker)
 }
 
 /// The width and height of an image, and its metadata fields, from libvips.
@@ -341,6 +372,228 @@ async fn makes_thumbnails_again_when_the_cache_loses_them() {
     })
     .await
     .expect("the worker should make the thumbnail again");
+    stop.send(()).unwrap();
+    worker.await.unwrap();
+}
+
+#[tokio::test]
+async fn shows_a_frame_from_each_kind_of_video() {
+    let server = start().await;
+    let audio = ["-f", "lavfi", "-i", "sine=duration=2"];
+    for (name, options) in [
+        (
+            "iphone.mov",
+            vec![
+                "-c:v",
+                "libx265",
+                "-preset",
+                "ultrafast",
+                "-x265-params",
+                "log-level=error",
+                "-tag:v",
+                "hvc1",
+            ],
+        ),
+        (
+            "android.mp4",
+            vec!["-c:v", "libx264", "-preset", "ultrafast"],
+        ),
+        (
+            "download.webm",
+            [
+                &audio[..],
+                &[
+                    "-c:v",
+                    "libvpx-vp9",
+                    "-deadline",
+                    "realtime",
+                    "-c:a",
+                    "libopus",
+                ],
+            ]
+            .concat(),
+        ),
+        ("old.avi", vec!["-c:v", "mpeg4"]),
+        (
+            // A camcorder's, with 192-byte packets and AC-3 sound.
+            "camcorder.mts",
+            [
+                &audio[..],
+                &[
+                    "-c:v",
+                    "libx264",
+                    "-c:a",
+                    "ac3",
+                    "-f",
+                    "mpegts",
+                    "-mpegts_m2ts_mode",
+                    "1",
+                ],
+            ]
+            .concat(),
+        ),
+    ] {
+        let hash = server.save(name, &server.video(name, &options)).await;
+        assert!(server.thumbnails.make_now(hash).await.unwrap(), "{name}");
+        let (width, height, _) = describe(&thumbnail(&server, hash));
+        assert_eq!((width, height), (480, 270), "{name}");
+    }
+
+    // A video already smaller stays its size.
+    let small = server.video(
+        "small.mp4",
+        &[
+            "-vf",
+            "scale=200:100",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+        ],
+    );
+    let hash = server.save("small.mp4", &small).await;
+    assert!(server.thumbnails.make_now(hash).await.unwrap());
+    let (width, height, _) = describe(&thumbnail(&server, hash));
+    assert_eq!((width, height), (200, 100));
+}
+
+#[tokio::test]
+async fn turns_portrait_videos_upright() {
+    // Phones store portrait video sideways, with a flag to turn it.
+    let server = start().await;
+    server.video("sideways.mp4", &["-c:v", "libx264", "-preset", "ultrafast"]);
+    let path = server.dir.path().join("portrait.mov");
+    let made = Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-display_rotation", "90", "-i"])
+        .arg(server.dir.path().join("sideways.mp4"))
+        .args(["-c", "copy"])
+        .arg(&path)
+        .status()
+        .unwrap();
+    assert!(made.success());
+    let hash = server
+        .save("portrait.mov", &std::fs::read(path).unwrap())
+        .await;
+    assert!(server.thumbnails.make_now(hash).await.unwrap());
+    let (width, height, _) = describe(&thumbnail(&server, hash));
+    assert_eq!((width, height), (270, 480));
+}
+
+#[tokio::test]
+async fn tone_maps_hdr_video_within_its_limits() {
+    // 10-bit HLG, as iPhones record HDR. Tone mapping a whole frame this
+    // size would pass the memory limit, so this checks it's done after
+    // shrinking.
+    let server = start().await;
+    let hdr = server.video(
+        "hdr.mov",
+        &[
+            "-vf",
+            "scale=3840:2160,format=yuv420p10le",
+            "-c:v",
+            "libx265",
+            "-preset",
+            "ultrafast",
+            "-x265-params",
+            "log-level=error:colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc",
+            "-color_primaries",
+            "bt2020",
+            "-color_trc",
+            "arib-std-b67",
+            "-colorspace",
+            "bt2020nc",
+        ],
+    );
+    let hash = server.save("hdr.mov", &hdr).await;
+    assert!(server.thumbnails.make_now(hash).await.unwrap());
+    let (width, height, _) = describe(&thumbnail(&server, hash));
+    assert_eq!((width, height), (480, 270));
+}
+
+#[tokio::test]
+async fn makes_none_for_songs_and_fails_cut_off_videos() {
+    let server = start().await;
+    let song = server.dir.path().join("song.m4a");
+    let made = Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=duration=2",
+            "-c:a",
+            "aac",
+        ])
+        .arg(&song)
+        .status()
+        .unwrap();
+    assert!(made.success());
+    // Saved as .mp4, so it gets as far as ffprobe.
+    let song = server.save("song.mp4", &std::fs::read(song).unwrap()).await;
+    let video = server.video("whole.mov", &["-c:v", "libx264", "-preset", "ultrafast"]);
+    let cut_off = server.save("cut-off.mov", &video[..video.len() / 2]).await;
+
+    let mut status = server.thumbnails.status();
+    let (stop, worker) = start_worker(&server.thumbnails);
+    // Both are in the worker's first batch, so it counts them together.
+    let done = tokio::time::timeout(
+        Duration::from_secs(60),
+        status.wait_for(|status| status.waiting == 0 && status.failed > 0),
+    )
+    .await
+    .expect("the worker should try both")
+    .unwrap()
+    .clone();
+    stop.send(()).unwrap();
+    worker.await.unwrap();
+    assert!(server.thumbnails.find(song).is_none());
+    assert!(server.thumbnails.find(cut_off).is_none());
+    // A song has no video, which isn't a failure.
+    assert_eq!(done.failed, 1);
+}
+
+#[tokio::test]
+async fn shows_videos_once_ffmpeg_is_installed() {
+    let server = start_with(|tools| Tools {
+        ffmpeg: "/nonexistent/ffmpeg".into(),
+        ..tools
+    })
+    .await;
+    let reason = server.thumbnails.status().borrow().videos.clone().unwrap();
+    assert!(reason.contains("ffmpeg"), "{reason}");
+    let hash = server
+        .save(
+            "clip.mp4",
+            &server.video("clip.mp4", &["-c:v", "libx264", "-preset", "ultrafast"]),
+        )
+        .await;
+    assert!(!server.thumbnails.make_now(hash).await.unwrap());
+    // Photos still work.
+    let photo = server
+        .save("photo.png", &server.image("photo.png", 64, 48))
+        .await;
+    assert!(server.thumbnails.make_now(photo).await.unwrap());
+
+    // As if the admin installed it: the same data, with ffmpeg.
+    let thumbnails = Thumbnails::open(
+        server.db.clone(),
+        server.storage.clone(),
+        server.dir.path(),
+        Tools::installed(env!("CARGO_BIN_EXE_accordion-core-sandbox")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(thumbnails.status().borrow().videos, None);
+    let (stop, worker) = start_worker(&thumbnails);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while thumbnails.find(hash).is_none() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the worker should try the video again");
     stop.send(()).unwrap();
     worker.await.unwrap();
 }

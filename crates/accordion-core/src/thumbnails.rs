@@ -1,6 +1,7 @@
-//! Thumbnails: a small picture of each photo and PDF that's stored, and the
-//! first lines of each text file, for Drive's grid now and Photos, Mail, and
-//! Docs later (decision 14 in the `accordion` repo's `docs/decisions`).
+//! Thumbnails: a small picture of each photo, PDF, and video that's stored,
+//! and the first lines of each text file, for Drive's grid now and Photos,
+//! Mail, and Docs later (decisions 14 and 15 in the `accordion` repo's
+//! `docs/decisions`).
 //!
 //! A picture is a WebP, at most 480 pixels on its longer side. Text is the
 //! file's first lines as UTF-8, which apps draw themselves, so it follows
@@ -12,8 +13,10 @@
 //!
 //! [`Thumbnails::run`] makes them in the background, one at a time, newest
 //! files first. The decoding happens in a sandboxed worker
-//! ([`accordion_sandbox`]): libvips for images, and poppler's `pdftoppm` for
-//! a PDF's first page. The server only reads a file's first bytes, to decide
+//! ([`accordion_sandbox`]): libvips for images, poppler's `pdftoppm` for a
+//! PDF's first page, and ffmpeg for a frame from a video. ffmpeg is optional:
+//! without it, videos have none, and they get another try once it's
+//! installed. The server only reads a file's first bytes, to decide
 //! whether there's anything to decode, and to take a text file's first lines,
 //! which needs no decoder. Thumbnails keep no metadata from the file, such as
 //! where a photo was taken.
@@ -62,7 +65,7 @@ static MIGRATIONS: &[Migration] = &[Migration {
 
 /// The version of what makes thumbnails. Raise it when it can make
 /// thumbnails of files it couldn't before, so they get another try.
-pub const WORKER: u32 = 2;
+pub const WORKER: u32 = 3;
 
 /// The longer side of a thumbnail, in pixels.
 const SIZE: u32 = 480;
@@ -88,6 +91,25 @@ const LIMITS: Limits = Limits {
     output: 10 * 1024 * 1024,
 };
 
+/// The decoders ffmpeg may use for video: the codecs families' videos have.
+const VIDEO_DECODERS: &str = "h264,hevc,vp8,vp9,av1,libdav1d,mpeg4,mpeg2video,mjpeg,prores";
+
+/// ffprobe opens a decoder for every track, and stops at one it may not use,
+/// so it may also use the decoders for the audio in those videos. ffmpeg
+/// skips the audio.
+const AUDIO_DECODERS: &str = "aac,mp3float,mp3,opus,libopus,vorbis,libvorbis,ac3,eac3,\
+                              flac,alac,pcm_s16le,pcm_s16be,pcm_s24le,pcm_s24be,pcm_s32le,\
+                              pcm_f32le,pcm_bluray";
+
+/// Turns an HDR frame's colors into ordinary ones. It runs after the frame
+/// is shrunk, since a whole 4K frame takes more memory than the limit.
+const TONE_MAP: &str = "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,\
+                        tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p";
+
+/// Why a video has no thumbnail when ffmpeg isn't installed. Videos with
+/// this reason get another try once it is.
+const NO_FFMPEG: &str = "ffmpeg isn't installed";
+
 /// How many waiting files each look at the database fetches.
 const BATCH: usize = 20;
 
@@ -103,6 +125,9 @@ pub struct Tools {
     pub vips: PathBuf,
     pub vipsheader: PathBuf,
     pub pdftoppm: PathBuf,
+    /// Optional: without ffmpeg, videos have no thumbnails.
+    pub ffmpeg: PathBuf,
+    pub ffprobe: PathBuf,
 }
 
 impl Tools {
@@ -114,7 +139,13 @@ impl Tools {
             vips: "/usr/bin/vips".into(),
             vipsheader: "/usr/bin/vipsheader".into(),
             pdftoppm: "/usr/bin/pdftoppm".into(),
+            ffmpeg: "/usr/bin/ffmpeg".into(),
+            ffprobe: "/usr/bin/ffprobe".into(),
         }
+    }
+
+    fn has_ffmpeg(&self) -> bool {
+        self.ffmpeg.is_file() && self.ffprobe.is_file()
     }
 }
 
@@ -156,6 +187,8 @@ impl ThumbnailKind {
 pub struct ThumbnailStatus {
     /// Why no thumbnails are made, such as a missing program.
     pub unavailable: Option<String>,
+    /// Why videos have no thumbnails, such as ffmpeg not being installed.
+    pub videos: Option<String>,
     /// Files waiting for a thumbnail.
     pub waiting: u64,
     /// Files the worker couldn't make a thumbnail of.
@@ -208,8 +241,43 @@ enum Kind {
     /// HEIC or AVIF, which are decoded whole.
     Heif,
     Pdf,
+    Video(Container),
     /// UTF-8 text, such as notes, Markdown, CSV, or code.
     Text,
+}
+
+/// The video formats families have. ffmpeg reads each with only the one
+/// demuxer, so it never tries its others.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Container {
+    /// QuickTime and MP4: `.mov`, `.mp4`, `.m4v`, and `.3gp`.
+    Mov,
+    /// `.mkv` and `.webm`.
+    Matroska,
+    Avi,
+    /// MPEG transport streams, such as a camcorder's `.mts` files.
+    MpegTs,
+}
+
+impl Container {
+    fn format(self) -> &'static str {
+        match self {
+            Self::Mov => "mov",
+            Self::Matroska => "matroska",
+            Self::Avi => "avi",
+            Self::MpegTs => "mpegts",
+        }
+    }
+}
+
+/// What ffprobe says about a video.
+#[derive(Debug, PartialEq)]
+struct Probe {
+    /// Whether it has a video track at all.
+    video: bool,
+    seconds: Option<f64>,
+    /// Whether the video is HDR, as HLG or PQ.
+    hdr: bool,
 }
 
 impl Thumbnails {
@@ -238,6 +306,7 @@ impl Thumbnails {
         })
         .await?;
         let unavailable = unavailable(&tools);
+        let videos = videos_unavailable(&tools);
         if let Some(reason) = &unavailable {
             tracing::warn!("no thumbnails: {reason}");
         }
@@ -250,6 +319,7 @@ impl Thumbnails {
                 tools,
                 status: watch::Sender::new(ThumbnailStatus {
                     unavailable,
+                    videos,
                     ..ThumbnailStatus::default()
                 }),
             }),
@@ -385,10 +455,13 @@ impl Thumbnails {
                 .map_err(Error::from)
             })
             .await?;
+        let videos = videos_unavailable(&self.inner.tools);
         self.inner.status.send_if_modified(|status| {
-            let changed = (status.waiting, status.failed) != (waiting, failed);
+            let changed =
+                (status.waiting, status.failed, &status.videos) != (waiting, failed, &videos);
             status.waiting = waiting;
             status.failed = failed;
+            status.videos = videos;
             changed
         });
         Ok(())
@@ -424,9 +497,22 @@ impl Thumbnails {
 
     /// Forgets contents that are gone from storage, and removes their
     /// thumbnails. Also forgets thumbnails that are missing from the cache,
-    /// such as after a restore, since backups leave the cache out, so
-    /// they're made again.
+    /// such as after a restore, since backups leave the cache out, and
+    /// videos skipped without ffmpeg once it's installed, so they're made
+    /// again.
     async fn tidy(&self) -> Result<(), Error> {
+        if self.inner.tools.has_ffmpeg() {
+            self.inner
+                .db
+                .write(|tx| {
+                    tx.execute(
+                        "DELETE FROM thumbnails WHERE state = 'none' AND reason = ?1",
+                        [NO_FFMPEG],
+                    )
+                })
+                .await?;
+        }
+
         let ready = self
             .inner
             .db
@@ -486,7 +572,10 @@ impl Thumbnails {
             Ok(Some((Kind::Text, _, head))) => {
                 return self.done(hash, ThumbnailKind::Text, &text(&head));
             }
-            Ok(Some((_, size, _))) if size > MAX_FILE => return Outcome::None("over 200 MB"),
+            // ffmpeg reads a video's index and a few frames, not all of it.
+            Ok(Some((kind, size, _))) if size > MAX_FILE && !matches!(kind, Kind::Video(_)) => {
+                return Outcome::None("over 200 MB");
+            }
             Ok(Some((kind, _, _))) => kind,
             Ok(None) => return Outcome::None("not a kind of file with thumbnails"),
             Err(err) => return Outcome::Failed(format!("couldn't read the file: {err}")),
@@ -501,6 +590,12 @@ impl Thumbnails {
                 Err(problem) => Err(problem),
             },
             Kind::Pdf => self.pdf(&file).await,
+            Kind::Video(_) if !self.inner.tools.has_ffmpeg() => return Outcome::None(NO_FFMPEG),
+            Kind::Video(container) => match self.video(&file, container).await {
+                Ok(Some(frame)) => self.thumbnail(Ok(frame)).await,
+                Ok(None) => return Outcome::None("a video file without video, such as a song"),
+                Err(problem) => Err(problem),
+            },
             Kind::Text => unreachable!("text is kept above"),
         };
         match made {
@@ -617,14 +712,146 @@ impl Thumbnails {
         let png = self
             .work(&self.inner.tools.pdftoppm, &args, input, &[])
             .await?;
-        let page = tempfile::tempfile_in(self.inner.dir.join("partial"))
-            .and_then(|mut page| {
-                io::Write::write_all(&mut page, &png)?;
-                io::Seek::rewind(&mut page)?;
-                Ok(page)
+        self.thumbnail(Ok(self.scratch(&png)?)).await
+    }
+
+    /// A frame from 10% into a video, which skips black frames and fade-ins
+    /// at the start, at most [`SIZE`] pixels on its longer side, as a PNG.
+    /// `None` if the file has no video, such as a song.
+    async fn video(
+        &self,
+        file: &Path,
+        container: Container,
+    ) -> Result<Option<std::fs::File>, String> {
+        let (start, hdr) = match self.probe(file, container).await {
+            Ok(Probe { video: false, .. }) => return Ok(None),
+            Ok(probe) => (
+                probe.seconds.map_or(0.0, |seconds| seconds / 10.0),
+                probe.hdr,
+            ),
+            // Such as a video with audio in a format ffprobe may not open.
+            // ffmpeg skips the audio, so the first frame, as it is, works.
+            Err(problem) => {
+                tracing::debug!(%problem, "ffprobe couldn't read a video");
+                (0.0, false)
+            }
+        };
+        let mut png = self.frame(file, container, start, hdr).await?;
+        if png.is_empty() && start > 0.0 {
+            // The video is shorter than it says.
+            png = self.frame(file, container, 0.0, hdr).await?;
+        }
+        if png.is_empty() {
+            return Err("ffmpeg found no frame in the video".into());
+        }
+        self.scratch(&png).map(Some)
+    }
+
+    /// How long a video is and whether it's HDR, from ffprobe. Like libvips
+    /// for a HEIC's header, it reads the one file it's named, since MOV and
+    /// MP4 files often keep their index at the end.
+    async fn probe(&self, file: &Path, container: Container) -> Result<Probe, String> {
+        let decoders = format!("{VIDEO_DECODERS},{AUDIO_DECODERS}");
+        let args = [
+            "-v",
+            "error",
+            // Only the file it's named, never a playlist's other files or
+            // web addresses.
+            "-protocol_whitelist",
+            "file",
+            "-f",
+            container.format(),
+            "-codec_whitelist",
+            &decoders,
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=color_transfer:format=duration",
+            "-of",
+            "json",
+        ]
+        .map(OsString::from);
+        let args: Vec<OsString> = args.into_iter().chain([file.into()]).collect();
+        let input = std::fs::File::open("/dev/null").map_err(|err| err.to_string())?;
+        let output = self
+            .work(&self.inner.tools.ffprobe, &args, input, &[file.to_owned()])
+            .await?;
+        probe(&output)
+    }
+
+    /// One frame from `start` seconds into a video, shrunk, as a PNG. Empty
+    /// if there's no frame there.
+    async fn frame(
+        &self,
+        file: &Path,
+        container: Container,
+        start: f64,
+        hdr: bool,
+    ) -> Result<Vec<u8>, String> {
+        // A video already smaller stays its size, as a picture does.
+        let shrink = format!(
+            "scale=w='min({SIZE},iw)':h='min({SIZE},ih)':force_original_aspect_ratio=decrease"
+        );
+        let filters = if hdr {
+            format!("{shrink},{TONE_MAP}")
+        } else {
+            shrink
+        };
+        let start = format!("{start:.3}");
+        let before = [
+            "-nostdin",
+            "-v",
+            "error",
+            // Every core would double the memory for no gain.
+            "-threads",
+            "2",
+            "-protocol_whitelist",
+            "file",
+            "-f",
+            container.format(),
+            "-codec_whitelist",
+            VIDEO_DECODERS,
+            "-ss",
+            &start,
+            "-i",
+        ]
+        .map(OsString::from);
+        let after = [
+            "-map",
+            "0:v:0",
+            "-frames:v",
+            "1",
+            "-an",
+            "-sn",
+            "-dn",
+            "-vf",
+            &filters,
+            "-c:v",
+            "png",
+            "-f",
+            "image2pipe",
+            "-",
+        ]
+        .map(OsString::from);
+        let args: Vec<OsString> = before
+            .into_iter()
+            .chain([file.into()])
+            .chain(after)
+            .collect();
+        let input = std::fs::File::open("/dev/null").map_err(|err| err.to_string())?;
+        self.work(&self.inner.tools.ffmpeg, &args, input, &[file.to_owned()])
+            .await
+    }
+
+    /// Keeps a worker's picture in a temporary file, for libvips to read.
+    fn scratch(&self, picture: &[u8]) -> Result<std::fs::File, String> {
+        tempfile::tempfile_in(self.inner.dir.join("partial"))
+            .and_then(|mut file| {
+                io::Write::write_all(&mut file, picture)?;
+                io::Seek::rewind(&mut file)?;
+                Ok(file)
             })
-            .map_err(|err| format!("couldn't keep the page: {err}"))?;
-        self.thumbnail(Ok(page)).await
+            .map_err(|err| format!("couldn't keep the picture: {err}"))
     }
 
     /// Saves a thumbnail in the cache, whole or not at all.
@@ -660,6 +887,29 @@ fn unavailable(tools: &Tools) -> Option<String> {
         "the programs that make thumbnails aren't installed. Install {} with apt.",
         packages.join(" and ")
     ))
+}
+
+/// Why videos have no thumbnails here, if that's the case.
+fn videos_unavailable(tools: &Tools) -> Option<String> {
+    (!tools.has_ffmpeg()).then(|| {
+        "ffmpeg isn't installed. Install it with apt to show a frame from each video.".to_owned()
+    })
+}
+
+/// What ffprobe's JSON says about a video.
+fn probe(output: &[u8]) -> Result<Probe, String> {
+    let json: serde_json::Value = serde_json::from_slice(output)
+        .map_err(|err| format!("ffprobe's answer wasn't JSON: {err}"))?;
+    let stream = json["streams"].get(0);
+    let transfer = stream.and_then(|stream| stream["color_transfer"].as_str());
+    Ok(Probe {
+        video: stream.is_some(),
+        seconds: json["format"]["duration"]
+            .as_str()
+            .and_then(|seconds| seconds.parse::<f64>().ok())
+            .filter(|seconds| seconds.is_finite() && *seconds > 0.0),
+        hdr: matches!(transfer, Some("smpte2084" | "arib-std-b67")),
+    })
 }
 
 /// What kind of file this is, from its first bytes, its size, and those
@@ -701,7 +951,41 @@ fn kind(head: &[u8], whole: bool) -> Option<Kind> {
     if starts(b"%PDF-") {
         return Some(Kind::Pdf);
     }
+    if let Some(container) = container(head) {
+        return Some(Kind::Video(container));
+    }
     is_text(head, whole).then_some(Kind::Text)
+}
+
+/// The video format that starts with `head`, if it's one families have.
+fn container(head: &[u8]) -> Option<Container> {
+    // Songs, audiobooks, and Canon's raw photos are in the same format as
+    // MP4, but have no video, or none ffmpeg should read.
+    const NOT_VIDEO: [&[u8; 4]; 4] = [b"M4A ", b"M4B ", b"M4P ", b"crx "];
+    // Older QuickTime files start with another box. Its size, first, is
+    // small, which tells it from text that happens to have these letters.
+    const QUICKTIME: [&[u8; 4]; 5] = [b"moov", b"mdat", b"wide", b"free", b"skip"];
+    let at = |range: std::ops::Range<usize>| head.get(range);
+    if at(4..8) == Some(b"ftyp") {
+        let brand = at(8..12)?;
+        return (!NOT_VIDEO.iter().any(|known| brand == *known)).then_some(Container::Mov);
+    }
+    if head.first() == Some(&0)
+        && at(4..8).is_some_and(|name| QUICKTIME.iter().any(|known| name == *known))
+    {
+        return Some(Container::Mov);
+    }
+    if head.starts_with(b"\x1a\x45\xdf\xa3") {
+        return Some(Container::Matroska);
+    }
+    if head.starts_with(b"RIFF") && at(8..12) == Some(b"AVI ") {
+        return Some(Container::Avi);
+    }
+    // Transport stream packets start with 0x47 every 188 bytes, or every
+    // 192 after a timestamp, as camcorders write them.
+    let packets =
+        |first: usize, size: usize| (0..3).all(|n| head.get(first + n * size) == Some(&0x47));
+    (packets(0, 188) || packets(4, 192)).then_some(Container::MpegTs)
 }
 
 /// Whether `head` is UTF-8 text with something to show. When it isn't the
@@ -772,11 +1056,72 @@ mod tests {
         assert_eq!(kind(b"\0\0\0\x1cftypavif\0\0\0\0"), Some(Kind::Heif));
         assert_eq!(kind(b"%PDF-1.7\n"), Some(Kind::Pdf));
         // A video in the same box format isn't a picture.
-        assert_eq!(kind(b"\0\0\0\x18ftypmp42\0\0\0\0"), None);
+        assert_eq!(
+            kind(b"\0\0\0\x18ftypmp42\0\0\0\0"),
+            Some(Kind::Video(Container::Mov))
+        );
         assert_eq!(kind(b"RIFF\0\0\0\0WAVEfmt "), None);
         assert_eq!(kind(b"PK\x03\x04"), None);
         assert_eq!(kind(b""), None);
         assert_eq!(kind(b"Pick up the bread.\n"), Some(Kind::Text));
+    }
+
+    #[test]
+    fn knows_the_video_formats_families_have() {
+        let video = |head: &[u8]| container(head);
+        assert_eq!(video(b"\0\0\0\x14ftypqt  \0\0\0\0"), Some(Container::Mov));
+        assert_eq!(
+            video(b"\0\0\0\x08wide\x01\x23\x45\x67mdat"),
+            Some(Container::Mov)
+        );
+        assert_eq!(
+            video(b"\x1a\x45\xdf\xa3\x9f\x42\x86\x81"),
+            Some(Container::Matroska)
+        );
+        assert_eq!(video(b"RIFF\0\0\0\0AVI LIST"), Some(Container::Avi));
+        let mut stream = vec![0u8; 600];
+        for n in 0..3 {
+            stream[n * 188] = 0x47;
+        }
+        assert_eq!(video(&stream), Some(Container::MpegTs));
+        let mut camcorder = vec![0u8; 600];
+        for n in 0..3 {
+            camcorder[4 + n * 192] = 0x47;
+        }
+        assert_eq!(video(&camcorder), Some(Container::MpegTs));
+
+        assert_eq!(video(b"\0\0\0\x1cftypM4A \0\0\0\0"), None);
+        assert_eq!(video(b"\0\0\0\x18ftypcrx \0\0\0\0"), None);
+        // Text with "wide" in the right place isn't a QuickTime file.
+        assert_eq!(video(b"The wide river"), None);
+        assert_eq!(video(b"RIFF\0\0\0\0WAVEfmt "), None);
+    }
+
+    #[test]
+    fn reads_what_ffprobe_says() {
+        let iphone = br#"{"programs": [], "streams": [{"color_transfer": "arib-std-b67"}],
+            "format": {"duration": "30.976667"}}"#;
+        assert_eq!(
+            probe(iphone).unwrap(),
+            Probe {
+                video: true,
+                seconds: Some(30.976667),
+                hdr: true
+            }
+        );
+        let ordinary =
+            br#"{"streams": [{"color_transfer": "bt709"}], "format": {"duration": "N/A"}}"#;
+        assert_eq!(
+            probe(ordinary).unwrap(),
+            Probe {
+                video: true,
+                seconds: None,
+                hdr: false
+            }
+        );
+        let song = br#"{"streams": [], "format": {"duration": "2.000000"}}"#;
+        assert!(!probe(song).unwrap().video);
+        assert!(probe(b"not json").is_err());
     }
 
     #[test]

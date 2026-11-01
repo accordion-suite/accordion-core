@@ -12,6 +12,7 @@ This repo is part of [Accordion](https://github.com/accordion-suite/accordion), 
 | `accordion-sync` | Sync engine for offline merging | Server, desktop app, and mobile apps |
 | `accordion-core` | Services that hold state: identity, search, jobs, storage, and backups | Server and modules |
 | `accordion-module` | The interface between modules and the server: the `Module` trait, sign-in checks, and error responses | Server and modules |
+| `accordion-sandbox` | The sandbox for workers that read untrusted files, such as image decoders: Landlock, seccomp, and resource limits ([decision 14](https://github.com/accordion-suite/accordion/blob/main/docs/decisions/0014-thumbnails-and-sandboxed-workers.md)) | Server |
 
 Modules use core only through these crates' public APIs and never read core's database tables directly. [Decision 1](https://github.com/accordion-suite/accordion/blob/main/docs/decisions/0001-where-core-services-run.md) explains why.
 
@@ -23,6 +24,8 @@ Install Rust with [rustup](https://rustup.rs), then run these commands from the 
 cargo build --workspace
 cargo test --workspace
 ```
+
+The sandbox's tests run real programs (`sh`, `cat`, and `python3`) and need a Linux kernel with Landlock, which is 5.13 or later with Landlock turned on.
 
 The backup tests run [restic](https://restic.net) 0.19.1, the program that makes backups ([decision 8](https://github.com/accordion-suite/accordion/blob/main/docs/decisions/0008-backups.md)). Put it on your `PATH`, or set `ACCORDION_RESTIC` to its full path.
 

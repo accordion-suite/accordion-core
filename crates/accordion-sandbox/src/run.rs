@@ -1,0 +1,158 @@
+//! The server's side: starts the launcher with a job, feeds it the file, and
+//! stops it if it runs too long or writes too much.
+
+use std::ffi::OsString;
+use std::fs::File;
+use std::path::{Path, PathBuf};
+use std::process::{ExitStatus, Stdio};
+use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::Command;
+
+/// The folders every worker can read: programs, their libraries, and the
+/// list of where libraries are. Ones a system doesn't have are left out.
+const SYSTEM: [&str; 5] = [
+    "/usr",
+    "/lib",
+    "/lib64",
+    "/etc/ld.so.cache",
+    "/etc/ld.so.conf",
+];
+
+/// How much of a worker's error output the server keeps, for its log.
+const MESSAGE_LIMIT: u64 = 4096;
+
+/// Starts workers through a launcher: the server's own program, which
+/// answers `sandbox`.
+#[derive(Clone, Debug)]
+pub struct Sandbox {
+    launcher: Arc<Path>,
+}
+
+/// What a worker may use.
+#[derive(Clone, Copy, Debug)]
+pub struct Limits {
+    /// Writable memory, in bytes: the heap and other memory the worker
+    /// can write to, not libraries or space it reserves without using.
+    pub memory: u64,
+    /// CPU time, across all the worker's threads.
+    pub cpu: Duration,
+    /// Time from start to finish, including waiting.
+    pub time: Duration,
+    /// The most the worker may write to its standard output, in bytes.
+    pub output: u64,
+}
+
+/// One run of a worker program.
+pub struct Job<'a> {
+    /// The program's full path.
+    pub program: &'a Path,
+    pub args: &'a [OsString],
+    /// The program's whole environment.
+    pub env: &'a [(&'a str, &'a str)],
+    /// What the program reads on its standard input, such as a stored file.
+    pub input: File,
+    /// Folders the program may read besides the system's own, such as its
+    /// data files.
+    pub read: &'a [PathBuf],
+    pub limits: Limits,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RunError {
+    #[error("the worker couldn't start: {0}")]
+    Start(#[source] std::io::Error),
+    #[error("the worker took longer than {0:?}, so it was stopped")]
+    TimedOut(Duration),
+    #[error("the worker wrote more than {0} bytes, so it was stopped")]
+    TooLarge(u64),
+    #[error("the worker stopped with {status}: {message}")]
+    Failed { status: ExitStatus, message: String },
+}
+
+impl Sandbox {
+    /// `launcher` is the program that answers `sandbox`, usually
+    /// `std::env::current_exe()`.
+    pub fn new(launcher: impl Into<PathBuf>) -> Self {
+        Self {
+            launcher: Arc::from(launcher.into()),
+        }
+    }
+
+    /// Runs `job`, and returns what it wrote to its standard output.
+    pub async fn run(&self, job: Job<'_>) -> Result<Vec<u8>, RunError> {
+        let limits = job.limits;
+        let mut command = Command::new(&*self.launcher);
+        command
+            .arg("sandbox")
+            .arg("--memory")
+            .arg(limits.memory.to_string())
+            .arg("--cpu")
+            .arg(limits.cpu.as_secs().max(1).to_string());
+        let system = SYSTEM.iter().map(Path::new);
+        for path in system.chain(job.read.iter().map(PathBuf::as_path)) {
+            if path.exists() {
+                command.arg("--read").arg(path);
+            }
+        }
+        command
+            .arg("--")
+            .arg(job.program)
+            .args(job.args)
+            .env_clear()
+            .envs(job.env.iter().copied())
+            .stdin(Stdio::from(job.input))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .kill_on_drop(true);
+        let mut child = command.spawn().map_err(RunError::Start)?;
+        let group = child.id();
+        let stdout = child.stdout.take().expect("stdout is piped");
+        let stderr = child.stderr.take().expect("stderr is piped");
+
+        let work = async {
+            let (output, message) = tokio::join!(
+                read_up_to(stdout, limits.output + 1),
+                read_up_to(stderr, MESSAGE_LIMIT),
+            );
+            let output = output.map_err(RunError::Start)?;
+            if output.len() as u64 > limits.output {
+                return Err(RunError::TooLarge(limits.output));
+            }
+            let status = child.wait().await.map_err(RunError::Start)?;
+            if status.success() {
+                return Ok(output);
+            }
+            let message = String::from_utf8_lossy(&message.unwrap_or_default())
+                .trim()
+                .to_owned();
+            Err(RunError::Failed { status, message })
+        };
+        let result = match tokio::time::timeout(limits.time, work).await {
+            Ok(result) => result,
+            Err(_) => Err(RunError::TimedOut(limits.time)),
+        };
+        if result.is_err() {
+            stop(group);
+        }
+        result
+    }
+}
+
+/// Reads at most `limit` bytes, then stops reading.
+async fn read_up_to(reader: impl AsyncRead + Unpin, limit: u64) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader.take(limit).read_to_end(&mut bytes).await?;
+    Ok(bytes)
+}
+
+/// Stops the worker's whole process group, including anything it started.
+fn stop(group: Option<u32>) {
+    if let Some(group) = group.and_then(|group| libc::pid_t::try_from(group).ok()) {
+        // The group may be gone already, which is fine.
+        unsafe { libc::kill(-group, libc::SIGKILL) };
+    }
+}

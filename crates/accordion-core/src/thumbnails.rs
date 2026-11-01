@@ -1,19 +1,22 @@
-//! Thumbnails: a small picture of each photo and PDF that's stored, for
-//! Drive's grid now and Photos, Mail, and Docs later (decision 14 in the
-//! `accordion` repo's `docs/decisions`).
+//! Thumbnails: a small picture of each photo and PDF that's stored, and the
+//! first lines of each text file, for Drive's grid now and Photos, Mail, and
+//! Docs later (decision 14 in the `accordion` repo's `docs/decisions`).
 //!
-//! Each thumbnail is a WebP, at most 480 pixels on its longer side, named by
-//! the hash of the contents it shows, so copies and unchanged versions share
-//! one. They're kept in `cache/thumbnails/` in the data folder, which backups
-//! leave out, because they can be made again. After a restore, the worker
-//! finds them missing and makes them again.
+//! A picture is a WebP, at most 480 pixels on its longer side. Text is the
+//! file's first lines as UTF-8, which apps draw themselves, so it follows
+//! their light or dark look. Each is named by the hash of the contents it
+//! shows, so copies and unchanged versions share one. They're kept in
+//! `cache/thumbnails/` in the data folder, which backups leave out, because
+//! they can be made again. After a restore, the worker finds them missing
+//! and makes them again.
 //!
 //! [`Thumbnails::run`] makes them in the background, one at a time, newest
 //! files first. The decoding happens in a sandboxed worker
 //! ([`accordion_sandbox`]): libvips for images, and poppler's `pdftoppm` for
 //! a PDF's first page. The server only reads a file's first bytes, to decide
-//! whether there's anything to decode. Thumbnails keep no metadata from the
-//! file, such as where a photo was taken.
+//! whether there's anything to decode, and to take a text file's first lines,
+//! which needs no decoder. Thumbnails keep no metadata from the file, such as
+//! where a photo was taken.
 //!
 //! A file that fails isn't tried again until [`WORKER`] changes, such as
 //! when an update makes thumbnails of more kinds of file.
@@ -59,7 +62,7 @@ static MIGRATIONS: &[Migration] = &[Migration {
 
 /// The version of what makes thumbnails. Raise it when it can make
 /// thumbnails of files it couldn't before, so they get another try.
-pub const WORKER: u32 = 1;
+pub const WORKER: u32 = 2;
 
 /// The longer side of a thumbnail, in pixels.
 const SIZE: u32 = 480;
@@ -69,6 +72,13 @@ const MAX_FILE: u64 = 200 * 1024 * 1024;
 
 /// HEIC and AVIF files are decoded whole, so larger ones get no thumbnail.
 const MAX_HEIF_PIXELS: u64 = 24_000_000;
+
+/// How much of a file is read to tell what it is, and the most a text
+/// thumbnail keeps.
+const HEAD: usize = 4096;
+
+/// The most lines a text thumbnail keeps. A card shows fewer.
+const TEXT_LINES: usize = 40;
 
 /// What a worker may use for each thumbnail.
 const LIMITS: Limits = Limits {
@@ -104,6 +114,39 @@ impl Tools {
             vips: "/usr/bin/vips".into(),
             vipsheader: "/usr/bin/vipsheader".into(),
             pdftoppm: "/usr/bin/pdftoppm".into(),
+        }
+    }
+}
+
+/// A thumbnail in the cache.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Thumbnail {
+    pub kind: ThumbnailKind,
+    pub path: PathBuf,
+}
+
+/// What a thumbnail is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThumbnailKind {
+    /// A WebP picture.
+    Picture,
+    /// A text file's first lines, as UTF-8 with `\n` between lines.
+    Text,
+}
+
+impl ThumbnailKind {
+    /// The thumbnail's media type, for sending it.
+    pub fn content_type(self) -> &'static str {
+        match self {
+            Self::Picture => "image/webp",
+            Self::Text => "text/plain; charset=utf-8",
+        }
+    }
+
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Picture => "webp",
+            Self::Text => "txt",
         }
     }
 }
@@ -165,6 +208,8 @@ enum Kind {
     /// HEIC or AVIF, which are decoded whole.
     Heif,
     Pdf,
+    /// UTF-8 text, such as notes, Markdown, CSV, or code.
+    Text,
 }
 
 impl Thumbnails {
@@ -215,18 +260,22 @@ impl Thumbnails {
         self.inner.status.subscribe()
     }
 
-    /// The thumbnail of the contents with `hash`, a WebP file, if there is
-    /// one yet.
-    pub fn find(&self, hash: ContentHash) -> Option<PathBuf> {
-        let path = self.path(hash);
-        path.is_file().then_some(path)
+    /// The thumbnail of the contents with `hash`, if there is one yet.
+    pub fn find(&self, hash: ContentHash) -> Option<Thumbnail> {
+        [ThumbnailKind::Picture, ThumbnailKind::Text]
+            .into_iter()
+            .map(|kind| Thumbnail {
+                kind,
+                path: self.path(hash, kind),
+            })
+            .find(|thumbnail| thumbnail.path.is_file())
     }
 
-    fn path(&self, hash: ContentHash) -> PathBuf {
+    fn path(&self, hash: ContentHash, kind: ThumbnailKind) -> PathBuf {
         self.inner
             .dir
             .join(blobs::shard(hash))
-            .with_extension("webp")
+            .with_extension(kind.extension())
     }
 
     /// Makes thumbnails until `stopped` finishes: the newest waiting files
@@ -390,7 +439,7 @@ impl Thumbnails {
             .await?;
         let missing: Vec<ContentHash> = ready
             .into_iter()
-            .filter(|hash| !self.path(*hash).is_file())
+            .filter(|hash| self.find(*hash).is_none())
             .collect();
         if !missing.is_empty() {
             tracing::info!(count = missing.len(), "making missing thumbnails again");
@@ -420,9 +469,11 @@ impl Thumbnails {
             })
             .await?;
         for hash in gone {
-            match std::fs::remove_file(self.path(hash)) {
-                Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err.into()),
-                _ => {}
+            for kind in [ThumbnailKind::Picture, ThumbnailKind::Text] {
+                match std::fs::remove_file(self.path(hash, kind)) {
+                    Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err.into()),
+                    _ => {}
+                }
             }
         }
         Ok(())
@@ -431,8 +482,12 @@ impl Thumbnails {
     async fn make(&self, hash: ContentHash) -> Outcome {
         let file = self.inner.storage.contents_file(hash);
         let kind = match sniff(&file) {
-            Ok(Some((_, size))) if size > MAX_FILE => return Outcome::None("over 200 MB"),
-            Ok(Some((kind, _))) => kind,
+            // Only the first lines are kept, so text files of any size have one.
+            Ok(Some((Kind::Text, _, head))) => {
+                return self.done(hash, ThumbnailKind::Text, &text(&head));
+            }
+            Ok(Some((_, size, _))) if size > MAX_FILE => return Outcome::None("over 200 MB"),
+            Ok(Some((kind, _, _))) => kind,
             Ok(None) => return Outcome::None("not a kind of file with thumbnails"),
             Err(err) => return Outcome::Failed(format!("couldn't read the file: {err}")),
         };
@@ -446,13 +501,19 @@ impl Thumbnails {
                 Err(problem) => Err(problem),
             },
             Kind::Pdf => self.pdf(&file).await,
+            Kind::Text => unreachable!("text is kept above"),
         };
         match made {
-            Ok(webp) => match self.keep(hash, &webp) {
-                Ok(()) => Outcome::Ready,
-                Err(err) => Outcome::Failed(format!("couldn't save the thumbnail: {err}")),
-            },
+            Ok(webp) => self.done(hash, ThumbnailKind::Picture, &webp),
             Err(problem) => Outcome::Failed(problem),
+        }
+    }
+
+    /// Keeps a thumbnail that's been made.
+    fn done(&self, hash: ContentHash, kind: ThumbnailKind, thumbnail: &[u8]) -> Outcome {
+        match self.keep(self.path(hash, kind), thumbnail) {
+            Ok(()) => Outcome::Ready,
+            Err(err) => Outcome::Failed(format!("couldn't save the thumbnail: {err}")),
         }
     }
 
@@ -567,11 +628,10 @@ impl Thumbnails {
     }
 
     /// Saves a thumbnail in the cache, whole or not at all.
-    fn keep(&self, hash: ContentHash, webp: &[u8]) -> io::Result<()> {
-        let path = self.path(hash);
+    fn keep(&self, path: PathBuf, thumbnail: &[u8]) -> io::Result<()> {
         std::fs::create_dir_all(path.parent().expect("a thumbnail is in a folder"))?;
         let mut partial = tempfile::NamedTempFile::new_in(self.inner.dir.join("partial"))?;
-        io::Write::write_all(&mut partial, webp)?;
+        io::Write::write_all(&mut partial, thumbnail)?;
         partial.persist(&path).map_err(|err| err.error)?;
         Ok(())
     }
@@ -602,16 +662,20 @@ fn unavailable(tools: &Tools) -> Option<String> {
     ))
 }
 
-/// What kind of file this is, from its first bytes, and its size.
-fn sniff(file: &Path) -> io::Result<Option<(Kind, u64)>> {
-    let mut opened = std::fs::File::open(file)?;
+/// What kind of file this is, from its first bytes, its size, and those
+/// bytes.
+fn sniff(file: &Path) -> io::Result<Option<(Kind, u64, Vec<u8>)>> {
+    let opened = std::fs::File::open(file)?;
     let size = opened.metadata()?.len();
-    let mut head = [0u8; 16];
-    let read = opened.read(&mut head)?;
-    Ok(kind(&head[..read]).map(|kind| (kind, size)))
+    let mut head = Vec::with_capacity(HEAD);
+    opened.take(HEAD as u64).read_to_end(&mut head)?;
+    let whole = head.len() as u64 == size;
+    Ok(kind(&head, whole).map(|kind| (kind, size, head)))
 }
 
-fn kind(head: &[u8]) -> Option<Kind> {
+/// The kind of file that starts with `head`, which is `whole` if it's the
+/// entire file.
+fn kind(head: &[u8], whole: bool) -> Option<Kind> {
     const HEIF_BRANDS: [&[u8; 4]; 12] = [
         b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"hevm", b"hevs", b"mif1", b"msf1",
         b"avif", b"avis",
@@ -637,7 +701,48 @@ fn kind(head: &[u8]) -> Option<Kind> {
     if starts(b"%PDF-") {
         return Some(Kind::Pdf);
     }
-    None
+    is_text(head, whole).then_some(Kind::Text)
+}
+
+/// Whether `head` is UTF-8 text with something to show. When it isn't the
+/// whole file, it may end partway through a character.
+fn is_text(head: &[u8], whole: bool) -> bool {
+    let valid = match std::str::from_utf8(head) {
+        Ok(text) => text,
+        // Cut off partway through a character, not broken.
+        Err(err) if !whole && err.error_len().is_none() => {
+            std::str::from_utf8(&head[..err.valid_up_to()]).expect("valid up to here")
+        }
+        Err(_) => return false,
+    };
+    let text = valid.strip_prefix('\u{feff}').unwrap_or(valid);
+    // Binary files have control characters, and a file of nothing but
+    // spaces has nothing to show.
+    let controls = |c: char| c.is_control() && !matches!(c, '\t' | '\n' | '\r' | '\u{c}');
+    let trimmed = text.trim_start();
+    !text.contains(controls)
+        && !trimmed.is_empty()
+        // An SVG is a picture, and an RTF file is a formatted document, so
+        // their markup would look broken.
+        && !(trimmed.starts_with("<svg")
+            || (trimmed.starts_with("<?xml") && trimmed.contains("<svg"))
+            || trimmed.starts_with("{\\rtf"))
+}
+
+/// A text thumbnail from the start of a text file: its first lines, with
+/// `\n` between them.
+fn text(head: &[u8]) -> Vec<u8> {
+    let valid = match std::str::from_utf8(head) {
+        Ok(text) => text,
+        Err(err) => std::str::from_utf8(&head[..err.valid_up_to()]).expect("valid up to here"),
+    };
+    let text = valid.strip_prefix('\u{feff}').unwrap_or(valid);
+    let lines: Vec<&str> = text
+        .lines()
+        .take(TEXT_LINES)
+        .map(|line| line.strip_suffix('\r').unwrap_or(line))
+        .collect();
+    lines.join("\n").into_bytes()
 }
 
 fn hash(row: &Row<'_>, index: usize) -> rusqlite::Result<ContentHash> {
@@ -657,6 +762,7 @@ mod tests {
 
     #[test]
     fn knows_each_kind_by_its_first_bytes() {
+        let kind = |head: &[u8]| kind(head, false);
         assert_eq!(kind(b"\xff\xd8\xff\xe0\0\x10JFIF"), Some(Kind::Image));
         assert_eq!(kind(b"\x89PNG\r\n\x1a\n\0\0"), Some(Kind::Image));
         assert_eq!(kind(b"GIF89a\x01\0"), Some(Kind::Image));
@@ -670,5 +776,39 @@ mod tests {
         assert_eq!(kind(b"RIFF\0\0\0\0WAVEfmt "), None);
         assert_eq!(kind(b"PK\x03\x04"), None);
         assert_eq!(kind(b""), None);
+        assert_eq!(kind(b"Pick up the bread.\n"), Some(Kind::Text));
+    }
+
+    #[test]
+    fn knows_text_from_binary_files() {
+        assert!(is_text(b"name,age\r\nAlex,9\r\n", true));
+        assert!(is_text(
+            "\u{feff}# Caf\u{e9} \u{2615}\n\tTabs too".as_bytes(),
+            true
+        ));
+        // Cut off partway through "é", because only the start was read.
+        assert!(is_text(b"Caf\xc3", false));
+        assert!(!is_text(b"Caf\xc3", true));
+        assert!(!is_text(b"Latin-1 caf\xe9 isn't UTF-8", true));
+        assert!(!is_text(b"\x7fELF\x02\x01\x01\0", false));
+        assert!(!is_text(b"   \n\n", true));
+        assert!(!is_text(
+            b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>",
+            true
+        ));
+        assert!(!is_text(b"<?xml version=\"1.0\"?>\n<svg/>", true));
+        assert!(is_text(b"<?xml version=\"1.0\"?>\n<notes/>", true));
+        assert!(!is_text(b"{\\rtf1\\ansi Hello}", true));
+    }
+
+    #[test]
+    fn keeps_a_text_files_first_lines() {
+        let long: String = (1..=100).map(|n| format!("Line {n}\r\n")).collect();
+        let kept = String::from_utf8(text(long.as_bytes())).unwrap();
+        assert_eq!(kept.lines().count(), TEXT_LINES);
+        assert!(kept.starts_with("Line 1\nLine 2\n"));
+        assert!(!kept.contains('\r'));
+        // The byte order mark goes, and so does a character cut off at the end.
+        assert_eq!(text(b"\xef\xbb\xbfCaf\xc3"), b"Caf");
     }
 }

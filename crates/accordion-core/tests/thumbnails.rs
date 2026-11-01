@@ -9,7 +9,7 @@ use std::time::Duration;
 use accordion_core::db::Database;
 use accordion_core::identity::{Identity, NewUser};
 use accordion_core::storage::{ContentHash, ItemKind, Storage};
-use accordion_core::thumbnails::{Thumbnails, Tools};
+use accordion_core::thumbnails::{ThumbnailKind, Thumbnails, Tools};
 use accordion_types::{ItemId, Role};
 
 struct Server {
@@ -105,11 +105,14 @@ fn describe(path: &Path) -> (u32, u32, String) {
     (field("width"), field("height"), text)
 }
 
+/// The picture made of the contents with `hash`.
 fn thumbnail(server: &Server, hash: ContentHash) -> PathBuf {
-    server
+    let found = server
         .thumbnails
         .find(hash)
-        .expect("there should be a thumbnail")
+        .expect("there should be a thumbnail");
+    assert_eq!(found.kind, ThumbnailKind::Picture);
+    found.path
 }
 
 /// A JPEG with a camera's make in its metadata, as phones write, and where
@@ -215,11 +218,29 @@ async fn keeps_no_metadata_such_as_where_a_photo_was_taken() {
 }
 
 #[tokio::test]
+async fn keeps_a_text_files_first_lines() {
+    let server = start().await;
+    let mut list = String::from("\u{feff}Shopping\r\n");
+    for n in 1..=1000 {
+        list.push_str(&format!("{n}. Bread\r\n"));
+    }
+    let hash = server.save("list.txt", list.as_bytes()).await;
+    assert!(server.thumbnails.make_now(hash).await.unwrap());
+    let found = server.thumbnails.find(hash).unwrap();
+    assert_eq!(found.kind, ThumbnailKind::Text);
+    assert_eq!(found.kind.content_type(), "text/plain; charset=utf-8");
+    let text = std::fs::read_to_string(found.path).unwrap();
+    assert!(text.starts_with("Shopping\n1. Bread\n2. Bread\n"), "{text}");
+    assert_eq!(text.lines().count(), 40);
+}
+
+#[tokio::test]
 async fn makes_none_for_other_files_and_huge_heic_and_avif() {
     let server = start().await;
-    let notes = server.save("notes.txt", b"Pick up the bread.\n").await;
-    assert!(!server.thumbnails.make_now(notes).await.unwrap());
-    assert!(server.thumbnails.find(notes).is_none());
+    // The start of a ZIP file, such as a Word document.
+    let zip = server.save("letter.docx", b"PK\x03\x04\x14\0\x06\0").await;
+    assert!(!server.thumbnails.make_now(zip).await.unwrap());
+    assert!(server.thumbnails.find(zip).is_none());
 
     // 25 megapixels, over the limit, since these are decoded whole.
     let huge = server

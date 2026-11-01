@@ -27,6 +27,21 @@ mod launch;
 mod run;
 
 pub use launch::launch;
+
+/// A whole program that's only the launcher, such as the ones tests use:
+/// `<program> sandbox <limits> -- <program> [<argument>]...`.
+pub fn main() -> ! {
+    let mut args = std::env::args_os().skip(1);
+    if args.next().is_none_or(|command| command != "sandbox") {
+        eprintln!(
+            "Usage: {} sandbox --memory <bytes> --cpu <seconds> [--read <path>]... -- <program> \
+             [<argument>]...",
+            std::env::args().next().unwrap_or_default()
+        );
+        std::process::exit(2);
+    }
+    std::process::exit(launch(args));
+}
 pub use run::{Job, Limits, RunError, Sandbox};
 
 /// Why the sandbox can't run on this system.

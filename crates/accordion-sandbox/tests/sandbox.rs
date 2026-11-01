@@ -230,3 +230,31 @@ async fn stops_a_worker_that_writes_too_much() {
         "{result:?}"
     );
 }
+
+#[tokio::test]
+async fn reads_one_file_it_is_given_and_not_the_rest_of_its_folder() {
+    let dir = tempfile::tempdir().unwrap();
+    let given = dir.path().join("given.jpg");
+    let other = dir.path().join("other.jpg");
+    std::fs::write(&given, "allowed").unwrap();
+    std::fs::write(&other, "someone else's").unwrap();
+    let run_cat = |path: &Path| {
+        let args = [OsString::from(path)];
+        let read = [given.clone()];
+        async move {
+            sandbox()
+                .run(Job {
+                    program: Path::new("/usr/bin/cat"),
+                    args: &args,
+                    env: &[],
+                    input: File::open("/dev/null").unwrap(),
+                    read: &read,
+                    limits: LIMITS,
+                })
+                .await
+        }
+    };
+    assert_eq!(run_cat(&given).await.unwrap(), b"allowed");
+    let result = run_cat(&other).await;
+    assert!(matches!(result, Err(RunError::Failed { .. })), "{result:?}");
+}

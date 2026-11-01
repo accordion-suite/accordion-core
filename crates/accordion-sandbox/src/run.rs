@@ -54,8 +54,8 @@ pub struct Job<'a> {
     pub env: &'a [(&'a str, &'a str)],
     /// What the program reads on its standard input, such as a stored file.
     pub input: File,
-    /// Folders the program may read besides the system's own, such as its
-    /// data files.
+    /// Folders and files the program may read besides the system's own,
+    /// such as a stored file it reads by name.
     pub read: &'a [PathBuf],
     pub limits: Limits,
 }

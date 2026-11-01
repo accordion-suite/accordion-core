@@ -164,9 +164,16 @@ fn landlock(request: &Request, interpreter: Option<&Path>) -> Result<(), String>
         .create()
         .map_err(|err| fail(&err))?;
     for path in &request.read {
+        // A file, such as the one a worker reads by name, can only be read.
+        // Listing applies to folders.
+        let access = if path.is_dir() {
+            read
+        } else {
+            AccessFs::ReadFile.into()
+        };
         let fd = PathFd::new(path).map_err(|err| fail(&err))?;
         ruleset = ruleset
-            .add_rule(PathBeneath::new(fd, read))
+            .add_rule(PathBeneath::new(fd, access))
             .map_err(|err| fail(&err))?;
     }
     for program in std::iter::once(request.program.as_path()).chain(interpreter) {

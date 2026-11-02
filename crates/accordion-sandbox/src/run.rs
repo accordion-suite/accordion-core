@@ -89,6 +89,13 @@ impl Sandbox {
 
     /// Runs `job`, and returns what it wrote to its standard output.
     pub async fn run(&self, job: Job<'_>) -> Result<Vec<u8>, RunError> {
+        self.run_with_messages(job).await.map(|(output, _)| output)
+    }
+
+    /// Runs `job`, and returns what it wrote to its standard output, and to
+    /// its error output, for programs that explain a problem there but still
+    /// finish as if they'd succeeded.
+    pub async fn run_with_messages(&self, job: Job<'_>) -> Result<(Vec<u8>, String), RunError> {
         let limits = job.limits;
         let mut command = Command::new(&*self.launcher);
         command
@@ -135,12 +142,12 @@ impl Sandbox {
                 return Err(RunError::TooLarge(limits.output));
             }
             let status = child.wait().await.map_err(RunError::Start)?;
-            if status.success() {
-                return Ok(output);
-            }
             let message = String::from_utf8_lossy(&message.unwrap_or_default())
                 .trim()
                 .to_owned();
+            if status.success() {
+                return Ok((output, message));
+            }
             Err(RunError::Failed { status, message })
         };
         let result = match tokio::time::timeout(limits.time, work).await {

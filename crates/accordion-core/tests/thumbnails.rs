@@ -793,3 +793,46 @@ async fn shows_documents_once_libreoffice_is_installed() {
     stop.send(()).unwrap();
     worker.await.unwrap();
 }
+
+#[tokio::test]
+async fn tries_failed_documents_again_when_the_server_starts() {
+    // As when the server starts while apt is still installing LibreOffice:
+    // its program is there, but it finishes without making a PDF.
+    let half_installed = tempfile::tempdir().unwrap();
+    let soffice = half_installed.path().join("program").join("soffice.bin");
+    std::fs::create_dir_all(soffice.parent().unwrap()).unwrap();
+    std::fs::copy("/usr/bin/true", &soffice).unwrap();
+    let server = start_with(|tools| Tools {
+        soffice: soffice.clone(),
+        ..tools
+    })
+    .await;
+    let hash = server
+        .save(
+            "letter.docx",
+            &server.document("letter.fodt", LETTER, "docx"),
+        )
+        .await;
+    assert!(!server.thumbnails.make_now(hash).await.unwrap());
+    assert_eq!(server.thumbnails.status().borrow().documents, None);
+
+    // The same data after a restart, with LibreOffice installed.
+    let thumbnails = Thumbnails::open(
+        server.db.clone(),
+        server.storage.clone(),
+        server.dir.path(),
+        Tools::installed(env!("CARGO_BIN_EXE_accordion-core-sandbox")),
+    )
+    .await
+    .unwrap();
+    let (stop, worker) = start_worker(&thumbnails);
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while thumbnails.preview(hash).is_none() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the worker should try the document again");
+    stop.send(()).unwrap();
+    worker.await.unwrap();
+}

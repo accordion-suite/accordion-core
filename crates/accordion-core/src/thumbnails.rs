@@ -162,6 +162,10 @@ const TONE_MAP: &str = "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,
 /// this reason get another try once it is.
 const NO_FFMPEG: &str = "ffmpeg isn't installed";
 
+/// How the reason starts when a document fails, so failed documents can get
+/// another try when LibreOffice changes.
+const DOCUMENT_FAILED: &str = "Document: ";
+
 /// Why a document has no thumbnail when LibreOffice isn't installed.
 /// Documents with this reason get another try once it is.
 const NO_OFFICE: &str = "LibreOffice isn't installed";
@@ -305,6 +309,10 @@ struct Inner {
     /// Holding the lock also keeps to one document at a time, so two large
     /// ones can't use the memory together.
     office: tokio::sync::Mutex<Option<tempfile::TempDir>>,
+    /// LibreOffice's installation as the worker last saw it, from
+    /// [`office_stamp`]. `None` until the first look after the server
+    /// starts.
+    office_seen: std::sync::Mutex<Option<OfficeStamp>>,
 }
 
 /// What became of one file.
@@ -504,6 +512,7 @@ impl Thumbnails {
                     ..ThumbnailStatus::default()
                 }),
                 office: tokio::sync::Mutex::new(None),
+                office_seen: std::sync::Mutex::new(None),
             }),
         })
     }
@@ -709,6 +718,28 @@ impl Thumbnails {
     /// they're installed, so they're made again.
     async fn tidy(&self) -> Result<(), Error> {
         let tools = &self.inner.tools;
+        // Documents that failed get another try when LibreOffice's packages
+        // change, such as one that was still being installed when the
+        // server started, and once each time the server starts.
+        let stamp = office_stamp(tools);
+        let changed = {
+            let mut seen = self.inner.office_seen.lock().expect("never poisoned");
+            let changed = seen.as_ref() != Some(&stamp);
+            *seen = Some(stamp);
+            changed
+        };
+        if changed && tools.has_office() {
+            let pattern = format!("{DOCUMENT_FAILED}%");
+            self.inner
+                .db
+                .write(move |tx| {
+                    tx.execute(
+                        "DELETE FROM thumbnails WHERE state = 'failed' AND reason LIKE ?1",
+                        [pattern],
+                    )
+                })
+                .await?;
+        }
         for (installed, reason) in [
             (tools.has_ffmpeg(), NO_FFMPEG),
             (tools.has_office(), NO_OFFICE),
@@ -839,7 +870,10 @@ impl Thumbnails {
                 Err(problem) => Err(problem),
             },
             Kind::Document(_) if !self.inner.tools.has_office() => return Outcome::None(NO_OFFICE),
-            Kind::Document(format) => self.document(hash, &file, format).await,
+            Kind::Document(format) => self
+                .document(hash, &file, format)
+                .await
+                .map_err(|problem| format!("{DOCUMENT_FAILED}{problem}")),
             Kind::Text => unreachable!("text is kept above"),
         };
         match made {
@@ -1020,7 +1054,8 @@ impl Thumbnails {
             out.clone().into(),
             file.into(),
         ];
-        self.office(scratch.path(), &args, &[file.to_owned()])
+        let messages = self
+            .office(scratch.path(), &args, &[file.to_owned()])
             .await?;
 
         // The worker named the PDF after the file. It could only make
@@ -1030,7 +1065,10 @@ impl Thumbnails {
             .map_err(|err| format!("couldn't read LibreOffice's PDF: {err}"))?
             .map(|entry| entry.path())
             .filter(|path| path.symlink_metadata().is_ok_and(|found| found.is_file()))
-            .ok_or("LibreOffice didn't make a PDF")?;
+            .ok_or_else(|| match messages.as_str() {
+                "" => "LibreOffice didn't make a PDF".to_owned(),
+                said => format!("LibreOffice didn't make a PDF: {said}"),
+            })?;
         let pages = self.pages(&pdf).await?;
         let webp = self.pdf(&pdf).await?;
         // Both are kept, or neither.
@@ -1065,13 +1103,14 @@ impl Thumbnails {
         Ok(made)
     }
 
-    /// Runs LibreOffice in the sandbox, with `scratch` to write in.
+    /// Runs LibreOffice in the sandbox, with `scratch` to write in, and
+    /// returns what it said on its error output.
     async fn office(
         &self,
         scratch: &Path,
         args: &[OsString],
         files: &[PathBuf],
-    ) -> Result<(), String> {
+    ) -> Result<String, String> {
         let scratch_text = scratch
             .to_str()
             .ok_or("the data folder's name isn't UTF-8")?;
@@ -1086,7 +1125,7 @@ impl Thumbnails {
         let result = self
             .inner
             .sandbox
-            .run(Job {
+            .run_with_messages(Job {
                 program: &self.inner.tools.soffice,
                 args,
                 env: &env,
@@ -1102,7 +1141,9 @@ impl Thumbnails {
         for socket in office_sockets().difference(&before) {
             let _ = std::fs::remove_file(socket);
         }
-        result.map(drop).map_err(|err| err.to_string())
+        result
+            .map(|(_, messages)| messages)
+            .map_err(|err| err.to_string())
     }
 
     /// How many pages a PDF has, from poppler.
@@ -1308,6 +1349,27 @@ fn documents_unavailable(tools: &Tools) -> Option<String> {
          and libreoffice-impress-nogui with apt to show the first page of each document."
             .to_owned()
     })
+}
+
+/// When LibreOffice's program folder and its settings folder last changed.
+/// Installing, updating, or removing its packages adds, replaces, or removes
+/// files in them.
+type OfficeStamp = [Option<std::time::SystemTime>; 2];
+
+fn office_stamp(tools: &Tools) -> OfficeStamp {
+    let program = tools.soffice.parent();
+    let changed = |dir: Option<PathBuf>| {
+        dir.and_then(|dir| dir.metadata().ok())
+            .and_then(|found| found.modified().ok())
+    };
+    [
+        changed(program.map(Path::to_owned)),
+        changed(
+            program
+                .and_then(Path::parent)
+                .map(|office| office.join("share").join("registry")),
+        ),
+    ]
 }
 
 /// The server's LibreOffice sockets in [`SOCKETS`].

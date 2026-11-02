@@ -87,6 +87,11 @@ pub struct Routes {
     pub api: Option<Router>,
     /// WebDAV, CalDAV, or CardDAV for standard clients, at `/dav/<id>`.
     pub dav: Option<Router>,
+    /// More WebDAV addresses, each at `/dav/<name>`, such as Drive's
+    /// `/dav/shared` for what others shared. A name is lowercase letters, and
+    /// can't be another module's ID or another module's extra name. The
+    /// server stops if it is, so a clash shows up the first time it runs.
+    pub more_dav: Vec<(&'static str, Router)>,
     /// The module's pages in the web app, at `/<id>`.
     pub pages: Option<Router>,
 }

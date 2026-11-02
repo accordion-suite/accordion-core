@@ -366,3 +366,12 @@ for attempt in [
     );
     drop(other);
 }
+
+#[tokio::test]
+async fn cant_make_memory_both_writable_and_runnable() {
+    // As the service can't, through systemd's MemoryDenyWriteExecute.
+    let script =
+        "import mmap; mmap.mmap(-1, 4096, prot=mmap.PROT_READ | mmap.PROT_WRITE | mmap.PROT_EXEC)";
+    let message = failure(run("/usr/bin/python3", &["-I", "-c", script], LIMITS).await);
+    assert!(message.contains("PermissionError"), "{message}");
+}

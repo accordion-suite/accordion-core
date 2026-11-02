@@ -105,6 +105,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Request, String> {
 
 fn restrict(request: &Request) -> Result<(), String> {
     lower_priority();
+    deny_write_execute();
     limit(request)?;
     // The program's interpreter, such as ld-linux, has to be allowed to run
     // too, because the kernel checks it like the program.
@@ -132,6 +133,16 @@ fn lower_priority() {
             IOPRIO_CLASS_IDLE << 13,
         );
     }
+}
+
+/// Refuses memory that's both writable and runnable, as systemd's
+/// `MemoryDenyWriteExecute` does for the service. The service has it either
+/// way, so this makes workers run the same in tests and development.
+/// Kernels before 6.3 don't have it, which is fine for the same reason.
+fn deny_write_execute() {
+    const PR_SET_MDWE: libc::c_int = 65;
+    const PR_MDWE_REFUSE_EXEC_GAIN: libc::c_ulong = 1;
+    unsafe { libc::prctl(PR_SET_MDWE, PR_MDWE_REFUSE_EXEC_GAIN, 0, 0, 0) };
 }
 
 fn limit(request: &Request) -> Result<(), String> {

@@ -113,13 +113,17 @@ const DOCUMENT_LIMITS: Limits = Limits {
 };
 
 /// What LibreOffice reads besides programs and libraries: its settings,
-/// which Debian keeps in `/etc`, the fonts, and random numbers, without
-/// which it stops.
-const DOCUMENT_READS: [&str; 4] = [
+/// which Debian keeps in `/etc`, the fonts, random numbers, without which it
+/// stops, and the list of accounts, which has no passwords. The service
+/// can't make memory both writable and runnable, so LibreOffice maps a file
+/// in its home folder twice instead, and it finds its home folder through
+/// the list. Without it, it tries `/tmp`, which it can't write to, and stops.
+const DOCUMENT_READS: [&str; 5] = [
     "/etc/libreoffice",
     "/etc/fonts",
     "/var/cache/fontconfig",
     "/dev/urandom",
+    "/etc/passwd",
 ];
 
 /// Where LibreOffice makes the socket it checks for another copy of itself

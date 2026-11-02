@@ -14,7 +14,8 @@
 //!   needs a local socket of its own, as LibreOffice does, can make one and
 //!   listen on it, but never connect.
 //! - Resource limits cap its writable memory and CPU time, and it runs at
-//!   low priority.
+//!   low priority. It can't make memory both writable and runnable, as the
+//!   service can't.
 //!
 //! The server's side, [`Sandbox::run`], gives it an empty environment except
 //! for what the job sets, stops it when it runs too long or writes too much,

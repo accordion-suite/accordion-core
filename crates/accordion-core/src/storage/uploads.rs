@@ -1,7 +1,7 @@
 //! Resumable uploads, for large files over connections that can drop.
 //!
-//! An upload starts with its size, which counts toward the owner's quota
-//! until it finishes, so two big uploads can't both squeeze into the last of
+//! An upload starts with its size, which counts toward the quota of the
+//! person whose storage it goes into until it finishes, so two big uploads can't both squeeze into the last of
 //! the space. Its contents collect in `uploads/<id>.upload`, flushed to disk
 //! after every piece, so the file's length is always how much has safely
 //! arrived. A client that loses its connection asks how much arrived and
@@ -23,7 +23,11 @@ use crate::sql_now;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Upload {
     pub id: UploadId,
+    /// Whose storage it goes into.
     pub owner: UserId,
+    /// Who's sending it: the owner, or an editor of a folder the owner
+    /// shared.
+    pub started_by: UserId,
     /// The whole file's size, given when the upload started.
     pub size: u64,
     /// How much has safely arrived. The next piece starts here.
@@ -44,11 +48,27 @@ impl Storage {
     /// Starts an upload of `size` bytes for `owner`, if it fits in their
     /// quota.
     pub async fn start_upload(&self, owner: UserId, size: u64) -> Result<Upload, Error> {
-        self.inner
-            .identity
-            .user(owner)
-            .await?
-            .ok_or(Error::UserNotFound)?;
+        self.start_upload_by(owner, owner, size).await
+    }
+
+    /// Starts an upload of `size` bytes into `owner`'s storage, sent by
+    /// `started_by`, such as an editor of a folder `owner` shared. It counts
+    /// toward `owner`'s quota, and can only finish in their storage.
+    pub async fn start_upload_by(
+        &self,
+        owner: UserId,
+        started_by: UserId,
+        size: u64,
+    ) -> Result<Upload, Error> {
+        for user in [owner, started_by] {
+            self.inner
+                .identity
+                .user(user)
+                .await?
+                .ok_or(Error::UserNotFound)?;
+        }
+        // NULL when the owner sends it, as every upload did before sharing.
+        let started_by = (started_by != owner).then_some(started_by);
         let id = UploadId::generate();
         let path = self.inner.blobs.upload_path(id);
         tokio::fs::File::create(&path).await?;
@@ -60,14 +80,20 @@ impl Storage {
                 check_space(tx, owner, size, None)?;
                 tx.execute(
                     concat!(
-                        "INSERT INTO storage_uploads (id, owner_id, size, created_at, updated_at)
-                         VALUES (?1, ?2, ?3, ",
+                        "INSERT INTO storage_uploads
+                         (id, owner_id, started_by, size, created_at, updated_at)
+                         VALUES (?1, ?2, ?3, ?4, ",
                         sql_now!(),
                         ", ",
                         sql_now!(),
                         ")"
                     ),
-                    (id.as_uuid(), owner.as_uuid(), to_sql_size(size)),
+                    (
+                        id.as_uuid(),
+                        owner.as_uuid(),
+                        started_by.map(|user| user.as_uuid()),
+                        to_sql_size(size),
+                    ),
                 )?;
                 Ok(())
             })
@@ -86,15 +112,17 @@ impl Storage {
             .db
             .read(move |conn| {
                 conn.query_row(
-                    "SELECT owner_id, size, created_at FROM storage_uploads WHERE id = ?1",
+                    "SELECT owner_id, coalesce(started_by, owner_id), size, created_at
+                     FROM storage_uploads WHERE id = ?1",
                     [id.as_uuid()],
                     |row| {
                         Ok(Upload {
                             id,
                             owner: UserId::from_uuid(row.get(0)?),
-                            size: size_from(row, 1)?,
+                            started_by: UserId::from_uuid(row.get(1)?),
+                            size: size_from(row, 2)?,
                             received: 0,
-                            created_at: row.get(2)?,
+                            created_at: row.get(3)?,
                         })
                     },
                 )

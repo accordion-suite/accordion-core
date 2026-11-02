@@ -14,14 +14,19 @@
 //! contents nothing uses, and rehashes stored files to find damage.
 //!
 //! Drive, Docs, Notes, Photos, and Takeout import all store files here,
-//! through this API. Who may open what is up to them.
+//! through this API. Each item belongs to the owner of its folder tree, and
+//! owners can share items with other people ([`Storage::share`]). Every
+//! module asks [`Storage::access`] before it shows or changes an item, so
+//! sharing works the same way everywhere. See decision 16.
 
 pub mod blobs;
+mod shares;
 mod upkeep;
 mod uploads;
 mod view;
 
 pub use blobs::{Blob, ContentHash, Problem};
+pub use shares::{Access, Share, ShareEvent, ShareLevel, Shared};
 pub use upkeep::{Checked, Cleaned, Damage, Purged, Retention, StorageStatus};
 pub use uploads::Upload;
 
@@ -138,6 +143,40 @@ static MIGRATIONS: &[Migration] = &[
         CREATE INDEX storage_blob_refs_blob ON storage_blob_refs (blob);
     ",
     },
+    Migration {
+        version: 3,
+        name: "Add sharing",
+        sql: "
+        -- Who else may open an item, and everything inside it.
+        CREATE TABLE storage_shares (
+            item_id BLOB NOT NULL REFERENCES storage_items (id) ON DELETE CASCADE,
+            user_id BLOB NOT NULL REFERENCES identity_users (id) ON DELETE CASCADE,
+            level TEXT NOT NULL CHECK (level IN ('viewer', 'editor')),
+            -- Not a reference, so the record outlives the account.
+            shared_by BLOB NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (item_id, user_id)
+        ) STRICT, WITHOUT ROWID;
+        CREATE INDEX storage_shares_user ON storage_shares (user_id);
+
+        -- Every share, change, and removal, for the audit log. Rows stay
+        -- after the item and the people are gone.
+        CREATE TABLE storage_share_events (
+            id INTEGER PRIMARY KEY,
+            at TEXT NOT NULL,
+            item_id BLOB NOT NULL,
+            user_id BLOB NOT NULL,
+            -- NULL when the share was removed.
+            level TEXT CHECK (level IN ('viewer', 'editor')),
+            by_id BLOB NOT NULL
+        ) STRICT;
+        CREATE INDEX storage_share_events_item ON storage_share_events (item_id);
+
+        -- Who's sending an upload into someone else's storage, such as an
+        -- editor of a shared folder. NULL when it's the owner.
+        ALTER TABLE storage_uploads ADD COLUMN started_by BLOB;
+    ",
+    },
 ];
 
 /// The longest name, in bytes of UTF-8. Most file systems allow 255, so the
@@ -196,6 +235,12 @@ pub enum Error {
 
     #[error("Someone's files can't be given to themselves. Choose someone else.")]
     GiveToSelf,
+
+    #[error("They own it already, so it can't be shared with them. Choose someone else.")]
+    ShareWithOwner,
+
+    #[error("A whole Drive can't be shared. Share a folder inside it instead.")]
+    ShareTopFolder,
 
     #[error(
         "That upload doesn't exist. It may have finished, been canceled, or been removed after \
@@ -533,26 +578,32 @@ impl Storage {
             .await
     }
 
-    /// `owner`'s files outside the trash, most recently changed first.
-    pub async fn recent(&self, owner: UserId, limit: usize) -> Result<Vec<Found>, Error> {
+    /// `user`'s files outside the trash, and files in what others shared
+    /// with them, most recently changed first.
+    pub async fn recent(&self, user: UserId, limit: usize) -> Result<Vec<Found>, Error> {
         self.inner
             .db
             .read(move |conn| {
                 let mut statement = conn.prepare(&format!(
                     "{FOUND_SELECT} WHERE i.kind = 'file' ORDER BY i.modified_at DESC, i.name LIMIT ?2"
                 ))?;
-                let found = statement
-                    .query_map((owner.as_uuid(), limit as i64), found_from_row)?
-                    .collect::<Result<_, _>>()?;
-                Ok(found)
+                let mut found = Vec::new();
+                for root in shares::roots(conn, user)? {
+                    let rows = statement.query_map((root.as_uuid(), limit as i64), found_from_row)?;
+                    for row in rows {
+                        found.push(row?);
+                    }
+                }
+                Ok(newest_first(found, limit))
             })
             .await
     }
 
-    /// `owner`'s items outside the trash that match `search`, most recently
-    /// changed first. Names are matched in Rust, because SQLite only ignores
-    /// case for ASCII, and names are in every language.
-    pub async fn search(&self, owner: UserId, search: Search) -> Result<Vec<Found>, Error> {
+    /// `user`'s items outside the trash, and items in what others shared
+    /// with them, that match `search`, most recently changed first. Names
+    /// are matched in Rust, because SQLite only ignores case for ASCII, and
+    /// names are in every language.
+    pub async fn search(&self, user: UserId, search: Search) -> Result<Vec<Found>, Error> {
         self.inner
             .db
             .read(move |conn| {
@@ -569,34 +620,40 @@ impl Storage {
                        AND (?3 IS NULL OR i.modified_at < ?3)
                      ORDER BY i.modified_at DESC, i.name"
                 ))?;
-                let rows = statement.query_map(
-                    (
-                        owner.as_uuid(),
-                        &search.modified_since,
-                        &search.modified_before,
-                    ),
-                    found_from_row,
-                )?;
                 let mut found = Vec::new();
-                for row in rows {
-                    let row = row?;
-                    let name = row.item.name.to_lowercase();
-                    let extension_matches = match &search.only {
-                        Some(Only::Extensions(extensions)) => {
-                            name.rsplit_once('.').is_some_and(|(stem, ext)| {
-                                !stem.is_empty() && extensions.iter().any(|e| e == ext)
-                            })
-                        }
-                        _ => true,
-                    };
-                    if name.contains(&text) && extension_matches {
-                        found.push(row);
-                        if found.len() == search.limit {
-                            break;
+                for root in shares::roots(conn, user)? {
+                    let rows = statement.query_map(
+                        (
+                            root.as_uuid(),
+                            &search.modified_since,
+                            &search.modified_before,
+                        ),
+                        found_from_row,
+                    )?;
+                    // Each root's matches come newest first, so the newest
+                    // overall are among each root's first `limit`.
+                    let mut matched = 0;
+                    for row in rows {
+                        let row = row?;
+                        let name = row.item.name.to_lowercase();
+                        let extension_matches = match &search.only {
+                            Some(Only::Extensions(extensions)) => {
+                                name.rsplit_once('.').is_some_and(|(stem, ext)| {
+                                    !stem.is_empty() && extensions.iter().any(|e| e == ext)
+                                })
+                            }
+                            _ => true,
+                        };
+                        if name.contains(&text) && extension_matches {
+                            found.push(row);
+                            matched += 1;
+                            if matched == search.limit {
+                                break;
+                            }
                         }
                     }
                 }
-                Ok(found)
+                Ok(newest_first(found, search.limit))
             })
             .await
     }
@@ -873,8 +930,9 @@ impl Storage {
 
     /// Copies a file's current version into `parent` as a new file named
     /// `name`. The copy shares the stored contents, but counts toward the
-    /// owner's quota like any other file. Folders can't be copied, as in
-    /// Google Drive.
+    /// quota of `parent`'s owner like any other file, which is how someone
+    /// keeps their own copy of a file shared with them. Folders can't be
+    /// copied, as in Google Drive.
     pub async fn copy_file(&self, id: ItemId, parent: ItemId, name: &str) -> Result<Item, Error> {
         let name = check_name(name)?;
         let _changes = self.inner.changes.lock().await;
@@ -891,9 +949,6 @@ impl Storage {
                     return Err(Error::InTrash);
                 }
                 let parent = writable_folder(tx, parent)?;
-                if parent.owner != original.owner {
-                    return Err(Error::DifferentOwner);
-                }
                 if let Some(other) = child_named(tx, parent.id, &name)? {
                     return Err(other.name_taken());
                 }
@@ -1092,8 +1147,9 @@ impl Storage {
     }
 
     /// Takes everything `owner` has out of storage, so their account can be
-    /// deleted: their files and trash, their quota, and their uploads in
-    /// progress. Returns the folder their files went into, if they were
+    /// deleted: their files and trash, their quota, their uploads in
+    /// progress, and what others shared with them. What they shared stays
+    /// shared, now from whoever gets their files. Returns the folder their files went into, if they were
     /// given to someone and had any.
     ///
     /// Turn the account off first, so nothing new arrives while this runs.
@@ -1123,12 +1179,14 @@ impl Storage {
             .inner
             .db
             .read(move |conn| {
-                conn.prepare("SELECT id FROM storage_uploads WHERE owner_id = ?1")?
-                    .query_map([owner.as_uuid()], |row| {
-                        Ok(UploadId::from_uuid(row.get(0)?))
-                    })?
-                    .collect::<Result<_, _>>()
-                    .map_err(Error::from)
+                conn.prepare(
+                    "SELECT id FROM storage_uploads WHERE owner_id = ?1 OR started_by = ?1",
+                )?
+                .query_map([owner.as_uuid()], |row| {
+                    Ok(UploadId::from_uuid(row.get(0)?))
+                })?
+                .collect::<Result<_, _>>()
+                .map_err(Error::from)
             })
             .await?;
         for id in uploads {
@@ -1165,6 +1223,13 @@ impl Storage {
                             "UPDATE storage_items SET owner_id = ?2 WHERE owner_id = ?1",
                             (owner.as_uuid(), to.as_uuid()),
                         )?;
+                        // What they shared with the new owner is the new
+                        // owner's own now.
+                        tx.execute(
+                            "DELETE FROM storage_shares WHERE user_id = ?1 AND item_id IN
+                                 (SELECT id FROM storage_items WHERE owner_id = ?1)",
+                            [to.as_uuid()],
+                        )?;
                         folder = Some(item_or_missing(tx, id)?);
                     }
                     (Some(top), None) => delete_subtree(tx, top)?,
@@ -1172,6 +1237,10 @@ impl Storage {
                 }
                 tx.execute(
                     "DELETE FROM storage_quotas WHERE owner_id = ?1",
+                    [owner.as_uuid()],
+                )?;
+                tx.execute(
+                    "DELETE FROM storage_shares WHERE user_id = ?1",
                     [owner.as_uuid()],
                 )?;
                 Ok::<_, Error>(folder)
@@ -1456,16 +1525,20 @@ macro_rules! item_select {
 
 const ITEM_SELECT: &str = item_select!("", "", "storage_items i");
 
-/// Selects the user `?1`'s items outside the trash, for [`found_from_row`].
-/// `live` walks down from their top folder, skipping deleted items, so it
-/// leaves out what's inside a deleted folder too. It carries each item's
-/// path, its folder names joined by "/", which names can't contain, and the
-/// path of the folder it's in: null for the top folder, and empty for
-/// what's in it.
+/// Selects the items outside the trash under `?1`, for [`found_from_row`]:
+/// someone's top folder, or a folder or file shared with them. `live` walks
+/// down from it, skipping deleted items, so it leaves out what's inside a
+/// deleted folder too. It carries each item's path, its folder names joined
+/// by "/", which names can't contain, and the path of the folder it's in:
+/// null for a top folder, and empty for what's in it. A shared item is the
+/// first folder in its own path, so what's inside it says where it is from
+/// there.
 const FOUND_SELECT: &str = item_select!(
     "
     WITH RECURSIVE live (id, path, inside) AS (
-        SELECT id, '', NULL FROM storage_items WHERE owner_id = ?1 AND parent_id IS NULL
+        SELECT id, CASE WHEN parent_id IS NULL THEN '' ELSE name END,
+               CASE WHEN parent_id IS NULL THEN NULL ELSE '' END
+        FROM storage_items WHERE id = ?1
         UNION ALL
         SELECT i.id, CASE live.path WHEN '' THEN i.name ELSE live.path || '/' || i.name END,
                live.path
@@ -1475,6 +1548,44 @@ const FOUND_SELECT: &str = item_select!(
     ", l.inside",
     "live l JOIN storage_items i ON i.id = l.id"
 );
+
+/// Shares joined to their items, for [`item_from_row`], with the share's
+/// columns from index 11 (see `shares::share_from_row`).
+const SHARED_SELECT: &str = item_select!(
+    "",
+    ", s.item_id, s.user_id, s.level, s.shared_by, s.created_at",
+    "storage_shares s JOIN storage_items i ON i.id = s.item_id"
+);
+
+/// The first `limit` of `found`, newest first. An item reached from more
+/// than one root, such as a folder shared on its own and inside a shared
+/// folder, appears once, with the longest path.
+fn newest_first(mut found: Vec<Found>, limit: usize) -> Vec<Found> {
+    let mut longest: HashMap<ItemId, usize> = HashMap::new();
+    for found in &found {
+        let len = longest.entry(found.item.id).or_default();
+        *len = (*len).max(found.folders.len() + 1);
+    }
+    found.retain(|found| {
+        let len = found.folders.len() + 1;
+        match longest.get_mut(&found.item.id) {
+            Some(longest) if *longest == len => {
+                // Taken, so a second copy at the same length is dropped.
+                *longest = 0;
+                true
+            }
+            _ => false,
+        }
+    });
+    found.sort_by(|a, b| {
+        b.item
+            .modified_at
+            .cmp(&a.item.modified_at)
+            .then_with(|| a.item.name.cmp(&b.item.name))
+    });
+    found.truncate(limit);
+    found
+}
 
 fn found_from_row(row: &Row<'_>) -> rusqlite::Result<Found> {
     let inside: Option<String> = row.get(11)?;

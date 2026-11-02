@@ -788,13 +788,17 @@ async fn copies_a_file() {
         .await
         .unwrap_err();
     assert!(matches!(folder, Error::NotAFile));
+    // Someone keeping their own copy of a file shared with them. It counts
+    // toward their quota, not the original owner's.
     let sams = server.storage.top_folder(sam).await.unwrap();
     let theirs = server
         .storage
         .copy_file(beach.id, sams, "Beach.jpg")
         .await
-        .unwrap_err();
-    assert!(matches!(theirs, Error::DifferentOwner));
+        .unwrap();
+    assert_eq!(theirs.owner, sam);
+    assert_eq!(server.storage.usage(sam).await.unwrap().used, 4);
+    assert_eq!(server.storage.usage(alex).await.unwrap().used, 8);
     server.storage.set_quota(alex, Some(10)).await.unwrap();
     let full = server
         .storage

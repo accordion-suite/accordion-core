@@ -846,3 +846,72 @@ async fn finds_live_items_by_id() {
         .unwrap();
     assert_eq!(names(&found), ["Trip/Day 1/a.jpg", "Trip"]);
 }
+
+#[tokio::test]
+async fn sizes_folders_and_lists_the_largest_files() {
+    let server = start().await;
+    let alex = server.user("alex").await;
+    let sam = server.user("sam").await;
+    let top = server.storage.top_folder(alex).await.unwrap();
+    let trip = server.storage.create_folder(top, "Trip").await.unwrap();
+    let day = server
+        .storage
+        .create_folder(trip.id, "Day 1")
+        .await
+        .unwrap();
+    let empty = server.storage.create_folder(top, "Empty").await.unwrap();
+    server
+        .storage
+        .write_file(top, "notes.txt", &[0u8; 10][..])
+        .await
+        .unwrap();
+    server
+        .storage
+        .write_file(trip.id, "map.png", &[1u8; 300][..])
+        .await
+        .unwrap();
+    server
+        .storage
+        .write_file(day.id, "beach.jpg", &[2u8; 2000][..])
+        .await
+        .unwrap();
+    // Only the current version counts, as the list shows.
+    server
+        .storage
+        .write_file(day.id, "beach.jpg", &[3u8; 1000][..])
+        .await
+        .unwrap();
+    // The trash doesn't.
+    let old = server
+        .storage
+        .write_file(trip.id, "old.mov", &[4u8; 5000][..])
+        .await
+        .unwrap();
+    server.storage.delete(old.id).await.unwrap();
+    // Nor do other people's files.
+    let sams = server.storage.top_folder(sam).await.unwrap();
+    server
+        .storage
+        .write_file(sams, "huge.iso", &[5u8; 9000][..])
+        .await
+        .unwrap();
+
+    let sizes = server
+        .storage
+        .folder_sizes(vec![trip.id, day.id, empty.id])
+        .await
+        .unwrap();
+    assert_eq!(sizes[&trip.id], 1300);
+    assert_eq!(sizes[&day.id], 1000);
+    assert_eq!(sizes[&empty.id], 0);
+
+    let largest = server.storage.largest(alex, 10).await.unwrap();
+    assert_eq!(
+        names(&largest),
+        ["Trip/Day 1/beach.jpg", "Trip/map.png", "notes.txt"]
+    );
+    assert_eq!(
+        names(&server.storage.largest(alex, 1).await.unwrap()),
+        ["Trip/Day 1/beach.jpg"]
+    );
+}

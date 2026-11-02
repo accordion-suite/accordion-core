@@ -599,6 +599,62 @@ impl Storage {
             .await
     }
 
+    /// `owner`'s largest files outside the trash, largest first, for
+    /// finding what takes their space. Each counts its current version.
+    pub async fn largest(&self, owner: UserId, limit: usize) -> Result<Vec<Found>, Error> {
+        self.inner
+            .db
+            .read(move |conn| {
+                let Some(top) = conn
+                    .query_row(
+                        "SELECT id FROM storage_items WHERE owner_id = ?1 AND parent_id IS NULL",
+                        [owner.as_uuid()],
+                        |row| row.get::<_, uuid::Uuid>(0),
+                    )
+                    .optional()?
+                else {
+                    return Ok(Vec::new());
+                };
+                let mut statement = conn.prepare(&format!(
+                    "{FOUND_SELECT} WHERE i.kind = 'file' ORDER BY b.size DESC, i.name LIMIT ?2"
+                ))?;
+                let found = statement
+                    .query_map((top, limit as i64), found_from_row)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(found)
+            })
+            .await
+    }
+
+    /// How much each folder in `folders` holds: the current version of
+    /// every file inside it, however deep, leaving out the trash.
+    pub async fn folder_sizes(&self, folders: Vec<ItemId>) -> Result<HashMap<ItemId, u64>, Error> {
+        self.inner
+            .db
+            .read(move |conn| {
+                let mut statement = conn.prepare(
+                    "WITH RECURSIVE inside (id) AS (
+                         SELECT ?1
+                         UNION ALL
+                         SELECT i.id FROM storage_items i JOIN inside ON i.parent_id = inside.id
+                         WHERE i.trashed_at IS NULL
+                     )
+                     SELECT coalesce(sum(b.size), 0) FROM inside
+                     JOIN storage_versions v ON v.item_id = inside.id
+                         AND v.number = (SELECT max(number) FROM storage_versions
+                                         WHERE item_id = inside.id)
+                     JOIN storage_blobs b ON b.hash = v.blob",
+                )?;
+                let mut sizes = HashMap::new();
+                for folder in folders {
+                    let size = statement.query_row([folder.as_uuid()], |row| size_from(row, 0))?;
+                    sizes.insert(folder, size);
+                }
+                Ok(sizes)
+            })
+            .await
+    }
+
     /// `user`'s items outside the trash, and items in what others shared
     /// with them, that match `search`, most recently changed first. Names
     /// are matched in Rust, because SQLite only ignores case for ASCII, and

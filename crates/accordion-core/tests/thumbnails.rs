@@ -1,6 +1,7 @@
 //! Makes thumbnails with the real programs in the sandbox. The tests need
 //! libvips (libvips-tools, with libheif's AV1 encoder for test images),
-//! poppler-utils, ffmpeg, and a kernel with Landlock, as CI has.
+//! poppler-utils, ffmpeg, LibreOffice's Writer, Calc, and Impress, and a
+//! kernel with Landlock, as CI has.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -9,7 +10,7 @@ use std::time::Duration;
 use accordion_core::db::Database;
 use accordion_core::identity::{Identity, NewUser};
 use accordion_core::storage::{ContentHash, ItemKind, Storage};
-use accordion_core::thumbnails::{ThumbnailKind, Thumbnails, Tools};
+use accordion_core::thumbnails::{PREVIEW_PAGES, ThumbnailKind, Thumbnails, Tools};
 use accordion_types::{ItemId, Role};
 
 struct Server {
@@ -97,6 +98,87 @@ impl Server {
         assert!(made.success(), "ffmpeg couldn't make {name}");
         std::fs::read(path).unwrap()
     }
+
+    /// Makes a document with LibreOffice, outside the sandbox, from
+    /// `source`, a file LibreOffice reads, such as "letter.fodt". `to` is
+    /// the extension to save as, such as "docx".
+    fn document(&self, source: &str, contents: &str, to: &str) -> Vec<u8> {
+        let dir = self.dir.path().join("documents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(source), contents).unwrap();
+        let profile = format!(
+            "-env:UserInstallation=file://{}",
+            self.dir.path().join("libreoffice").display()
+        );
+        let made = Command::new("soffice")
+            .args([&profile, "--headless", "--norestore", "--convert-to", to])
+            .arg("--outdir")
+            .arg(&dir)
+            .arg(dir.join(source))
+            .output()
+            .unwrap();
+        let (stem, _) = source.rsplit_once('.').unwrap();
+        let path = dir.join(format!("{stem}.{to}"));
+        assert!(
+            made.status.success() && path.is_file(),
+            "LibreOffice couldn't make {stem}.{to}: {}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        std::fs::read(path).unwrap()
+    }
+}
+
+/// A two-page letter, as a flat OpenDocument file LibreOffice reads.
+const LETTER: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+  xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+  xmlns:fo="urn:oasis:names:tc:opendocument:xmlns:xsl-fo-compatible:1.0"
+  xmlns:style="urn:oasis:names:tc:opendocument:xmlns:style:1.0"
+  office:version="1.3" office:mimetype="application/vnd.oasis.opendocument.text">
+ <office:automatic-styles>
+  <style:style style:name="P1" style:family="paragraph">
+   <style:paragraph-properties fo:break-before="page"/>
+  </style:style>
+ </office:automatic-styles>
+ <office:body><office:text>
+  <text:h text:outline-level="1">Dear Sam</text:h>
+  <text:p>The garden needs watering on Tuesdays.</text:p>
+  <text:p text:style-name="P1">Love, Alex</text:p>
+ </office:text></office:body>
+</office:document>"#;
+
+/// Two slides, as a flat OpenDocument file LibreOffice reads.
+const SLIDES: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<office:document xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0"
+  xmlns:draw="urn:oasis:names:tc:opendocument:xmlns:drawing:1.0"
+  xmlns:text="urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+  xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0"
+  office:version="1.3" office:mimetype="application/vnd.oasis.opendocument.presentation">
+ <office:body><office:presentation>
+  <draw:page draw:name="One">
+   <draw:frame svg:x="2cm" svg:y="2cm" svg:width="20cm" svg:height="3cm">
+    <draw:text-box><text:p>Family trip</text:p></draw:text-box>
+   </draw:frame>
+  </draw:page>
+  <draw:page draw:name="Two">
+   <draw:frame svg:x="2cm" svg:y="2cm" svg:width="20cm" svg:height="3cm">
+    <draw:text-box><text:p>The lake</text:p></draw:text-box>
+   </draw:frame>
+  </draw:page>
+ </office:presentation></office:body>
+</office:document>"#;
+
+/// How many pages a PDF has, from poppler.
+fn pages(pdf: &Path) -> u32 {
+    let output = Command::new("pdfinfo").arg(pdf).output().unwrap();
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("Pages:"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
 }
 
 /// Starts the background worker, and returns how to stop it.
@@ -594,6 +676,120 @@ async fn shows_videos_once_ffmpeg_is_installed() {
     })
     .await
     .expect("the worker should try the video again");
+    stop.send(()).unwrap();
+    worker.await.unwrap();
+}
+
+#[tokio::test]
+async fn shows_the_first_page_of_each_kind_of_document() {
+    let server = start().await;
+    let budget = "Month,Food,Rent\nJanuary,420,1200\nFebruary,395,1200\n";
+    for (source, contents, formats) in [
+        (
+            "letter.fodt",
+            LETTER,
+            ["docx", "doc", "odt", "rtf"].as_slice(),
+        ),
+        ("budget.csv", budget, &["xlsx", "xls", "ods"]),
+        ("slides.fodp", SLIDES, &["pptx", "ppt", "odp"]),
+    ] {
+        for to in formats {
+            let (stem, _) = source.rsplit_once('.').unwrap();
+            let name = format!("{stem}.{to}");
+            let hash = server
+                .save(&name, &server.document(source, contents, to))
+                .await;
+            assert!(server.thumbnails.make_now(hash).await.unwrap(), "{name}");
+            let (width, height, _) = describe(&thumbnail(&server, hash));
+            assert!(width.max(height) <= 480, "{name}: {width}x{height}");
+            let preview = server.thumbnails.preview(hash).expect(&name);
+            assert!(!preview.partial, "{name}");
+            let expected = if stem == "budget" { 1 } else { 2 };
+            assert_eq!(pages(&preview.path), expected, "{name}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn stops_a_long_spreadsheets_preview_at_50_pages() {
+    let server = start().await;
+    let rows: String = (1..=5000)
+        .map(|row| format!("{row},Groceries,{}\n", row % 97))
+        .collect();
+    let hash = server
+        .save("ledger.xlsx", &server.document("ledger.csv", &rows, "xlsx"))
+        .await;
+    assert!(server.thumbnails.make_now(hash).await.unwrap());
+    let preview = server.thumbnails.preview(hash).unwrap();
+    assert!(preview.partial);
+    assert_eq!(pages(&preview.path), PREVIEW_PAGES);
+}
+
+#[tokio::test]
+async fn reads_a_document_only_as_what_its_name_says() {
+    let server = start().await;
+    // An OpenDocument file named as Word's is read only as Word's, which
+    // fails.
+    let odt = server.document("letter.fodt", LETTER, "odt");
+    let hash = server.save("letter.docx", &odt).await;
+    assert!(!server.thumbnails.make_now(hash).await.unwrap());
+    assert!(server.thumbnails.preview(hash).is_none());
+
+    // A web page named as a document never reaches LibreOffice, and shows
+    // as text, as it is.
+    let hash = server
+        .save("invoice.docx", b"<html><body>Pay now</body></html>")
+        .await;
+    assert!(server.thumbnails.make_now(hash).await.unwrap());
+    assert_eq!(
+        server.thumbnails.find(hash).unwrap().kind,
+        ThumbnailKind::Text
+    );
+    assert!(server.thumbnails.preview(hash).is_none());
+}
+
+#[tokio::test]
+async fn shows_documents_once_libreoffice_is_installed() {
+    let server = start_with(|tools| Tools {
+        soffice: "/nonexistent/soffice.bin".into(),
+        ..tools
+    })
+    .await;
+    let reason = server
+        .thumbnails
+        .status()
+        .borrow()
+        .documents
+        .clone()
+        .unwrap();
+    assert!(reason.contains("LibreOffice"), "{reason}");
+    let hash = server
+        .save(
+            "letter.docx",
+            &server.document("letter.fodt", LETTER, "docx"),
+        )
+        .await;
+    assert!(!server.thumbnails.make_now(hash).await.unwrap());
+
+    // As if the admin installed it: the same data, with LibreOffice.
+    let thumbnails = Thumbnails::open(
+        server.db.clone(),
+        server.storage.clone(),
+        server.dir.path(),
+        Tools::installed(env!("CARGO_BIN_EXE_accordion-core-sandbox")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(thumbnails.status().borrow().documents, None);
+    let (stop, worker) = start_worker(&thumbnails);
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while thumbnails.preview(hash).is_none() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the worker should try the document again");
+    assert!(thumbnails.find(hash).is_some());
     stop.send(()).unwrap();
     worker.await.unwrap();
 }

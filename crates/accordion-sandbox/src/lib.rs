@@ -7,9 +7,12 @@
 //! every limit:
 //!
 //! - Landlock lets it read only the folders it's given, such as `/usr`, run
-//!   only its own program, write nowhere, and make no TCP connections.
-//! - A seccomp filter refuses network sockets, tracing, namespaces,
-//!   signals to other processes, and io_uring, which seccomp can't see into.
+//!   only its own program, write only in a scratch folder it's given, if
+//!   any, and make no TCP connections.
+//! - A seccomp filter refuses sockets, tracing, namespaces, signals to other
+//!   processes, and io_uring, which seccomp can't see into. A worker that
+//!   needs a local socket of its own, as LibreOffice does, can make one and
+//!   listen on it, but never connect.
 //! - Resource limits cap its writable memory and CPU time, and it runs at
 //!   low priority.
 //!
@@ -34,8 +37,8 @@ pub fn main() -> ! {
     let mut args = std::env::args_os().skip(1);
     if args.next().is_none_or(|command| command != "sandbox") {
         eprintln!(
-            "Usage: {} sandbox --memory <bytes> --cpu <seconds> [--read <path>]... -- <program> \
-             [<argument>]...",
+            "Usage: {} sandbox --memory <bytes> --cpu <seconds> [--read <path>]... [--write \
+             <folder>]... [--sockets <folder>] -- <program> [<argument>]...",
             std::env::args().next().unwrap_or_default()
         );
         std::process::exit(2);

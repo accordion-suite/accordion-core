@@ -1,7 +1,7 @@
-//! Thumbnails: a small picture of each photo, PDF, and video that's stored,
-//! and the first lines of each text file, for Drive's grid now and Photos,
-//! Mail, and Docs later (decisions 14 and 15 in the `accordion` repo's
-//! `docs/decisions`).
+//! Thumbnails: a small picture of each photo, PDF, video, and Office
+//! document that's stored, and the first lines of each text file, for
+//! Drive's grid now and Photos, Mail, and Docs later (decisions 14, 15, and
+//! 17 in the `accordion` repo's `docs/decisions`).
 //!
 //! A picture is a WebP, at most 480 pixels on its longer side. Text is the
 //! file's first lines as UTF-8, which apps draw themselves, so it follows
@@ -14,12 +14,17 @@
 //! [`Thumbnails::run`] makes them in the background, one at a time, newest
 //! files first. The decoding happens in a sandboxed worker
 //! ([`accordion_sandbox`]): libvips for images, poppler's `pdftoppm` for a
-//! PDF's first page, and ffmpeg for a frame from a video. ffmpeg is optional:
-//! without it, videos have none, and they get another try once it's
+//! PDF's first page, ffmpeg for a frame from a video, and LibreOffice for an
+//! Office document. ffmpeg and LibreOffice are optional: without them,
+//! videos and documents have none, and they get another try once they're
 //! installed. The server only reads a file's first bytes, to decide
 //! whether there's anything to decode, and to take a text file's first lines,
 //! which needs no decoder. Thumbnails keep no metadata from the file, such as
 //! where a photo was taken.
+//!
+//! LibreOffice turns each document into a PDF of its first pages, which is
+//! the document's preview, kept beside its thumbnail. The thumbnail is the
+//! PDF's first page.
 //!
 //! A file that fails isn't tried again until [`WORKER`] changes, such as
 //! when an update makes thumbnails of more kinds of file.
@@ -31,7 +36,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use accordion_sandbox::{Job, Limits, Sandbox};
-use rusqlite::Row;
+use rusqlite::{OptionalExtension, Row};
 use tokio::sync::watch;
 
 use crate::db::{self, Database, Migration};
@@ -65,7 +70,7 @@ static MIGRATIONS: &[Migration] = &[Migration {
 
 /// The version of what makes thumbnails. Raise it when it can make
 /// thumbnails of files it couldn't before, so they get another try.
-pub const WORKER: u32 = 3;
+pub const WORKER: u32 = 4;
 
 /// The longer side of a thumbnail, in pixels.
 const SIZE: u32 = 480;
@@ -75,6 +80,13 @@ const MAX_FILE: u64 = 200 * 1024 * 1024;
 
 /// HEIC and AVIF files are decoded whole, so larger ones get no thumbnail.
 const MAX_HEIF_PIXELS: u64 = 24_000_000;
+
+/// Larger documents get no thumbnail. LibreOffice reads the whole file.
+const MAX_DOCUMENT: u64 = 100 * 1024 * 1024;
+
+/// The most pages a document's preview has, so a long spreadsheet can't
+/// make a huge PDF.
+pub const PREVIEW_PAGES: u32 = 50;
 
 /// How much of a file is read to tell what it is, and the most a text
 /// thumbnail keeps.
@@ -90,6 +102,42 @@ const LIMITS: Limits = Limits {
     time: Duration::from_secs(30),
     output: 10 * 1024 * 1024,
 };
+
+/// What LibreOffice may use for each document, which is more than other
+/// workers, for long documents on a Raspberry Pi.
+const DOCUMENT_LIMITS: Limits = Limits {
+    memory: 1024 * 1024 * 1024,
+    cpu: Duration::from_secs(60),
+    time: Duration::from_secs(90),
+    output: 1024 * 1024,
+};
+
+/// What LibreOffice reads besides programs and libraries: its settings,
+/// which Debian keeps in `/etc`, the fonts, and random numbers, without
+/// which it stops.
+const DOCUMENT_READS: [&str; 4] = [
+    "/etc/libreoffice",
+    "/etc/fonts",
+    "/var/cache/fontconfig",
+    "/dev/urandom",
+];
+
+/// Where LibreOffice makes the socket it checks for another copy of itself
+/// with. It's always here, whatever `TMPDIR` says. The service has its own,
+/// through systemd's `PrivateTmp`.
+const SOCKETS: &str = "/tmp";
+
+/// Settings for every document: macros never run, and nothing a document
+/// links to or embeds is fetched or updated. A conversion isn't meant to do
+/// either anyway, but these don't rely on that. Writer and Calc number their
+/// "never" differently.
+const DOCUMENT_SETTINGS: &str = r#"<item oor:path="/org.openoffice.Office.Common/Security/Scripting"><prop oor:name="MacroSecurityLevel" oor:op="fuse"><value>3</value></prop></item>
+<item oor:path="/org.openoffice.Office.Common/Security/Scripting"><prop oor:name="DisableMacrosExecution" oor:op="fuse"><value>true</value></prop></item>
+<item oor:path="/org.openoffice.Office.Common/Security/Scripting"><prop oor:name="DisableActiveContent" oor:op="fuse"><value>true</value></prop></item>
+<item oor:path="/org.openoffice.Office.Common/Security/Scripting"><prop oor:name="BlockUntrustedRefererLinks" oor:op="fuse"><value>true</value></prop></item>
+<item oor:path="/org.openoffice.Office.Writer/Content/Update"><prop oor:name="Link" oor:op="fuse"><value>2</value></prop></item>
+<item oor:path="/org.openoffice.Office.Calc/Content/Update"><prop oor:name="Link" oor:op="fuse"><value>1</value></prop></item>
+"#;
 
 /// The decoders ffmpeg may use for video: the codecs families' videos have.
 const VIDEO_DECODERS: &str = "h264,hevc,vp8,vp9,av1,libdav1d,mpeg4,mpeg2video,mjpeg,prores";
@@ -110,6 +158,10 @@ const TONE_MAP: &str = "zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,
 /// this reason get another try once it is.
 const NO_FFMPEG: &str = "ffmpeg isn't installed";
 
+/// Why a document has no thumbnail when LibreOffice isn't installed.
+/// Documents with this reason get another try once it is.
+const NO_OFFICE: &str = "LibreOffice isn't installed";
+
 /// How many waiting files each look at the database fetches.
 const BATCH: usize = 20;
 
@@ -125,9 +177,13 @@ pub struct Tools {
     pub vips: PathBuf,
     pub vipsheader: PathBuf,
     pub pdftoppm: PathBuf,
+    pub pdfinfo: PathBuf,
     /// Optional: without ffmpeg, videos have no thumbnails.
     pub ffmpeg: PathBuf,
     pub ffprobe: PathBuf,
+    /// LibreOffice's own program, rather than the `soffice` script that
+    /// starts it. Optional: without it, documents have no thumbnails.
+    pub soffice: PathBuf,
 }
 
 impl Tools {
@@ -139,13 +195,19 @@ impl Tools {
             vips: "/usr/bin/vips".into(),
             vipsheader: "/usr/bin/vipsheader".into(),
             pdftoppm: "/usr/bin/pdftoppm".into(),
+            pdfinfo: "/usr/bin/pdfinfo".into(),
             ffmpeg: "/usr/bin/ffmpeg".into(),
             ffprobe: "/usr/bin/ffprobe".into(),
+            soffice: "/usr/lib/libreoffice/program/soffice.bin".into(),
         }
     }
 
     fn has_ffmpeg(&self) -> bool {
         self.ffmpeg.is_file() && self.ffprobe.is_file()
+    }
+
+    fn has_office(&self) -> bool {
+        self.soffice.is_file()
     }
 }
 
@@ -182,6 +244,15 @@ impl ThumbnailKind {
     }
 }
 
+/// A document's preview: a PDF of its first pages.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Preview {
+    pub path: PathBuf,
+    /// Whether the PDF stops at [`PREVIEW_PAGES`], so the document may go
+    /// on past it.
+    pub partial: bool,
+}
+
 /// How thumbnails are doing, for the health page.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ThumbnailStatus {
@@ -189,6 +260,9 @@ pub struct ThumbnailStatus {
     pub unavailable: Option<String>,
     /// Why videos have no thumbnails, such as ffmpeg not being installed.
     pub videos: Option<String>,
+    /// Why Office documents have no thumbnails, such as LibreOffice not
+    /// being installed.
+    pub documents: Option<String>,
     /// Files waiting for a thumbnail.
     pub waiting: u64,
     /// Files the worker couldn't make a thumbnail of.
@@ -223,6 +297,10 @@ struct Inner {
     tools: Tools,
     sandbox: Sandbox,
     status: watch::Sender<ThumbnailStatus>,
+    /// LibreOffice's settings, made the first time a document needs them.
+    /// Holding the lock also keeps to one document at a time, so two large
+    /// ones can't use the memory together.
+    office: tokio::sync::Mutex<Option<tempfile::TempDir>>,
 }
 
 /// What became of one file.
@@ -244,6 +322,98 @@ enum Kind {
     Video(Container),
     /// UTF-8 text, such as notes, Markdown, CSV, or code.
     Text,
+    Document(&'static Format),
+}
+
+/// An Office format, with the one reader LibreOffice may use for it, so a
+/// disguised file can't reach its other readers.
+#[derive(Debug, PartialEq, Eq)]
+struct Format {
+    extension: &'static str,
+    /// How every file in the format starts.
+    signature: &'static [u8],
+    /// LibreOffice's reader.
+    filter: &'static str,
+    /// LibreOffice's PDF writer for that kind of document.
+    export: &'static str,
+}
+
+const ZIP: &[u8] = b"PK\x03\x04";
+/// Office 97–2003 files are in Microsoft's compound file format.
+const COMPOUND: &[u8] = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1";
+
+/// The Office formats families have. Apple's are left out, since
+/// LibreOffice reads only some of them.
+static FORMATS: [Format; 10] = [
+    Format {
+        extension: "docx",
+        signature: ZIP,
+        filter: "MS Word 2007 XML",
+        export: "writer_pdf_Export",
+    },
+    Format {
+        extension: "doc",
+        signature: COMPOUND,
+        filter: "MS Word 97",
+        export: "writer_pdf_Export",
+    },
+    Format {
+        extension: "odt",
+        signature: ZIP,
+        filter: "writer8",
+        export: "writer_pdf_Export",
+    },
+    Format {
+        extension: "rtf",
+        signature: b"{\\rtf",
+        filter: "Rich Text Format",
+        export: "writer_pdf_Export",
+    },
+    Format {
+        extension: "xlsx",
+        signature: ZIP,
+        filter: "Calc MS Excel 2007 XML",
+        export: "calc_pdf_Export",
+    },
+    Format {
+        extension: "xls",
+        signature: COMPOUND,
+        filter: "MS Excel 97",
+        export: "calc_pdf_Export",
+    },
+    Format {
+        extension: "ods",
+        signature: ZIP,
+        filter: "calc8",
+        export: "calc_pdf_Export",
+    },
+    Format {
+        extension: "pptx",
+        signature: ZIP,
+        filter: "Impress MS PowerPoint 2007 XML",
+        export: "impress_pdf_Export",
+    },
+    Format {
+        extension: "ppt",
+        signature: COMPOUND,
+        filter: "MS PowerPoint 97",
+        export: "impress_pdf_Export",
+    },
+    Format {
+        extension: "odp",
+        signature: ZIP,
+        filter: "impress8",
+        export: "impress_pdf_Export",
+    },
+];
+
+/// The Office format of a file named `name` that starts with `head`, if
+/// it's one families have and it starts the way the format does.
+fn format(name: &str, head: &[u8]) -> Option<&'static Format> {
+    let (_, extension) = name.rsplit_once('.')?;
+    FORMATS.iter().find(|format| {
+        extension.eq_ignore_ascii_case(format.extension) && head.starts_with(format.signature)
+    })
 }
 
 /// The video formats families have. ffmpeg reads each with only the one
@@ -293,9 +463,14 @@ impl Thumbnails {
         db.migrate(OWNER, MIGRATIONS).await?;
         let dir = data_dir.join("cache").join("thumbnails");
         std::fs::create_dir_all(dir.join("partial"))?;
-        // Thumbnails from a run that stopped partway.
+        // Thumbnails and scratch folders from a run that stopped partway.
         for entry in std::fs::read_dir(dir.join("partial"))? {
-            let _ = std::fs::remove_file(entry?.path());
+            let entry = entry?;
+            let _ = if entry.file_type()?.is_dir() {
+                std::fs::remove_dir_all(entry.path())
+            } else {
+                std::fs::remove_file(entry.path())
+            };
         }
         // A newer worker may manage what an older one couldn't.
         db.write(|tx| {
@@ -307,6 +482,7 @@ impl Thumbnails {
         .await?;
         let unavailable = unavailable(&tools);
         let videos = videos_unavailable(&tools);
+        let documents = documents_unavailable(&tools);
         if let Some(reason) = &unavailable {
             tracing::warn!("no thumbnails: {reason}");
         }
@@ -320,8 +496,10 @@ impl Thumbnails {
                 status: watch::Sender::new(ThumbnailStatus {
                     unavailable,
                     videos,
+                    documents,
                     ..ThumbnailStatus::default()
                 }),
+                office: tokio::sync::Mutex::new(None),
             }),
         })
     }
@@ -341,11 +519,30 @@ impl Thumbnails {
             .find(|thumbnail| thumbnail.path.is_file())
     }
 
+    /// The preview of the document with `hash`, if there is one yet.
+    pub fn preview(&self, hash: ContentHash) -> Option<Preview> {
+        [false, true]
+            .into_iter()
+            .map(|partial| Preview {
+                path: self.preview_path(hash, partial),
+                partial,
+            })
+            .find(|preview| preview.path.is_file())
+    }
+
     fn path(&self, hash: ContentHash, kind: ThumbnailKind) -> PathBuf {
+        self.cached(hash, kind.extension())
+    }
+
+    fn preview_path(&self, hash: ContentHash, partial: bool) -> PathBuf {
+        self.cached(hash, if partial { "part.pdf" } else { "pdf" })
+    }
+
+    fn cached(&self, hash: ContentHash, extension: &str) -> PathBuf {
         self.inner
             .dir
             .join(blobs::shard(hash))
-            .with_extension(kind.extension())
+            .with_extension(extension)
     }
 
     /// Makes thumbnails until `stopped` finishes: the newest waiting files
@@ -456,12 +653,18 @@ impl Thumbnails {
             })
             .await?;
         let videos = videos_unavailable(&self.inner.tools);
+        let documents = documents_unavailable(&self.inner.tools);
         self.inner.status.send_if_modified(|status| {
-            let changed =
-                (status.waiting, status.failed, &status.videos) != (waiting, failed, &videos);
+            let changed = (
+                status.waiting,
+                status.failed,
+                &status.videos,
+                &status.documents,
+            ) != (waiting, failed, &videos, &documents);
             status.waiting = waiting;
             status.failed = failed;
             status.videos = videos;
+            status.documents = documents;
             changed
         });
         Ok(())
@@ -498,19 +701,25 @@ impl Thumbnails {
     /// Forgets contents that are gone from storage, and removes their
     /// thumbnails. Also forgets thumbnails that are missing from the cache,
     /// such as after a restore, since backups leave the cache out, and
-    /// videos skipped without ffmpeg once it's installed, so they're made
-    /// again.
+    /// videos and documents skipped without ffmpeg or LibreOffice once
+    /// they're installed, so they're made again.
     async fn tidy(&self) -> Result<(), Error> {
-        if self.inner.tools.has_ffmpeg() {
-            self.inner
-                .db
-                .write(|tx| {
-                    tx.execute(
-                        "DELETE FROM thumbnails WHERE state = 'none' AND reason = ?1",
-                        [NO_FFMPEG],
-                    )
-                })
-                .await?;
+        let tools = &self.inner.tools;
+        for (installed, reason) in [
+            (tools.has_ffmpeg(), NO_FFMPEG),
+            (tools.has_office(), NO_OFFICE),
+        ] {
+            if installed {
+                self.inner
+                    .db
+                    .write(move |tx| {
+                        tx.execute(
+                            "DELETE FROM thumbnails WHERE state = 'none' AND reason = ?1",
+                            [reason],
+                        )
+                    })
+                    .await?;
+            }
         }
 
         let ready = self
@@ -555,8 +764,14 @@ impl Thumbnails {
             })
             .await?;
         for hash in gone {
-            for kind in [ThumbnailKind::Picture, ThumbnailKind::Text] {
-                match std::fs::remove_file(self.path(hash, kind)) {
+            let paths = [
+                self.path(hash, ThumbnailKind::Picture),
+                self.path(hash, ThumbnailKind::Text),
+                self.preview_path(hash, false),
+                self.preview_path(hash, true),
+            ];
+            for path in paths {
+                match std::fs::remove_file(path) {
                     Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err.into()),
                     _ => {}
                 }
@@ -567,18 +782,41 @@ impl Thumbnails {
 
     async fn make(&self, hash: ContentHash) -> Outcome {
         let file = self.inner.storage.contents_file(hash);
-        let kind = match sniff(&file) {
+        let (kind, size, head) = match sniff(&file) {
+            Ok(sniffed) => sniffed,
+            Err(err) => return Outcome::Failed(format!("couldn't read the file: {err}")),
+        };
+        // A document is known by its name as well as its first bytes.
+        let kind = if FORMATS
+            .iter()
+            .any(|format| head.starts_with(format.signature))
+        {
+            match self.name(hash).await {
+                Ok(name) => name
+                    .and_then(|name| format(&name, &head))
+                    .map(Kind::Document)
+                    .or(kind),
+                Err(err) => {
+                    return Outcome::Failed(format!("couldn't read the file's name: {err}"));
+                }
+            }
+        } else {
+            kind
+        };
+        let kind = match kind {
             // Only the first lines are kept, so text files of any size have one.
-            Ok(Some((Kind::Text, _, head))) => {
-                return self.done(hash, ThumbnailKind::Text, &text(&head));
+            Some(Kind::Text) => return self.done(hash, ThumbnailKind::Text, &text(&head)),
+            Some(Kind::Document(_)) if size > MAX_DOCUMENT => {
+                return Outcome::None("a document over 100 MB");
             }
             // ffmpeg reads a video's index and a few frames, not all of it.
-            Ok(Some((kind, size, _))) if size > MAX_FILE && !matches!(kind, Kind::Video(_)) => {
+            Some(kind)
+                if size > MAX_FILE && !matches!(kind, Kind::Video(_) | Kind::Document(_)) =>
+            {
                 return Outcome::None("over 200 MB");
             }
-            Ok(Some((kind, _, _))) => kind,
-            Ok(None) => return Outcome::None("not a kind of file with thumbnails"),
-            Err(err) => return Outcome::Failed(format!("couldn't read the file: {err}")),
+            Some(kind) => kind,
+            None => return Outcome::None("not a kind of file with thumbnails"),
         };
         let made = match kind {
             Kind::Image => self.thumbnail(std::fs::File::open(&file)).await,
@@ -596,6 +834,8 @@ impl Thumbnails {
                 Ok(None) => return Outcome::None("a video file without video, such as a song"),
                 Err(problem) => Err(problem),
             },
+            Kind::Document(_) if !self.inner.tools.has_office() => return Outcome::None(NO_OFFICE),
+            Kind::Document(format) => self.document(hash, &file, format).await,
             Kind::Text => unreachable!("text is kept above"),
         };
         match made {
@@ -610,6 +850,26 @@ impl Thumbnails {
             Ok(()) => Outcome::Ready,
             Err(err) => Outcome::Failed(format!("couldn't save the thumbnail: {err}")),
         }
+    }
+
+    /// The name of the newest file with the contents `hash`.
+    async fn name(&self, hash: ContentHash) -> Result<Option<String>, Error> {
+        self.inner
+            .db
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT i.name FROM storage_versions v
+                     JOIN storage_items i ON i.id = v.item_id
+                     WHERE v.blob = ?1
+                     ORDER BY v.created_at DESC
+                     LIMIT 1",
+                    [&hash.0[..]],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(Error::from)
+            })
+            .await
     }
 
     /// Runs a program in the sandbox, with libvips's settings.
@@ -635,6 +895,8 @@ impl Thumbnails {
                 env: &env,
                 input,
                 read,
+                write: &[],
+                sockets: None,
                 limits: LIMITS,
             })
             .await
@@ -713,6 +975,151 @@ impl Thumbnails {
             .work(&self.inner.tools.pdftoppm, &args, input, &[])
             .await?;
         self.thumbnail(Ok(self.scratch(&png)?)).await
+    }
+
+    /// A document's thumbnail. LibreOffice turns its first pages into a PDF,
+    /// which is kept as its preview, and the PDF's first page becomes the
+    /// thumbnail, as a PDF's does.
+    async fn document(
+        &self,
+        hash: ContentHash,
+        file: &Path,
+        format: &Format,
+    ) -> Result<Vec<u8>, String> {
+        let mut profile = self.inner.office.lock().await;
+        if profile.is_none() {
+            *profile = Some(self.office_profile().await?);
+        }
+        let profile = profile.as_ref().expect("made above").path().join("profile");
+        let scratch = self.scratch_dir()?;
+        copy_folder(&profile, &scratch.path().join("profile"))
+            .map_err(|err| format!("couldn't copy LibreOffice's settings: {err}"))?;
+        let out = scratch.path().join("out");
+        std::fs::create_dir(&out).map_err(|err| format!("couldn't make a folder: {err}"))?;
+
+        let pages = format!(
+            r#"pdf:{}:{{"PageRange":{{"type":"string","value":"1-{PREVIEW_PAGES}"}}}}"#,
+            format.export
+        );
+        let args = [
+            OsString::from(format!(
+                "-env:UserInstallation={}",
+                file_url(&scratch.path().join("profile"))
+            )),
+            "--headless".into(),
+            "--norestore".into(),
+            "--nolockcheck".into(),
+            format!("--infilter={}", format.filter).into(),
+            "--convert-to".into(),
+            pages.into(),
+            "--outdir".into(),
+            out.clone().into(),
+            file.into(),
+        ];
+        self.office(scratch.path(), &args, &[file.to_owned()])
+            .await?;
+
+        // The worker named the PDF after the file. It could only make
+        // folders and plain files there.
+        let pdf = std::fs::read_dir(&out)
+            .and_then(|mut entries| entries.next().transpose())
+            .map_err(|err| format!("couldn't read LibreOffice's PDF: {err}"))?
+            .map(|entry| entry.path())
+            .filter(|path| path.symlink_metadata().is_ok_and(|found| found.is_file()))
+            .ok_or("LibreOffice didn't make a PDF")?;
+        let pages = self.pages(&pdf).await?;
+        let webp = self.pdf(&pdf).await?;
+        // Both are kept, or neither.
+        let preview = self.preview_path(hash, pages >= PREVIEW_PAGES);
+        std::fs::create_dir_all(preview.parent().expect("a preview is in a folder"))
+            .and_then(|()| std::fs::rename(&pdf, &preview))
+            .map_err(|err| format!("couldn't keep the preview: {err}"))?;
+        Ok(webp)
+    }
+
+    /// Makes LibreOffice's settings, once. On new settings, LibreOffice sets
+    /// them up and stops, so each document gets a copy of these instead.
+    async fn office_profile(&self) -> Result<tempfile::TempDir, String> {
+        let made = self.scratch_dir()?;
+        let profile = made.path().join("profile");
+        let args = [
+            OsString::from(format!("-env:UserInstallation={}", file_url(&profile))),
+            "--headless".into(),
+            "--norestore".into(),
+            "--terminate_after_init".into(),
+        ];
+        self.office(made.path(), &args, &[]).await?;
+        let settings = profile.join("user").join("registrymodifications.xcu");
+        let read = std::fs::read_to_string(&settings)
+            .map_err(|err| format!("LibreOffice didn't make its settings: {err}"))?;
+        let Some(end) = read.rfind("</oor:items>") else {
+            return Err("LibreOffice's settings aren't what Accordion expects".into());
+        };
+        let written = format!("{}{DOCUMENT_SETTINGS}{}", &read[..end], &read[end..]);
+        std::fs::write(&settings, written)
+            .map_err(|err| format!("couldn't change LibreOffice's settings: {err}"))?;
+        Ok(made)
+    }
+
+    /// Runs LibreOffice in the sandbox, with `scratch` to write in.
+    async fn office(
+        &self,
+        scratch: &Path,
+        args: &[OsString],
+        files: &[PathBuf],
+    ) -> Result<(), String> {
+        let scratch_text = scratch
+            .to_str()
+            .ok_or("the data folder's name isn't UTF-8")?;
+        let env = [("HOME", scratch_text), ("TMPDIR", scratch_text)];
+        let read: Vec<PathBuf> = DOCUMENT_READS
+            .iter()
+            .map(PathBuf::from)
+            .chain(files.iter().cloned())
+            .collect();
+        let before = office_sockets();
+        let input = std::fs::File::open("/dev/null").map_err(|err| err.to_string())?;
+        let result = self
+            .inner
+            .sandbox
+            .run(Job {
+                program: &self.inner.tools.soffice,
+                args,
+                env: &env,
+                input,
+                read: &read,
+                write: &[scratch.to_owned()],
+                sockets: Some(Path::new(SOCKETS)),
+                limits: DOCUMENT_LIMITS,
+            })
+            .await;
+        // LibreOffice can't remove its socket, since the sandbox lets it
+        // only make files there, so the server does.
+        for socket in office_sockets().difference(&before) {
+            let _ = std::fs::remove_file(socket);
+        }
+        result.map(drop).map_err(|err| err.to_string())
+    }
+
+    /// How many pages a PDF has, from poppler.
+    async fn pages(&self, pdf: &Path) -> Result<u32, String> {
+        let args = [pdf.as_os_str().to_owned()];
+        let input = std::fs::File::open("/dev/null").map_err(|err| err.to_string())?;
+        let output = self
+            .work(&self.inner.tools.pdfinfo, &args, input, &[pdf.to_owned()])
+            .await?;
+        let text = String::from_utf8_lossy(&output);
+        text.lines()
+            .find_map(|line| line.strip_prefix("Pages:"))
+            .and_then(|pages| pages.trim().parse().ok())
+            .ok_or_else(|| "poppler didn't say how many pages the PDF has".to_owned())
+    }
+
+    /// A new, empty folder for a worker to write in, removed when it's
+    /// dropped.
+    fn scratch_dir(&self) -> Result<tempfile::TempDir, String> {
+        tempfile::tempdir_in(self.inner.dir.join("partial"))
+            .map_err(|err| format!("couldn't make a scratch folder: {err}"))
     }
 
     /// A frame from 10% into a video, which skips black frames and fade-ins
@@ -873,6 +1280,7 @@ fn unavailable(tools: &Tools) -> Option<String> {
         (&tools.vips, "libvips-tools"),
         (&tools.vipsheader, "libvips-tools"),
         (&tools.pdftoppm, "poppler-utils"),
+        (&tools.pdfinfo, "poppler-utils"),
     ]
     .into_iter()
     .filter(|(program, _)| !program.is_file())
@@ -887,6 +1295,69 @@ fn unavailable(tools: &Tools) -> Option<String> {
         "the programs that make thumbnails aren't installed. Install {} with apt.",
         packages.join(" and ")
     ))
+}
+
+/// Why Office documents have no thumbnails here, if that's the case.
+fn documents_unavailable(tools: &Tools) -> Option<String> {
+    (!tools.has_office()).then(|| {
+        "LibreOffice isn't installed. Install libreoffice-writer-nogui, libreoffice-calc-nogui, \
+         and libreoffice-impress-nogui with apt to show the first page of each document."
+            .to_owned()
+    })
+}
+
+/// The server's LibreOffice sockets in [`SOCKETS`].
+fn office_sockets() -> std::collections::HashSet<PathBuf> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let uid = unsafe { libc::getuid() };
+    let Ok(entries) = std::fs::read_dir(SOCKETS) else {
+        return Default::default();
+    };
+    entries
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .as_encoded_bytes()
+                .starts_with(b"OSL_PIPE_")
+        })
+        .filter(|entry| {
+            entry
+                .metadata()
+                .is_ok_and(|found| found.file_type().is_socket() && found.uid() == uid)
+        })
+        .map(|entry| entry.path())
+        .collect()
+}
+
+/// Copies a folder of folders and plain files.
+fn copy_folder(from: &Path, to: &Path) -> io::Result<()> {
+    std::fs::create_dir(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            copy_folder(&entry.path(), &to.join(entry.file_name()))?;
+        } else if kind.is_file() {
+            std::fs::copy(entry.path(), to.join(entry.file_name()))?;
+        }
+    }
+    Ok(())
+}
+
+/// A `file://` address for a folder, as LibreOffice takes them, with
+/// anything but letters, digits, and a few marks percent-encoded.
+fn file_url(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+    let mut url = String::from("file://");
+    for &byte in path.as_os_str().as_bytes() {
+        if byte.is_ascii_alphanumeric() || b"/-_.~".contains(&byte) {
+            url.push(byte as char);
+        } else {
+            url.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    url
 }
 
 /// Why videos have no thumbnails here, if that's the case.
@@ -914,13 +1385,13 @@ fn probe(output: &[u8]) -> Result<Probe, String> {
 
 /// What kind of file this is, from its first bytes, its size, and those
 /// bytes.
-fn sniff(file: &Path) -> io::Result<Option<(Kind, u64, Vec<u8>)>> {
+fn sniff(file: &Path) -> io::Result<(Option<Kind>, u64, Vec<u8>)> {
     let opened = std::fs::File::open(file)?;
     let size = opened.metadata()?.len();
     let mut head = Vec::with_capacity(HEAD);
     opened.take(HEAD as u64).read_to_end(&mut head)?;
     let whole = head.len() as u64 == size;
-    Ok(kind(&head, whole).map(|kind| (kind, size, head)))
+    Ok((kind(&head, whole), size, head))
 }
 
 /// The kind of file that starts with `head`, which is `whole` if it's the
@@ -1144,6 +1615,34 @@ mod tests {
         assert!(!is_text(b"<?xml version=\"1.0\"?>\n<svg/>", true));
         assert!(is_text(b"<?xml version=\"1.0\"?>\n<notes/>", true));
         assert!(!is_text(b"{\\rtf1\\ansi Hello}", true));
+    }
+
+    #[test]
+    fn knows_office_documents_by_name_and_first_bytes() {
+        let found = |name: &str, head: &[u8]| format(name, head).map(|format| format.filter);
+        assert_eq!(
+            found("Report.DOCX", b"PK\x03\x04\x14\0"),
+            Some("MS Word 2007 XML")
+        );
+        assert_eq!(found("budget.xls", COMPOUND), Some("MS Excel 97"));
+        assert_eq!(
+            found("letter.rtf", b"{\\rtf1\\ansi"),
+            Some("Rich Text Format")
+        );
+        assert_eq!(found("slides.odp", b"PK\x03\x04"), Some("impress8"));
+        // A web page named as a document isn't one.
+        assert_eq!(found("invoice.docx", b"<html><body>"), None);
+        assert_eq!(found("archive.zip", b"PK\x03\x04"), None);
+        assert_eq!(found("Keynote.key", b"PK\x03\x04"), None);
+        assert_eq!(found("docx", b"PK\x03\x04"), None);
+    }
+
+    #[test]
+    fn writes_file_addresses_for_libreoffice() {
+        assert_eq!(
+            file_url(Path::new("/var/lib/accordion/cache/a b%c")),
+            "file:///var/lib/accordion/cache/a%20b%25c"
+        );
     }
 
     #[test]

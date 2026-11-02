@@ -25,10 +25,11 @@ cargo build --workspace
 cargo test --workspace
 ```
 
-The sandbox's tests run real programs (`sh`, `cat`, and `python3`) and need a Linux kernel with Landlock, which is 5.13 or later with Landlock turned on. The thumbnail tests also need libvips and poppler, and libheif's AV1 encoder for their test images. On Ubuntu:
+The sandbox's tests run real programs (`sh`, `cat`, and `python3`) and need a Linux kernel with Landlock, which is 5.13 or later with Landlock turned on. The thumbnail tests also need libvips, poppler, ffmpeg, and LibreOffice's Writer, Calc, and Impress, and libheif's AV1 encoder for their test images. On Ubuntu:
 
 ```sh
-sudo apt install libvips-tools libheif-plugin-libde265 libheif-plugin-aomdec libheif-plugin-aomenc poppler-utils
+sudo apt install libvips-tools libheif-plugin-libde265 libheif-plugin-aomdec libheif-plugin-aomenc poppler-utils ffmpeg \
+    libreoffice-writer-nogui libreoffice-calc-nogui libreoffice-impress-nogui fonts-liberation2
 ```
 
 The backup tests run [restic](https://restic.net) 0.19.1, the program that makes backups ([decision 8](https://github.com/accordion-suite/accordion/blob/main/docs/decisions/0008-backups.md)). Put it on your `PATH`, or set `ACCORDION_RESTIC` to its full path.

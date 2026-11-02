@@ -31,6 +31,8 @@ async fn run(program: &str, args: &[&str], limits: Limits) -> Result<String, Run
             env: &[],
             input: File::open("/dev/null").unwrap(),
             read: &[],
+            write: &[],
+            sockets: None,
             limits,
         })
         .await?;
@@ -61,6 +63,8 @@ async fn reads_its_input_and_writes_its_output() {
             env: &[],
             input: File::open(&input).unwrap(),
             read: &[],
+            write: &[],
+            sockets: None,
             limits: LIMITS,
         })
         .await
@@ -89,6 +93,8 @@ async fn reads_the_folders_it_is_given() {
             env: &[],
             input: File::open("/dev/null").unwrap(),
             read: &[dir.path().to_owned()],
+            write: &[],
+            sockets: None,
             limits: LIMITS,
         })
         .await
@@ -163,6 +169,8 @@ async fn sees_only_the_environment_it_is_given() {
             env: &[("VIPS_BLOCK_UNTRUSTED", "1")],
             input: File::open("/dev/null").unwrap(),
             read: &[],
+            write: &[],
+            sockets: None,
             limits: LIMITS,
         })
         .await
@@ -249,6 +257,8 @@ async fn reads_one_file_it_is_given_and_not_the_rest_of_its_folder() {
                     env: &[],
                     input: File::open("/dev/null").unwrap(),
                     read: &read,
+                    write: &[],
+                    sockets: None,
                     limits: LIMITS,
                 })
                 .await
@@ -257,4 +267,102 @@ async fn reads_one_file_it_is_given_and_not_the_rest_of_its_folder() {
     assert_eq!(run_cat(&given).await.unwrap(), b"allowed");
     let result = run_cat(&other).await;
     assert!(matches!(result, Err(RunError::Failed { .. })), "{result:?}");
+}
+
+/// Runs a Python script that may write in `write` and make sockets in
+/// `sockets`.
+async fn run_python(
+    script: &str,
+    write: &[std::path::PathBuf],
+    sockets: Option<&Path>,
+) -> Result<String, RunError> {
+    let args = ["-I".into(), "-c".into(), OsString::from(script)];
+    let output = sandbox()
+        .run(Job {
+            program: Path::new("/usr/bin/python3"),
+            args: &args,
+            env: &[],
+            input: File::open("/dev/null").unwrap(),
+            read: &[],
+            write,
+            sockets,
+            limits: LIMITS,
+        })
+        .await?;
+    Ok(String::from_utf8(output).unwrap())
+}
+
+#[tokio::test]
+async fn writes_in_its_scratch_folder_but_runs_nothing_from_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let scratch = dir.path().join("scratch");
+    std::fs::create_dir(&scratch).unwrap();
+    let script = format!(
+        r#"
+import os, shutil
+os.chdir({scratch:?})
+os.mkdir("profile")
+with open("profile/settings.xml", "w") as f: f.write("kept")
+os.rename("profile/settings.xml", "settings.xml")
+print(open("settings.xml").read())
+try:
+    os.symlink("/etc/passwd", "link")
+except PermissionError:
+    print("can't link")
+shutil.copy("/usr/bin/true", "true")
+os.chmod("true", 0o755)
+try:
+    os.execv("true", ["true"])
+except PermissionError:
+    print("can't run it")
+"#,
+        scratch = scratch.to_str().unwrap()
+    );
+    let output = run_python(&script, std::slice::from_ref(&scratch), None)
+        .await
+        .unwrap();
+    assert_eq!(output, "kept\ncan't link\ncan't run it\n");
+
+    let outside = dir.path().join("planted.txt");
+    let script = format!("open({:?}, 'w')", outside.to_str().unwrap());
+    let message = failure(run_python(&script, &[scratch], None).await);
+    assert!(message.contains("PermissionError"), "{message}");
+    assert!(!outside.exists());
+}
+
+#[tokio::test]
+async fn listens_on_a_local_socket_but_connects_to_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("secret.txt"), "someone else's").unwrap();
+    // Another program's socket, in the same folder.
+    let other = std::os::unix::net::UnixListener::bind(dir.path().join("other")).unwrap();
+    let script = format!(
+        r#"
+import os, socket
+os.chdir({dir:?})
+own = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+own.bind("own")
+own.listen()
+print("listening")
+for attempt in [
+    lambda: socket.socket(socket.AF_UNIX).connect("other"),
+    lambda: socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM),
+    lambda: socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET),
+    lambda: socket.socket(socket.AF_INET),
+    lambda: open("secret.txt").read(),
+]:
+    try:
+        attempt()
+        print("allowed")
+    except PermissionError:
+        print("refused")
+"#,
+        dir = dir.path().to_str().unwrap()
+    );
+    let output = run_python(&script, &[], Some(dir.path())).await.unwrap();
+    assert_eq!(
+        output,
+        "listening\nrefused\nrefused\nrefused\nrefused\nrefused\n"
+    );
+    drop(other);
 }

@@ -57,6 +57,12 @@ pub struct Job<'a> {
     /// Folders and files the program may read besides the system's own,
     /// such as a stored file it reads by name.
     pub read: &'a [PathBuf],
+    /// Scratch folders the program may write in. It can't run what it
+    /// writes.
+    pub write: &'a [PathBuf],
+    /// A folder the program may make a local socket in, to listen on. It
+    /// still can't connect to any socket, or read the folder's files.
+    pub sockets: Option<&'a Path>,
     pub limits: Limits,
 }
 
@@ -96,6 +102,12 @@ impl Sandbox {
             if path.exists() {
                 command.arg("--read").arg(path);
             }
+        }
+        for folder in job.write {
+            command.arg("--write").arg(folder);
+        }
+        if let Some(folder) = job.sockets {
+            command.arg("--sockets").arg(folder);
         }
         command
             .arg("--")

@@ -1,7 +1,7 @@
 //! The launcher: `sandbox --memory <bytes> --cpu <seconds> [--read <path>]...
-//! -- <program> [<argument>]...`. It runs in a process of its own, after
-//! `exec`, so it restricts itself with ordinary code rather than between
-//! `fork` and `exec` in the server.
+//! [--write <folder>]... [--sockets <folder>] -- <program> [<argument>]...`.
+//! It runs in a process of its own, after `exec`, so it restricts itself
+//! with ordinary code rather than between `fork` and `exec` in the server.
 
 use std::collections::BTreeMap;
 use std::ffi::{CString, OsString};
@@ -27,6 +27,9 @@ struct Request {
     memory: u64,
     cpu: u64,
     read: Vec<PathBuf>,
+    write: Vec<PathBuf>,
+    /// Where the worker may make local sockets, to listen on.
+    sockets: Option<PathBuf>,
     program: PathBuf,
     args: Vec<OsString>,
 }
@@ -55,6 +58,8 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Request, String> {
     let mut memory = None;
     let mut cpu = None;
     let mut read = Vec::new();
+    let mut write = Vec::new();
+    let mut sockets = None;
     let number = |value: Option<OsString>, name: &str| {
         value
             .and_then(|value| value.to_str()?.parse::<u64>().ok())
@@ -66,6 +71,14 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Request, String> {
             Some("--memory") => memory = Some(number(args.next(), "--memory")?),
             Some("--cpu") => cpu = Some(number(args.next(), "--cpu")?),
             Some("--read") => read.push(PathBuf::from(args.next().ok_or("--read needs a path")?)),
+            Some("--write") => {
+                write.push(PathBuf::from(args.next().ok_or("--write needs a folder")?));
+            }
+            Some("--sockets") => {
+                sockets = Some(PathBuf::from(
+                    args.next().ok_or("--sockets needs a folder")?,
+                ));
+            }
             Some("--") => break,
             _ => {
                 return Err(format!(
@@ -83,6 +96,8 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Request, String> {
         memory: memory.ok_or("--memory is missing")?,
         cpu: cpu.ok_or("--cpu is missing")?,
         read,
+        write,
+        sockets,
         program,
         args: args.collect(),
     })
@@ -96,7 +111,7 @@ fn restrict(request: &Request) -> Result<(), String> {
     let interpreter = interpreter(&request.program)
         .map_err(|err| format!("couldn't read {}: {err}", request.program.display()))?;
     landlock(request, interpreter.as_deref())?;
-    seccomp()
+    seccomp(request.sockets.is_some())
 }
 
 /// Runs the worker at low priority for the CPU and the disk, so the
@@ -176,6 +191,31 @@ fn landlock(request: &Request, interpreter: Option<&Path>) -> Result<(), String>
             .add_rule(PathBeneath::new(fd, access))
             .map_err(|err| fail(&err))?;
     }
+    // A scratch folder: its files can be read, written, renamed, and
+    // removed, but not run, so a worker can't write a program and start it.
+    // Nor can it make links, which could point the server at another file
+    // when it reads what the worker wrote.
+    let write = AccessFs::from_all(ABI_WANTED)
+        & !(AccessFs::Execute
+            | AccessFs::MakeSym
+            | AccessFs::MakeChar
+            | AccessFs::MakeBlock
+            | AccessFs::MakeFifo
+            | AccessFs::MakeSock
+            | AccessFs::IoctlDev);
+    for folder in &request.write {
+        let fd = PathFd::new(folder).map_err(|err| fail(&err))?;
+        ruleset = ruleset
+            .add_rule(PathBeneath::new(fd, write))
+            .map_err(|err| fail(&err))?;
+    }
+    // Only new sockets: the folder's files stay out of reach.
+    if let Some(folder) = &request.sockets {
+        let fd = PathFd::new(folder).map_err(|err| fail(&err))?;
+        ruleset = ruleset
+            .add_rule(PathBeneath::new(fd, AccessFs::MakeSock))
+            .map_err(|err| fail(&err))?;
+    }
     for program in std::iter::once(request.program.as_path()).chain(interpreter) {
         let fd = PathFd::new(program).map_err(|err| fail(&err))?;
         ruleset = ruleset
@@ -190,8 +230,9 @@ fn landlock(request: &Request, interpreter: Option<&Path>) -> Result<(), String>
 }
 
 /// The system calls the worker has no use for, and a filter that refuses
-/// them.
-fn seccomp() -> Result<(), String> {
+/// them. With `sockets`, the worker may listen on a local socket of its
+/// own, which LibreOffice needs, but still connect to nothing.
+fn seccomp(sockets: bool) -> Result<(), String> {
     let fail = |err: &dyn std::fmt::Display| format!("couldn't set up seccomp: {err}");
     let arch = TargetArch::try_from(std::env::consts::ARCH).map_err(|err| fail(&err))?;
     let pid = std::process::id();
@@ -199,12 +240,7 @@ fn seccomp() -> Result<(), String> {
     let mut refused: BTreeMap<i64, Vec<SeccompRule>> = [
         // Networks and other processes' sockets. Socket pairs stay, since
         // they only connect a process to itself.
-        libc::SYS_socket,
         libc::SYS_connect,
-        libc::SYS_bind,
-        libc::SYS_listen,
-        libc::SYS_accept,
-        libc::SYS_accept4,
         // Other processes' memory.
         libc::SYS_ptrace,
         libc::SYS_process_vm_readv,
@@ -237,12 +273,35 @@ fn seccomp() -> Result<(), String> {
     .into_iter()
     .map(|call| (call, Vec::new()))
     .collect();
+    if !sockets {
+        for call in [
+            libc::SYS_socket,
+            libc::SYS_bind,
+            libc::SYS_listen,
+            libc::SYS_accept,
+            libc::SYS_accept4,
+        ] {
+            refused.insert(call, Vec::new());
+        }
+    }
 
     let rule =
         |conditions: Vec<SeccompCondition>| SeccompRule::new(conditions).map_err(|err| fail(&err));
     let arg = |index, op, value| {
         SeccompCondition::new(index, SeccompCmpArgLen::Dword, op, value).map_err(|err| fail(&err))
     };
+
+    if sockets {
+        // Only local stream sockets, which can send nothing until they
+        // connect. A datagram socket could send to another program's
+        // socket without connecting. The type's low bits are the kind of
+        // socket, and the rest are flags.
+        let mut socket_rules = vec![rule(vec![arg(0, SeccompCmpOp::Ne, libc::AF_UNIX as u64)?])?];
+        for kind in (0..16).filter(|&kind| kind != libc::SOCK_STREAM as u64) {
+            socket_rules.push(rule(vec![arg(1, SeccompCmpOp::MaskedEq(0xf), kind)?])?);
+        }
+        refused.insert(libc::SYS_socket, socket_rules);
+    }
 
     // Signals only to the worker itself and its process group, whose ID is
     // its own, since the server starts it in a new group.

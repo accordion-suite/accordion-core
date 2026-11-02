@@ -461,3 +461,64 @@ async fn removing_an_account_removes_its_shares() {
     assert_eq!(s.access(f.kim, f.photo).await, Some(Access::Owner));
     s.identity.delete_member(f.alex).await.unwrap();
 }
+
+#[tokio::test]
+async fn shared_by_lists_what_the_owner_shared_and_unshare_all_ends_it() {
+    let f = family().await;
+    let s = &f.server;
+    assert!(s.storage.shared_by(f.alex).await.unwrap().is_empty());
+    s.storage
+        .share(f.holiday, f.sam, ShareLevel::Viewer, f.alex)
+        .await
+        .unwrap();
+    s.storage
+        .share(f.holiday, f.kim, ShareLevel::Editor, f.alex)
+        .await
+        .unwrap();
+    s.storage
+        .share(f.photo, f.sam, ShareLevel::Editor, f.alex)
+        .await
+        .unwrap();
+
+    let out = s.storage.shared_by(f.alex).await.unwrap();
+    let names: Vec<&str> = out.iter().map(|out| out.found.item.name.as_str()).collect();
+    assert_eq!(out.len(), 2, "{names:?}");
+    let holiday = out
+        .iter()
+        .find(|out| out.found.item.id == f.holiday)
+        .unwrap();
+    assert!(holiday.found.folders.is_empty());
+    let with: Vec<UserId> = holiday.shares.iter().map(|share| share.user).collect();
+    assert_eq!(with, [f.sam, f.kim]);
+    let photo = out.iter().find(|out| out.found.item.id == f.photo).unwrap();
+    assert_eq!(photo.found.folders, ["Holiday", "Album"]);
+    assert_eq!(photo.shares.len(), 1);
+    // Nobody shared anything of Sam's.
+    assert!(s.storage.shared_by(f.sam).await.unwrap().is_empty());
+
+    // The trash leaves it out, as it does everywhere else.
+    s.storage.delete(f.album).await.unwrap();
+    assert_eq!(s.storage.shared_by(f.alex).await.unwrap().len(), 1);
+    s.storage.restore(f.album).await.unwrap();
+
+    let removed = s.storage.unshare_all(f.holiday, f.alex).await.unwrap();
+    assert_eq!(removed.len(), 2);
+    assert_eq!(s.access(f.kim, f.holiday).await, None);
+    // Sam still has the photo through its own share.
+    assert_eq!(s.access(f.sam, f.photo).await, Some(Access::Editor));
+    let out = s.storage.shared_by(f.alex).await.unwrap();
+    assert_eq!(out.len(), 1);
+    assert_eq!(out[0].found.item.id, f.photo);
+    let history = s.storage.share_history(f.holiday).await.unwrap();
+    assert_eq!(
+        history.iter().filter(|event| event.level.is_none()).count(),
+        2
+    );
+    assert!(
+        s.storage
+            .unshare_all(f.holiday, f.alex)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}

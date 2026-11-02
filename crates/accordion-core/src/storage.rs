@@ -26,7 +26,7 @@ mod uploads;
 mod view;
 
 pub use blobs::{Blob, ContentHash, Problem};
-pub use shares::{Access, Share, ShareEvent, ShareLevel, Shared};
+pub use shares::{Access, Share, ShareEvent, ShareLevel, Shared, SharedOut};
 pub use upkeep::{Checked, Cleaned, Damage, Purged, Retention, StorageStatus};
 pub use uploads::Upload;
 

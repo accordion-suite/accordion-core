@@ -10,9 +10,14 @@
 //! Only the owner sees an item in the trash. To everyone else, it's gone.
 
 use accordion_types::{ItemId, UserId};
+use std::collections::HashMap;
+
 use rusqlite::{Connection, OptionalExtension, Row};
 
-use super::{Error, Item, SHARED_SELECT, Storage, item, item_from_row, location};
+use super::{
+    Error, FOUND_SELECT, Found, Item, SHARED_SELECT, Storage, found_from_row, item, item_from_row,
+    location,
+};
 use crate::sql_now;
 
 /// What a share lets someone do.
@@ -80,6 +85,15 @@ pub struct Share {
 pub struct Shared {
     pub item: Item,
     pub share: Share,
+}
+
+/// One of an owner's items that they shared, with where it is and who has
+/// it, for **Shared by me**.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedOut {
+    pub found: Found,
+    /// Everyone it's shared with directly, in the order they were added.
+    pub shares: Vec<Share>,
 }
 
 /// A record of sharing, changing, or removing someone's access, for the
@@ -165,6 +179,27 @@ impl Storage {
             .await
     }
 
+    /// Stops sharing an item with everyone it's shared with directly, and
+    /// returns the shares it removed.
+    pub async fn unshare_all(&self, id: ItemId, by: UserId) -> Result<Vec<Share>, Error> {
+        self.inner
+            .db
+            .write(move |tx| {
+                let removed = tx
+                    .prepare(
+                        "DELETE FROM storage_shares WHERE item_id = ?1
+                         RETURNING item_id, user_id, level, shared_by, created_at",
+                    )?
+                    .query_map([id.as_uuid()], |row| share_from_row(row, 0))?
+                    .collect::<Result<Vec<_>, _>>()?;
+                for share in &removed {
+                    record(tx, id, share.user, None, by)?;
+                }
+                Ok(removed)
+            })
+            .await
+    }
+
     /// Everyone an item is shared with directly, in the order they were
     /// added. Shares on the folders above it aren't included.
     pub async fn shares(&self, id: ItemId) -> Result<Vec<Share>, Error> {
@@ -206,6 +241,62 @@ impl Storage {
                     }
                 }
                 Ok(shared)
+            })
+            .await
+    }
+
+    /// The items `owner` shared directly with anyone, outside the trash,
+    /// most recently shared first. What's inside a shared folder isn't
+    /// listed unless it's shared on its own too.
+    pub async fn shared_by(&self, owner: UserId) -> Result<Vec<SharedOut>, Error> {
+        self.inner
+            .db
+            .read(move |conn| {
+                let Some(top) = conn
+                    .query_row(
+                        "SELECT id FROM storage_items WHERE owner_id = ?1 AND parent_id IS NULL",
+                        [owner.as_uuid()],
+                        |row| row.get::<_, uuid::Uuid>(0),
+                    )
+                    .optional()?
+                else {
+                    return Ok(Vec::new());
+                };
+                let found = conn
+                    .prepare(&format!(
+                        "{FOUND_SELECT} WHERE i.id IN (SELECT item_id FROM storage_shares)"
+                    ))?
+                    .query_map([top], found_from_row)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut shares: HashMap<ItemId, Vec<Share>> = HashMap::new();
+                let mut statement = conn.prepare(&format!(
+                    "SELECT {SHARE_COLUMNS} FROM storage_shares s
+                     JOIN storage_items i ON i.id = s.item_id
+                     WHERE i.owner_id = ?1 ORDER BY s.created_at, s.user_id"
+                ))?;
+                for share in statement.query_map([owner.as_uuid()], |row| share_from_row(row, 0))? {
+                    let share = share?;
+                    shares.entry(share.item).or_default().push(share);
+                }
+                let mut out: Vec<SharedOut> = found
+                    .into_iter()
+                    .map(|found| SharedOut {
+                        shares: shares.remove(&found.item.id).unwrap_or_default(),
+                        found,
+                    })
+                    .collect();
+                out.sort_by(|a, b| {
+                    let latest = |out: &SharedOut| {
+                        out.shares
+                            .iter()
+                            .map(|share| share.created_at.clone())
+                            .max()
+                    };
+                    latest(b)
+                        .cmp(&latest(a))
+                        .then_with(|| a.found.item.name.cmp(&b.found.item.name))
+                });
+                Ok(out)
             })
             .await
     }

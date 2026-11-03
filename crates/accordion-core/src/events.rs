@@ -26,10 +26,11 @@ use crate::storage::{self, Access};
 
 const OWNER: &str = "events";
 
-static MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "Create the event log",
-    sql: "
+static MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "Create the event log",
+        sql: "
     -- One row for each change. Nothing here references other tables, so
     -- events outlive the items and people they're about.
     CREATE TABLE events_log (
@@ -76,7 +77,18 @@ static MIGRATIONS: &[Migration] = &[Migration {
     ) STRICT;
     INSERT INTO events_settings (id, keep_days) VALUES (1, 365);
 ",
-}];
+    },
+    Migration {
+        version: 2,
+        name: "Separate seeing notifications from reading them",
+        sql: "
+        -- Set when the person opens the list that shows the notification,
+        -- which clears the count. read_at waits until they select it.
+        ALTER TABLE events_notices ADD COLUMN seen_at TEXT;
+        UPDATE events_notices SET seen_at = read_at;
+    ",
+    },
+];
 
 /// The actions the admin log shows. It matches the `events_log_admin`
 /// index, so the admin log's query can use it.
@@ -431,6 +443,9 @@ pub struct Event {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Notice {
     pub event: Event,
+    /// Whether they've opened the list since it arrived.
+    pub seen: bool,
+    /// Whether they've selected it.
     pub read: bool,
 }
 
@@ -520,14 +535,15 @@ impl Events {
         self.db
             .read(move |conn| {
                 let mut statement = conn.prepare(&format!(
-                    "SELECT {EVENT_COLUMNS}, n.read_at IS NOT NULL
+                    "SELECT {EVENT_COLUMNS}, n.seen_at IS NOT NULL, n.read_at IS NOT NULL
                      FROM events_notices n JOIN events_log e ON e.id = n.event_id
                      WHERE n.user_id = ?1 ORDER BY e.id DESC LIMIT ?2"
                 ))?;
                 let rows = statement.query_map((user.as_uuid(), limit as i64), |row| {
                     Ok(Notice {
                         event: event_from_row(row)?,
-                        read: row.get(EVENT_COLUMN_COUNT)?,
+                        seen: row.get(EVENT_COLUMN_COUNT)?,
+                        read: row.get(EVENT_COLUMN_COUNT + 1)?,
                     })
                 })?;
                 let mut notices = Vec::new();
@@ -546,16 +562,65 @@ impl Events {
     }
 
     /// Marks `user`'s notifications up to and including event `up_to` as
-    /// read.
-    pub async fn mark_read(&self, user: UserId, up_to: i64) -> Result<(), Error> {
+    /// seen, such as when they open the list.
+    pub async fn mark_seen(&self, user: UserId, up_to: i64) -> Result<(), Error> {
         self.db
             .write(move |tx| {
                 tx.execute(
                     concat!(
-                        "UPDATE events_notices SET read_at = ",
+                        "UPDATE events_notices SET seen_at = ",
                         sql_now!(),
-                        " WHERE user_id = ?1 AND event_id <= ?2 AND read_at IS NULL"
+                        " WHERE user_id = ?1 AND event_id <= ?2 AND seen_at IS NULL"
                     ),
+                    (user.as_uuid(), up_to),
+                )?;
+                Ok(())
+            })
+            .await
+    }
+
+    /// Marks some of `user`'s notifications read, such as a group they
+    /// selected. Reading one also counts as seeing it.
+    pub async fn mark_read(&self, user: UserId, events: Vec<i64>) -> Result<(), Error> {
+        self.db
+            .write(move |tx| {
+                let mut statement = tx.prepare(concat!(
+                    "UPDATE events_notices SET read_at = coalesce(read_at, ",
+                    sql_now!(),
+                    "), seen_at = coalesce(seen_at, ",
+                    sql_now!(),
+                    ") WHERE user_id = ?1 AND event_id = ?2"
+                ))?;
+                for event in events {
+                    statement.execute((user.as_uuid(), event))?;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// Removes some of `user`'s notifications, for them only. The events
+    /// stay in the log.
+    pub async fn remove_notifications(&self, user: UserId, events: Vec<i64>) -> Result<(), Error> {
+        self.db
+            .write(move |tx| {
+                let mut statement =
+                    tx.prepare("DELETE FROM events_notices WHERE user_id = ?1 AND event_id = ?2")?;
+                for event in events {
+                    statement.execute((user.as_uuid(), event))?;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// Removes all of `user`'s notifications up to and including event
+    /// `up_to`, so any that arrive while they're looking stay.
+    pub async fn clear_notifications(&self, user: UserId, up_to: i64) -> Result<(), Error> {
+        self.db
+            .write(move |tx| {
+                tx.execute(
+                    "DELETE FROM events_notices WHERE user_id = ?1 AND event_id <= ?2",
                     (user.as_uuid(), up_to),
                 )?;
                 Ok(())

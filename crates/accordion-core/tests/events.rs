@@ -60,13 +60,14 @@ impl Server {
         self.events.activity(reader, id, None, 100).await.unwrap()
     }
 
-    async fn notified(&self, user: UserId) -> Vec<(Action, bool)> {
+    /// Each notification's action, and whether it's been seen and read.
+    async fn notified(&self, user: UserId) -> Vec<(Action, bool, bool)> {
         self.events
             .notifications(user, 50)
             .await
             .unwrap()
             .into_iter()
-            .map(|notice| (notice.event.action, notice.read))
+            .map(|notice| (notice.event.action, notice.seen, notice.read))
             .collect()
     }
 
@@ -233,7 +234,10 @@ async fn sharing_is_recorded_and_notifies_the_person() {
         .unwrap();
     assert_eq!(
         s.notified(sam).await,
-        [(Action::ShareChanged, false), (Action::Shared, false)]
+        [
+            (Action::ShareChanged, false, false),
+            (Action::Shared, false, false)
+        ]
     );
 
     // An editor's changes reach the owner, and the owner's own don't.
@@ -245,7 +249,7 @@ async fn sharing_is_recorded_and_notifies_the_person() {
         .write_file(folder.id, "mine.jpg", &b"own"[..])
         .await
         .unwrap();
-    assert_eq!(s.notified(alex).await, [(Action::Added, false)]);
+    assert_eq!(s.notified(alex).await, [(Action::Added, false, false)]);
 
     // Sam sees sharing with Sam, but not who else has it.
     let kim = s.user("kim").await;
@@ -273,11 +277,21 @@ async fn sharing_is_recorded_and_notifies_the_person() {
         ]
     );
 
-    // Marking read, then losing access: removing it doesn't notify, and
-    // what's left about the folder disappears.
-    let latest = s.events.notifications(sam, 50).await.unwrap()[0].event.id;
-    s.events.mark_read(sam, latest).await.unwrap();
-    assert!(s.notified(sam).await.iter().all(|(_, read)| *read));
+    // Opening the list sees everything, and selecting one reads it.
+    let notices = s.events.notifications(sam, 50).await.unwrap();
+    let (latest, oldest) = (notices[0].event.id, notices[1].event.id);
+    s.events.mark_seen(sam, latest).await.unwrap();
+    s.events.mark_read(sam, vec![oldest]).await.unwrap();
+    assert_eq!(
+        s.notified(sam).await,
+        [
+            (Action::ShareChanged, true, false),
+            (Action::Shared, true, true)
+        ]
+    );
+
+    // Losing access: removing it doesn't notify, and what's left about the
+    // folder disappears.
     storage.unshare(folder.id, sam, alex).await.unwrap();
     assert_eq!(s.notified(sam).await, []);
     assert!(s.events.activity(sam, folder.id, None, 10).await.is_err());
@@ -475,7 +489,7 @@ async fn expired_events_and_old_read_notifications_are_pruned() {
         .await
         .unwrap();
     let notice = s.events.notifications(sam, 1).await.unwrap()[0].event.id;
-    s.events.mark_read(sam, notice).await.unwrap();
+    s.events.mark_read(sam, vec![notice]).await.unwrap();
 
     assert_eq!(s.events.keep_days().await.unwrap(), Some(365));
     assert!(
@@ -524,4 +538,51 @@ async fn expired_events_and_old_read_notifications_are_pruned() {
     .unwrap();
     assert_eq!(s.events.prune().await.unwrap().events, 0);
     assert_eq!(s.count().await, 2);
+}
+
+#[tokio::test]
+async fn notifications_can_be_removed_one_at_a_time_or_all_at_once() {
+    let s = start().await;
+    let alex = s.user("alex").await;
+    let sam = s.user("sam").await;
+    let top = s.storage.top_folder(alex).await.unwrap();
+    let mut shared = Vec::new();
+    for name in ["One", "Two", "Three"] {
+        let folder = s.by(alex).create_folder(top, name).await.unwrap();
+        s.by(alex)
+            .share(folder.id, sam, ShareLevel::Viewer, alex)
+            .await
+            .unwrap();
+        shared.push(folder.id);
+    }
+    let notices = s.events.notifications(sam, 50).await.unwrap();
+    assert_eq!(notices.len(), 3);
+
+    s.events
+        .remove_notifications(sam, vec![notices[1].event.id])
+        .await
+        .unwrap();
+    let left: Vec<_> = s
+        .events
+        .notifications(sam, 50)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|notice| notice.event.item)
+        .collect();
+    assert_eq!(left, [Some(shared[2]), Some(shared[0])]);
+    // Only Sam's notifications go. The events stay in the log.
+    assert_eq!(s.activity(alex, shared[1]).await.len(), 2);
+
+    // Clearing stops at what was shown, so a newer one stays.
+    let shown = notices[0].event.id;
+    let four = s.by(alex).create_folder(top, "Four").await.unwrap();
+    s.by(alex)
+        .share(four.id, sam, ShareLevel::Viewer, alex)
+        .await
+        .unwrap();
+    s.events.clear_notifications(sam, shown).await.unwrap();
+    let left = s.events.notifications(sam, 50).await.unwrap();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].event.item, Some(four.id));
 }

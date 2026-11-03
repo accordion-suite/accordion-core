@@ -38,6 +38,14 @@ macro_rules! id_type {
                 self.0.fmt(f)
             }
         }
+
+        impl FromStr for $name {
+            type Err = uuid::Error;
+
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                Uuid::parse_str(s).map(Self)
+            }
+        }
     };
 }
 

@@ -3,7 +3,8 @@
 
 use accordion_core::db::Database;
 use accordion_core::identity::{Identity, NewUser};
-use accordion_core::storage::{Access, Error, Found, LeaveFiles, Search, ShareLevel, Storage};
+use accordion_core::storage::{Access, Error, Found, Hit, LeaveFiles, Search, ShareLevel, Storage};
+use accordion_core::texts::Words;
 use accordion_types::{ItemId, Role, UserId};
 
 struct Server {
@@ -85,6 +86,10 @@ async fn family() -> Family {
         album: album.id,
         photo: photo.id,
     }
+}
+
+fn founds(hits: Vec<Hit>) -> Vec<Found> {
+    hits.into_iter().map(|hit| hit.found).collect()
 }
 
 fn paths(found: &[Found]) -> Vec<String> {
@@ -388,11 +393,11 @@ async fn recent_and_search_include_shared_items() {
         ["Holiday/Album/beach.jpg"]
     );
     let search = |text: &str| Search {
-        text: text.into(),
+        name: Words::parse(text),
         limit: 10,
         ..Search::default()
     };
-    let mut found = paths(&s.storage.search(f.sam, search("")).await.unwrap());
+    let mut found = paths(&founds(s.storage.search(f.sam, search("")).await.unwrap()));
     found.sort();
     assert_eq!(
         found,
@@ -404,7 +409,7 @@ async fn recent_and_search_include_shared_items() {
         ]
     );
     // Alex's own results don't change.
-    let mut found = paths(&s.storage.search(f.alex, search("")).await.unwrap());
+    let mut found = paths(&founds(s.storage.search(f.alex, search("")).await.unwrap()));
     found.sort();
     assert_eq!(
         found,
@@ -414,7 +419,9 @@ async fn recent_and_search_include_shared_items() {
     s.storage.unshare(f.holiday, f.sam, f.alex).await.unwrap();
     s.storage.unshare(f.album, f.sam, f.alex).await.unwrap();
     assert_eq!(
-        paths(&s.storage.search(f.sam, search("beach")).await.unwrap()),
+        paths(&founds(
+            s.storage.search(f.sam, search("beach")).await.unwrap()
+        )),
         Vec::<String>::new()
     );
 }

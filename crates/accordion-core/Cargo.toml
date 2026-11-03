@@ -20,6 +20,7 @@ base64ct = { version = "1.8.3", features = ["alloc"] }
 getrandom = "0.4.3"
 jiff = { version = "0.2.38", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 libc = "0.2.190"
+quick-xml = "0.42.0"
 rusqlite = { version = "0.41.1", features = ["backup", "bundled", "uuid"] }
 # For reading a REST backup server's certificate, to pin it. The same versions
 # and features as the gateway, so the server builds one copy.
@@ -31,7 +32,9 @@ thiserror = "2.0.21"
 tokio = { version = "1.53.3", features = ["fs", "io-util", "macros", "net", "process", "rt", "sync", "time"] }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring"] }
 tracing = "0.1.44"
+unicode-normalization = "0.1.26"
 uuid = "1.28.0"
+zip = { version = "9.2.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [dev-dependencies]
 rcgen = { version = "0.14.10", default-features = false, features = ["crypto", "pem", "ring"] }

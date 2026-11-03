@@ -326,7 +326,7 @@ enum Outcome {
 
 /// The kinds of file with thumbnails, by their first bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Kind {
+pub(crate) enum Kind {
     /// JPEG, PNG, GIF, WebP, or TIFF.
     Image,
     /// HEIC or AVIF, which are decoded whole.
@@ -341,23 +341,23 @@ enum Kind {
 /// An Office format, with the one reader LibreOffice may use for it, so a
 /// disguised file can't reach its other readers.
 #[derive(Debug, PartialEq, Eq)]
-struct Format {
-    extension: &'static str,
+pub(crate) struct Format {
+    pub(crate) extension: &'static str,
     /// How every file in the format starts.
-    signature: &'static [u8],
+    pub(crate) signature: &'static [u8],
     /// LibreOffice's reader.
     filter: &'static str,
     /// LibreOffice's PDF writer for that kind of document.
     export: &'static str,
 }
 
-const ZIP: &[u8] = b"PK\x03\x04";
+pub(crate) const ZIP: &[u8] = b"PK\x03\x04";
 /// Office 97–2003 files are in Microsoft's compound file format.
 const COMPOUND: &[u8] = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1";
 
 /// The Office formats families have. Apple's are left out, since
 /// LibreOffice reads only some of them.
-static FORMATS: [Format; 10] = [
+pub(crate) static FORMATS: [Format; 10] = [
     Format {
         extension: "docx",
         signature: ZIP,
@@ -422,7 +422,7 @@ static FORMATS: [Format; 10] = [
 
 /// The Office format of a file named `name` that starts with `head`, if
 /// it's one families have and it starts the way the format does.
-fn format(name: &str, head: &[u8]) -> Option<&'static Format> {
+pub(crate) fn format(name: &str, head: &[u8]) -> Option<&'static Format> {
     let (_, extension) = name.rsplit_once('.')?;
     FORMATS.iter().find(|format| {
         extension.eq_ignore_ascii_case(format.extension) && head.starts_with(format.signature)
@@ -432,7 +432,7 @@ fn format(name: &str, head: &[u8]) -> Option<&'static Format> {
 /// The video formats families have. ffmpeg reads each with only the one
 /// demuxer, so it never tries its others.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Container {
+pub(crate) enum Container {
     /// QuickTime and MP4: `.mov`, `.mp4`, `.m4v`, and `.3gp`.
     Mov,
     /// `.mkv` and `.webm`.
@@ -899,19 +899,7 @@ impl Thumbnails {
     async fn name(&self, hash: ContentHash) -> Result<Option<String>, Error> {
         self.inner
             .db
-            .read(move |conn| {
-                conn.query_row(
-                    "SELECT i.name FROM storage_versions v
-                     JOIN storage_items i ON i.id = v.item_id
-                     WHERE v.blob = ?1
-                     ORDER BY v.created_at DESC
-                     LIMIT 1",
-                    [&hash.0[..]],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(Error::from)
-            })
+            .read(move |conn| newest_name(conn, hash).map_err(Error::from))
             .await
     }
 
@@ -1456,7 +1444,7 @@ fn probe(output: &[u8]) -> Result<Probe, String> {
 
 /// What kind of file this is, from its first bytes, its size, and those
 /// bytes.
-fn sniff(file: &Path) -> io::Result<(Option<Kind>, u64, Vec<u8>)> {
+pub(crate) fn sniff(file: &Path) -> io::Result<(Option<Kind>, u64, Vec<u8>)> {
     let opened = std::fs::File::open(file)?;
     let size = opened.metadata()?.len();
     let mut head = Vec::with_capacity(HEAD);
@@ -1569,6 +1557,23 @@ fn text(head: &[u8]) -> Vec<u8> {
         .map(|line| line.strip_suffix('\r').unwrap_or(line))
         .collect();
     lines.join("\n").into_bytes()
+}
+
+/// The name of the newest file with the contents `hash`.
+pub(crate) fn newest_name(
+    conn: &rusqlite::Connection,
+    hash: ContentHash,
+) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT i.name FROM storage_versions v
+         JOIN storage_items i ON i.id = v.item_id
+         WHERE v.blob = ?1
+         ORDER BY v.created_at DESC
+         LIMIT 1",
+        [&hash.0[..]],
+        |row| row.get(0),
+    )
+    .optional()
 }
 
 /// Tells whoever can open the folders of files with these contents that

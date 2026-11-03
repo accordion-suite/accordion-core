@@ -31,7 +31,7 @@ pub(crate) use shares::{access, people_with_access};
 pub use upkeep::{Checked, Cleaned, Damage, Purged, Retention, StorageStatus};
 pub use uploads::Upload;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -46,6 +46,7 @@ use crate::db::{self, Database, Migration};
 use crate::events::{self, Action, Actor, NewEvent};
 use crate::identity::{self, Identity};
 use crate::sql_now;
+use crate::texts::{Matched, Words};
 use blobs::{Blobs, Received};
 use view::{Entry, View};
 
@@ -349,19 +350,62 @@ pub struct Version {
 }
 
 /// What [`Storage::search`] looks for. Every part that's set has to match.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default)]
 pub struct Search {
-    /// Part of the name, ignoring case, such as "tax" for "Taxes 2025.pdf".
+    /// Words that all have to be in the name, ignoring case and accents.
     /// Empty matches every name.
-    pub text: String,
+    pub name: Words,
+    /// The contents whose text matched words that have to be in the text.
+    /// `None` doesn't look at the text.
+    pub text: Option<Matched>,
+    /// Words that have to be in the name, unless the item's contents are
+    /// among those whose text matched them.
+    pub name_or_text: Option<(Words, Matched)>,
     pub only: Option<Only>,
+    pub owner: Option<Owner>,
+    pub place: Option<Place>,
+    /// Looks in the user's own trash, rather than outside it.
+    pub trash: bool,
+    /// Only items the user shared with this person themselves.
+    pub shared_with: Option<UserId>,
+    /// Only these items, such as the ones the user starred.
+    pub among: Option<HashSet<ItemId>>,
     /// Changed at or after this time, in the database's timestamp format
     /// (see [`sql_now`]).
     pub modified_since: Option<String>,
     /// Changed before this time.
     pub modified_before: Option<String>,
-    /// The most results to return, newest first.
+    /// The most results to return.
     pub limit: usize,
+}
+
+/// Whose items a [`Search`] finds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Owner {
+    Me,
+    Others,
+    Person(UserId),
+}
+
+/// Where a [`Search`] looks.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Place {
+    /// The user's own top folder.
+    MyDrive,
+    /// What others shared with the user.
+    Shared,
+    /// This folder and the folders inside it.
+    Folder(ItemId),
+}
+
+/// An item a search found, and how it matched.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Hit {
+    pub found: Found,
+    /// Whether its name had the words of [`Search::name_or_text`].
+    pub by_name: bool,
+    /// How well its text matched, lower being better, if it did.
+    pub text_rank: Option<f64>,
 }
 
 /// Which kinds of item a [`Search`] finds.
@@ -692,14 +736,50 @@ impl Storage {
     }
 
     /// `user`'s items outside the trash, and items in what others shared
-    /// with them, that match `search`, most recently changed first. Names
-    /// are matched in Rust, because SQLite only ignores case for ASCII, and
-    /// names are in every language.
-    pub async fn search(&self, user: UserId, search: Search) -> Result<Vec<Found>, Error> {
+    /// with them, that match `search`. Items whose names matched come
+    /// first, most recently changed first, then items whose text matched,
+    /// best first. Names are matched in Rust, because SQLite only ignores
+    /// case for ASCII, and names are in every language.
+    pub async fn search(&self, user: UserId, search: Search) -> Result<Vec<Hit>, Error> {
         self.inner
             .db
             .read(move |conn| {
-                let text = search.text.to_lowercase();
+                let by_rank = search.text.is_some() || search.name_or_text.is_some();
+                let mut among = search.among.clone();
+                let mut narrow = |ids: HashSet<ItemId>| {
+                    among = Some(match among.take() {
+                        Some(among) => among.intersection(&ids).copied().collect(),
+                        None => ids,
+                    });
+                };
+                if let Some(person) = search.shared_with {
+                    narrow(shares::shared_by_with(conn, user, person)?);
+                }
+                if let Some(Place::Folder(folder)) = search.place {
+                    if shares::access(conn, user, folder)?.is_none() {
+                        return Ok(Vec::new());
+                    }
+                    narrow(inside(conn, folder)?);
+                }
+                let matches = |found: &Found| hit(&search, user, among.as_ref(), found);
+
+                let mut hits = Vec::new();
+                if search.trash {
+                    let mut statement = conn.prepare(&format!(
+                        "{ITEM_SELECT} WHERE i.owner_id = ?1 AND i.trashed_at IS NOT NULL"
+                    ))?;
+                    for item in statement.query_map([user.as_uuid()], item_from_row)? {
+                        let found = Found {
+                            item: item?,
+                            folders: Vec::new(),
+                        };
+                        if let Some(hit) = matches(&found) {
+                            hits.push(hit);
+                        }
+                    }
+                    return Ok(best_first(hits, search.limit, by_rank));
+                }
+
                 let kind = match search.only {
                     Some(Only::Folders) => "AND i.kind = 'folder'",
                     Some(_) => "AND i.kind = 'file'",
@@ -712,8 +792,19 @@ impl Storage {
                        AND (?3 IS NULL OR i.modified_at < ?3)
                      ORDER BY i.modified_at DESC, i.name"
                 ))?;
-                let mut found = Vec::new();
+                let own: Vec<ItemId> = conn
+                    .prepare(
+                        "SELECT id FROM storage_items WHERE owner_id = ?1 AND parent_id IS NULL",
+                    )?
+                    .query_map([user.as_uuid()], |row| Ok(ItemId::from_uuid(row.get(0)?)))?
+                    .collect::<Result<_, _>>()?;
                 for root in shares::roots(conn, user)? {
+                    let mine = own.contains(&root);
+                    match search.place {
+                        Some(Place::MyDrive) if !mine => continue,
+                        Some(Place::Shared) if mine => continue,
+                        _ => {}
+                    }
                     let rows = statement.query_map(
                         (
                             root.as_uuid(),
@@ -722,30 +813,22 @@ impl Storage {
                         ),
                         found_from_row,
                     )?;
-                    // Each root's matches come newest first, so the newest
-                    // overall are among each root's first `limit`.
+                    // Each root's matches come newest first, so when results
+                    // are newest first, the newest overall are among each
+                    // root's first `limit`.
                     let mut matched = 0;
                     for row in rows {
-                        let row = row?;
-                        let name = row.item.name.to_lowercase();
-                        let extension_matches = match &search.only {
-                            Some(Only::Extensions(extensions)) => {
-                                name.rsplit_once('.').is_some_and(|(stem, ext)| {
-                                    !stem.is_empty() && extensions.iter().any(|e| e == ext)
-                                })
-                            }
-                            _ => true,
+                        let Some(hit) = matches(&row?) else {
+                            continue;
                         };
-                        if name.contains(&text) && extension_matches {
-                            found.push(row);
-                            matched += 1;
-                            if matched == search.limit {
-                                break;
-                            }
+                        hits.push(hit);
+                        matched += 1;
+                        if !by_rank && matched == search.limit {
+                            break;
                         }
                     }
                 }
-                Ok(newest_first(found, search.limit))
+                Ok(best_first(hits, search.limit, by_rank))
             })
             .await
     }
@@ -1733,6 +1816,137 @@ fn newest_first(mut found: Vec<Found>, limit: usize) -> Vec<Found> {
     });
     found.truncate(limit);
     found
+}
+
+/// How `found` matches `search`, if it does, apart from what SQL checked:
+/// its time and kind.
+fn hit(
+    search: &Search,
+    user: UserId,
+    among: Option<&HashSet<ItemId>>,
+    found: &Found,
+) -> Option<Hit> {
+    let item = &found.item;
+    if among.is_some_and(|among| !among.contains(&item.id)) {
+        return None;
+    }
+    match &search.owner {
+        Some(Owner::Me) if item.owner != user => return None,
+        Some(Owner::Others) if item.owner == user => return None,
+        Some(Owner::Person(person)) if item.owner != *person => return None,
+        _ => {}
+    }
+    // The trash isn't narrowed by SQL.
+    if search.trash {
+        let kind_matches = match search.only {
+            Some(Only::Folders) => item.kind == ItemKind::Folder,
+            Some(_) => item.kind != ItemKind::Folder,
+            None => true,
+        };
+        let since = search
+            .modified_since
+            .as_ref()
+            .is_none_or(|since| item.modified_at >= *since);
+        let before = search
+            .modified_before
+            .as_ref()
+            .is_none_or(|before| item.modified_at < *before);
+        if !(kind_matches && since && before) {
+            return None;
+        }
+    }
+    if let Some(Only::Extensions(extensions)) = &search.only {
+        let name = item.name.to_lowercase();
+        let has = name.rsplit_once('.').is_some_and(|(stem, extension)| {
+            !stem.is_empty() && extensions.iter().any(|e| e == extension)
+        });
+        if !has {
+            return None;
+        }
+    }
+    if !search.name.in_name(&item.name) {
+        return None;
+    }
+    let hash = match &item.kind {
+        ItemKind::File { blob, .. } => Some(blob.hash),
+        ItemKind::Folder => None,
+    };
+    let rank = |matched: &Matched| hash.and_then(|hash| matched.rank(hash));
+    let text_rank = search.text.as_ref().map(rank);
+    if text_rank == Some(None) {
+        return None;
+    }
+    let mut by_name = false;
+    let mut either_rank = None;
+    if let Some((words, matched)) = &search.name_or_text {
+        by_name = words.in_name(&item.name);
+        either_rank = rank(matched);
+        if !by_name && either_rank.is_none() {
+            return None;
+        }
+    }
+    Some(Hit {
+        found: found.clone(),
+        by_name,
+        text_rank: either_rank.or(text_rank.flatten()),
+    })
+}
+
+/// The first `limit` of `hits`: names that matched first, newest first,
+/// then text that matched, best first, or all newest first unless
+/// `by_rank`. An item reached from more than one root appears once, with
+/// the longest path, as in [`newest_first`].
+fn best_first(mut hits: Vec<Hit>, limit: usize, by_rank: bool) -> Vec<Hit> {
+    let mut longest: HashMap<ItemId, usize> = HashMap::new();
+    for hit in &hits {
+        let len = longest.entry(hit.found.item.id).or_default();
+        *len = (*len).max(hit.found.folders.len() + 1);
+    }
+    hits.retain(|hit| {
+        let len = hit.found.folders.len() + 1;
+        match longest.get_mut(&hit.found.item.id) {
+            Some(longest) if *longest == len => {
+                *longest = 0;
+                true
+            }
+            _ => false,
+        }
+    });
+    let group = |hit: &Hit| u8::from(by_rank && !hit.by_name);
+    hits.sort_by(|a, b| {
+        let ranked = by_rank && !a.by_name && !b.by_name;
+        group(a)
+            .cmp(&group(b))
+            .then_with(|| {
+                if ranked {
+                    let rank = |hit: &Hit| hit.text_rank.unwrap_or(f64::MAX);
+                    rank(a).total_cmp(&rank(b))
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .then_with(|| b.found.item.modified_at.cmp(&a.found.item.modified_at))
+            .then_with(|| a.found.item.name.cmp(&b.found.item.name))
+    });
+    hits.truncate(limit);
+    hits
+}
+
+/// The items inside `folder`, however deep, outside the trash.
+fn inside(conn: &Connection, folder: ItemId) -> Result<HashSet<ItemId>, Error> {
+    let ids = conn
+        .prepare(
+            "WITH RECURSIVE inside (id) AS (
+                 SELECT id FROM storage_items WHERE parent_id = ?1 AND trashed_at IS NULL
+                 UNION ALL
+                 SELECT i.id FROM storage_items i JOIN inside ON i.parent_id = inside.id
+                 WHERE i.trashed_at IS NULL
+             )
+             SELECT id FROM inside",
+        )?
+        .query_map([folder.as_uuid()], |row| Ok(ItemId::from_uuid(row.get(0)?)))?
+        .collect::<Result<_, _>>()?;
+    Ok(ids)
 }
 
 fn found_from_row(row: &Row<'_>) -> rusqlite::Result<Found> {

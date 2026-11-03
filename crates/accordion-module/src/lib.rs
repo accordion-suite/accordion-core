@@ -20,6 +20,7 @@ use accordion_core::events::Events;
 use accordion_core::identity::Identity;
 use accordion_core::live::Live;
 use accordion_core::storage::Storage;
+use accordion_core::texts::Texts;
 use accordion_core::thumbnails::Thumbnails;
 use axum::Router;
 use tokio::sync::watch;
@@ -71,6 +72,8 @@ pub struct Services {
     pub events: Events,
     /// Thumbnails of stored files, by their contents' hash.
     pub thumbnails: Thumbnails,
+    /// The text inside stored files, for searching it.
+    pub texts: Texts,
     /// Live updates, for hints about the module's own changes. Changes made
     /// through storage and the event log send their own.
     pub live: Live,

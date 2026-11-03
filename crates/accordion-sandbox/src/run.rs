@@ -96,6 +96,18 @@ impl Sandbox {
     /// its error output, for programs that explain a problem there but still
     /// finish as if they'd succeeded.
     pub async fn run_with_messages(&self, job: Job<'_>) -> Result<(Vec<u8>, String), RunError> {
+        self.start(job, false).await
+    }
+
+    /// Runs `job`, and returns what it wrote to its standard output, up to
+    /// the output limit. A worker that writes more is stopped there rather
+    /// than failing, for output that's useful in part, such as a long
+    /// document's text.
+    pub async fn run_up_to(&self, job: Job<'_>) -> Result<Vec<u8>, RunError> {
+        self.start(job, true).await.map(|(output, _)| output)
+    }
+
+    async fn start(&self, job: Job<'_>, cut_off: bool) -> Result<(Vec<u8>, String), RunError> {
         let limits = job.limits;
         let mut command = Command::new(&*self.launcher);
         command
@@ -133,13 +145,28 @@ impl Sandbox {
         let stderr = child.stderr.take().expect("stderr is piped");
 
         let work = async {
-            let (output, message) = tokio::join!(
-                read_up_to(stdout, limits.output + 1),
-                read_up_to(stderr, MESSAGE_LIMIT),
-            );
-            let output = output.map_err(RunError::Start)?;
+            let read_output = async {
+                let output = read_up_to(stdout, limits.output + 1).await;
+                // The worker is waiting to write the rest, so it would never
+                // finish.
+                if cut_off
+                    && output
+                        .as_ref()
+                        .is_ok_and(|output| output.len() as u64 > limits.output)
+                {
+                    stop(group);
+                }
+                output
+            };
+            let (output, message) = tokio::join!(read_output, read_up_to(stderr, MESSAGE_LIMIT));
+            let mut output = output.map_err(RunError::Start)?;
             if output.len() as u64 > limits.output {
-                return Err(RunError::TooLarge(limits.output));
+                if !cut_off {
+                    return Err(RunError::TooLarge(limits.output));
+                }
+                let _ = child.wait().await;
+                output.truncate(limits.output as usize);
+                return Ok((output, String::new()));
             }
             let status = child.wait().await.map_err(RunError::Start)?;
             let message = String::from_utf8_lossy(&message.unwrap_or_default())

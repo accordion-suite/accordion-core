@@ -12,5 +12,6 @@ pub mod identity;
 pub mod live;
 mod random;
 pub mod storage;
+pub mod texts;
 pub mod thumbnails;
 mod time;

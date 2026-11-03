@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use accordion_core::{events, identity, storage};
+use accordion_core::{events, identity, storage, texts};
 use axum::Json;
 use axum::http::StatusCode;
 use axum::http::header::RETRY_AFTER;
@@ -163,6 +163,13 @@ impl From<events::Error> for ApiError {
                 Self::server_problem()
             }
         }
+    }
+}
+
+impl From<texts::Error> for ApiError {
+    fn from(err: texts::Error) -> Self {
+        tracing::error!("search index error: {err}");
+        Self::server_problem()
     }
 }
 

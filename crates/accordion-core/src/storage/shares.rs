@@ -10,7 +10,7 @@
 //! Only the owner sees an item in the trash. To everyone else, it's gone.
 
 use accordion_types::{ItemId, UserId};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rusqlite::{Connection, OptionalExtension, Row};
 
@@ -466,6 +466,26 @@ pub(crate) fn people_with_access(conn: &Connection, id: ItemId) -> Result<Vec<Us
 
 /// Where everything `user` can reach starts: their top folder, if they have
 /// one, and each item shared with them that's outside the trash.
+/// The items `owner` shared with `with` themselves, not counting what's
+/// inside shared folders.
+pub(super) fn shared_by_with(
+    conn: &Connection,
+    owner: UserId,
+    with: UserId,
+) -> Result<HashSet<ItemId>, Error> {
+    let ids = conn
+        .prepare(
+            "SELECT s.item_id FROM storage_shares s
+             JOIN storage_items i ON i.id = s.item_id
+             WHERE i.owner_id = ?1 AND s.user_id = ?2",
+        )?
+        .query_map((owner.as_uuid(), with.as_uuid()), |row| {
+            Ok(ItemId::from_uuid(row.get(0)?))
+        })?
+        .collect::<Result<_, _>>()?;
+    Ok(ids)
+}
+
 pub(super) fn roots(conn: &Connection, user: UserId) -> Result<Vec<ItemId>, Error> {
     let mut roots: Vec<ItemId> = conn
         .prepare("SELECT id FROM storage_items WHERE owner_id = ?1 AND parent_id IS NULL")?

@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 
 use accordion_core::db::Database;
 use accordion_core::identity::{Identity, NewUser};
-use accordion_core::storage::{Error, Found, ItemKind, LeaveFiles, Only, Search, Storage};
+use accordion_core::storage::{Error, Found, Hit, ItemKind, LeaveFiles, Only, Search, Storage};
+use accordion_core::texts::Words;
 use accordion_types::{Role, UserId};
 use tokio::io::AsyncReadExt;
 
@@ -597,6 +598,10 @@ async fn tick() {
     tokio::time::sleep(std::time::Duration::from_millis(5)).await;
 }
 
+fn found(hits: Vec<Hit>) -> Vec<Found> {
+    hits.into_iter().map(|hit| hit.found).collect()
+}
+
 fn names(found: &[Found]) -> Vec<String> {
     found
         .iter()
@@ -672,18 +677,22 @@ async fn searches_names_kinds_and_dates() {
         tick().await;
     }
     server.storage.delete(trashed.id).await.unwrap();
-    let search = |search: Search| {
-        server.storage.search(
-            alex,
-            Search {
-                limit: 10,
-                ..search
-            },
-        )
+    let storage = &server.storage;
+    let search = move |search: Search| async move {
+        storage
+            .search(
+                alex,
+                Search {
+                    limit: 10,
+                    ..search
+                },
+            )
+            .await
+            .map(found)
     };
 
     let found = search(Search {
-        text: "TAX".into(),
+        name: Words::parse("TAX"),
         ..Default::default()
     })
     .await
@@ -691,7 +700,7 @@ async fn searches_names_kinds_and_dates() {
     assert_eq!(names(&found), [".tax", "Taxes"]);
     // Case is ignored beyond ASCII.
     let found = search(Search {
-        text: "ölge".into(),
+        name: Words::parse("ölge"),
         ..Default::default()
     })
     .await

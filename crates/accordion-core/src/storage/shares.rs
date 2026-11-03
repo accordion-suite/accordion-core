@@ -438,6 +438,32 @@ pub(crate) fn access(conn: &Connection, user: UserId, id: ItemId) -> Result<Opti
     Ok(levels.into_iter().max().map(Access::from))
 }
 
+/// Everyone who can open `id`: its owner, and while it's outside the
+/// trash, whoever it or a folder above it is shared with.
+pub(crate) fn people_with_access(conn: &Connection, id: ItemId) -> Result<Vec<UserId>, Error> {
+    let Some(item) = item(conn, id)? else {
+        return Ok(Vec::new());
+    };
+    let mut people = vec![item.owner];
+    if location(conn, id)?.visible {
+        let mut shared = conn.prepare(
+            "WITH RECURSIVE up (id, parent_id) AS (
+                 SELECT id, parent_id FROM storage_items WHERE id = ?1
+                 UNION ALL
+                 SELECT i.id, i.parent_id FROM storage_items i JOIN up ON i.id = up.parent_id
+             )
+             SELECT DISTINCT s.user_id FROM up JOIN storage_shares s ON s.item_id = up.id",
+        )?;
+        for user in shared.query_map([id.as_uuid()], |row| Ok(UserId::from_uuid(row.get(0)?)))? {
+            let user = user?;
+            if user != item.owner {
+                people.push(user);
+            }
+        }
+    }
+    Ok(people)
+}
+
 /// Where everything `user` can reach starts: their top folder, if they have
 /// one, and each item shared with them that's outside the trash.
 pub(super) fn roots(conn: &Connection, user: UserId) -> Result<Vec<ItemId>, Error> {

@@ -18,6 +18,7 @@ use std::pin::Pin;
 use accordion_core::db::Database;
 use accordion_core::events::Events;
 use accordion_core::identity::Identity;
+use accordion_core::live::Live;
 use accordion_core::storage::Storage;
 use accordion_core::thumbnails::Thumbnails;
 use axum::Router;
@@ -70,6 +71,9 @@ pub struct Services {
     pub events: Events,
     /// Thumbnails of stored files, by their contents' hash.
     pub thumbnails: Thumbnails,
+    /// Live updates, for hints about the module's own changes. Changes made
+    /// through storage and the event log send their own.
+    pub live: Live,
 }
 
 /// What a module gives the server when it starts.

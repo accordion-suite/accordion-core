@@ -21,6 +21,7 @@ use rusqlite::{Connection, OptionalExtension, Row};
 use serde_json::Value;
 
 use crate::db::{self, Database, Migration};
+use crate::live::{self, Hint};
 use crate::sql_now;
 use crate::storage::{self, Access};
 
@@ -566,7 +567,7 @@ impl Events {
     pub async fn mark_seen(&self, user: UserId, up_to: i64) -> Result<(), Error> {
         self.db
             .write(move |tx| {
-                tx.execute(
+                let seen = tx.execute(
                     concat!(
                         "UPDATE events_notices SET seen_at = ",
                         sql_now!(),
@@ -574,6 +575,7 @@ impl Events {
                     ),
                     (user.as_uuid(), up_to),
                 )?;
+                changed_notices(user, seen);
                 Ok(())
             })
             .await
@@ -589,11 +591,13 @@ impl Events {
                     sql_now!(),
                     "), seen_at = coalesce(seen_at, ",
                     sql_now!(),
-                    ") WHERE user_id = ?1 AND event_id = ?2"
+                    ") WHERE user_id = ?1 AND event_id = ?2 AND read_at IS NULL"
                 ))?;
+                let mut read = 0;
                 for event in events {
-                    statement.execute((user.as_uuid(), event))?;
+                    read += statement.execute((user.as_uuid(), event))?;
                 }
+                changed_notices(user, read);
                 Ok(())
             })
             .await
@@ -606,9 +610,11 @@ impl Events {
             .write(move |tx| {
                 let mut statement =
                     tx.prepare("DELETE FROM events_notices WHERE user_id = ?1 AND event_id = ?2")?;
+                let mut removed = 0;
                 for event in events {
-                    statement.execute((user.as_uuid(), event))?;
+                    removed += statement.execute((user.as_uuid(), event))?;
                 }
+                changed_notices(user, removed);
                 Ok(())
             })
             .await
@@ -619,10 +625,11 @@ impl Events {
     pub async fn clear_notifications(&self, user: UserId, up_to: i64) -> Result<(), Error> {
         self.db
             .write(move |tx| {
-                tx.execute(
+                let removed = tx.execute(
                     "DELETE FROM events_notices WHERE user_id = ?1 AND event_id <= ?2",
                     (user.as_uuid(), up_to),
                 )?;
+                changed_notices(user, removed);
                 Ok(())
             })
             .await
@@ -824,6 +831,7 @@ fn event_from_row(row: &Row<'_>) -> rusqlite::Result<Event> {
 /// but not when it's taken away. An owner hears when someone else changes
 /// their files.
 pub(crate) fn record(conn: &Connection, actor: Actor, event: &NewEvent) -> rusqlite::Result<()> {
+    hint(conn, event)?;
     if let (Some(user), Some(item)) = (actor.user, event.item) {
         if event.action == Action::Edited && merge_edit(conn, user, item)? {
             return Ok(());
@@ -870,6 +878,54 @@ pub(crate) fn record(conn: &Connection, actor: Actor, event: &NewEvent) -> rusql
             "INSERT INTO events_notices (user_id, event_id) VALUES (?1, ?2)",
             (user.as_uuid(), id),
         )?;
+        db::hint(Hint::person(live::NOTIFICATIONS, user));
+    }
+    Ok(())
+}
+
+/// Tells `user`'s other tabs that their notifications changed, if `count`
+/// of them did, so the bell matches everywhere.
+fn changed_notices(user: UserId, count: usize) {
+    if count > 0 {
+        db::hint(Hint::person(live::NOTIFICATIONS, user));
+    }
+}
+
+/// Sends live updates about an event once it commits: the lists of the
+/// folders it changed, to whoever can open them, and **Shared with me** to
+/// someone whose access changed.
+fn hint(conn: &Connection, event: &NewEvent) -> rusqlite::Result<()> {
+    let Some(item) = event.item else {
+        return Ok(());
+    };
+    let mut folders = Vec::new();
+    let found: Option<(Option<uuid::Uuid>, bool)> = conn
+        .query_row(
+            "SELECT parent_id, kind = 'folder' FROM storage_items WHERE id = ?1",
+            [item.as_uuid()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((parent, folder)) = found {
+        folders.extend(parent.map(ItemId::from_uuid));
+        // A folder's own page shows its name, which a rename or move changes.
+        if folder {
+            folders.push(item);
+        }
+    }
+    for end in ["from", "to"] {
+        let moved = event.details.get(end).cloned();
+        folders.extend(moved.and_then(|id| serde_json::from_value::<ItemId>(id).ok()));
+    }
+    folders.sort_unstable();
+    folders.dedup();
+    for folder in folders {
+        db::hint(Hint::item(live::DRIVE_ITEMS, folder));
+    }
+    if let (Action::Shared | Action::ShareChanged | Action::Unshared, Some(other)) =
+        (event.action, event.other)
+    {
+        db::hint(Hint::person(live::DRIVE_SHARED, other));
     }
     Ok(())
 }

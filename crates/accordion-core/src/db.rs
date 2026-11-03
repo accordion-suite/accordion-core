@@ -11,6 +11,7 @@
 //! its own [`Migration`]s. Table names start with the owner's name, such as
 //! `identity_users` or `drive_files`, so owners never collide.
 
+use std::cell::RefCell;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -19,7 +20,9 @@ use std::thread;
 
 use rusqlite::backup::Backup;
 use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
-use tokio::sync::oneshot;
+use tokio::sync::{broadcast, oneshot};
+
+use crate::live::Hint;
 
 pub use rusqlite;
 
@@ -120,12 +123,30 @@ pub struct Migration {
 
 type Job = Box<dyn FnOnce(&mut Connection) + Send>;
 
+/// How many hints can wait for live updates to pick them up. Live updates
+/// close every stream if they fall further behind, and clients reload.
+const HINTS_WAITING: usize = 1024;
+
+thread_local! {
+    /// Hints from the write transaction running on this thread, sent once
+    /// it commits.
+    static HINTS: RefCell<Vec<Hint>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Sends `hint` to live updates once the write transaction running on this
+/// thread commits, or never if it rolls back. Call it only from inside
+/// [`Database::write`].
+pub(crate) fn hint(hint: Hint) {
+    HINTS.with_borrow_mut(|hints| hints.push(hint));
+}
+
 /// A handle to the metadata database. Cloning it is cheap, and every clone
 /// shares the same connections.
 #[derive(Clone)]
 pub struct Database {
     writer: Sender<Job>,
     readers: Sender<Job>,
+    hints: broadcast::Sender<Hint>,
 }
 
 impl Database {
@@ -176,6 +197,7 @@ impl Database {
         Ok(Self {
             writer: writer_jobs,
             readers: reader_jobs,
+            hints: broadcast::Sender::new(HINTS_WAITING),
         })
     }
 
@@ -190,16 +212,34 @@ impl Database {
         T: Send + 'static,
         E: From<rusqlite::Error> + Send + 'static,
     {
+        let hints = self.hints.clone();
         run(&self.writer, move |conn| {
+            // Hints left by a transaction that failed are never sent.
+            HINTS.with_borrow_mut(Vec::clear);
             // IMMEDIATE takes the write lock up front, so a transaction never
             // fails halfway because something outside the server, such as a
             // backup, started writing.
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let value = f(&tx)?;
             tx.commit()?;
+            for hint in HINTS.take() {
+                // Sending fails only when nothing is listening, which is fine.
+                let _ = hints.send(hint);
+            }
             Ok(value)
         })
         .await
+    }
+
+    /// Sends `hint` to live updates now, for a change that has already
+    /// committed.
+    pub(crate) fn send_hint(&self, hint: Hint) {
+        let _ = self.hints.send(hint);
+    }
+
+    /// Hints from changes as they commit, for live updates.
+    pub(crate) fn hints(&self) -> broadcast::Receiver<Hint> {
+        self.hints.subscribe()
     }
 
     /// Runs `f` on a read-only connection.
@@ -407,6 +447,32 @@ mod tests {
             .collect::<Result<_, _>>()
             .unwrap();
         assert_eq!(names, ["Rex"]);
+    }
+
+    #[tokio::test]
+    async fn hints_are_sent_only_when_the_write_commits() {
+        use crate::live::{Audience, Hint};
+        let (_dir, db) = open();
+        let mut hints = db.hints();
+        let hint = |id: &str| Hint {
+            kind: "pets.pets",
+            id: Some(id.into()),
+            audience: Audience::People(Vec::new()),
+        };
+        db.write(move |_| {
+            super::hint(hint("rolled back"));
+            Err::<(), _>(rusqlite::Error::QueryReturnedNoRows)
+        })
+        .await
+        .unwrap_err();
+        db.write(move |_| {
+            super::hint(hint("committed"));
+            Ok::<_, rusqlite::Error>(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(hints.recv().await.unwrap().id.as_deref(), Some("committed"));
+        assert!(hints.try_recv().is_err());
     }
 
     #[tokio::test]

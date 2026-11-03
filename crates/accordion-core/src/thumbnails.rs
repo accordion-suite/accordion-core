@@ -40,6 +40,7 @@ use rusqlite::{OptionalExtension, Row};
 use tokio::sync::watch;
 
 use crate::db::{self, Database, Migration};
+use crate::live::{self, Hint};
 use crate::sql_now;
 use crate::storage::{ContentHash, Storage, blobs};
 
@@ -705,7 +706,11 @@ impl Thumbnails {
                              reason = excluded.reason, made_at = excluded.made_at"
                     ),
                     (&hash.0[..], state, WORKER, reason),
-                )
+                )?;
+                if state == "ready" {
+                    hint_folders(tx, hash)?;
+                }
+                Ok::<_, rusqlite::Error>(())
             })
             .await?;
         Ok(())
@@ -1564,6 +1569,25 @@ fn text(head: &[u8]) -> Vec<u8> {
         .map(|line| line.strip_suffix('\r').unwrap_or(line))
         .collect();
     lines.join("\n").into_bytes()
+}
+
+/// Tells whoever can open the folders of files with these contents that
+/// their thumbnails are ready, once the transaction commits.
+fn hint_folders(conn: &rusqlite::Connection, hash: ContentHash) -> rusqlite::Result<()> {
+    let folders = conn
+        .prepare(
+            "SELECT DISTINCT i.parent_id FROM storage_versions v
+             JOIN storage_items i ON i.id = v.item_id
+             WHERE v.blob = ?1 AND i.parent_id IS NOT NULL",
+        )?
+        .query_map([&hash.0[..]], |row| {
+            Ok(accordion_types::ItemId::from_uuid(row.get(0)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for folder in folders {
+        db::hint(Hint::item(live::DRIVE_ITEMS, folder));
+    }
+    Ok(())
 }
 
 fn hash(row: &Row<'_>, index: usize) -> rusqlite::Result<ContentHash> {

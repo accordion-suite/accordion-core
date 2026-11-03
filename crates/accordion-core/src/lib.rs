@@ -9,6 +9,7 @@ pub mod backup;
 pub mod db;
 pub mod events;
 pub mod identity;
+pub mod live;
 mod random;
 pub mod storage;
 pub mod thumbnails;

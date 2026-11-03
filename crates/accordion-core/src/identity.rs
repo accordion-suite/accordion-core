@@ -7,11 +7,13 @@ mod app_password;
 pub mod limits;
 mod members;
 pub mod password;
+mod remote_device;
 mod session;
 
 pub use app_password::{AppPassword, AppPasswordSecret, AppPasswordUse, UsingAppPassword};
 pub use limits::SignInFrom;
 pub use members::{AppPasswords, LinkPurpose, LinkToken, Member, PasswordLink};
+pub use remote_device::{MAX_PER_PERSON as MAX_REMOTE_DEVICES, NewRemoteDevice, RemoteDevice};
 pub use session::{AuthMethod, Client, Session, SessionToken, SignedIn};
 
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -19,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use accordion_types::{Role, SessionId, UserId};
 use rusqlite::{Connection, OptionalExtension, Row, Transaction};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 
 use crate::db::{self, Database, Migration};
 use crate::events::{self, Action, Actor, NewEvent};
@@ -111,6 +113,31 @@ static MIGRATIONS: &[Migration] = &[
         ) STRICT, WITHOUT ROWID;
     ",
     },
+    Migration {
+        version: 5,
+        name: "Create remote access devices",
+        sql: "
+        CREATE TABLE identity_remote_devices (
+            id BLOB PRIMARY KEY CHECK (length(id) = 16),
+            user_id BLOB NOT NULL REFERENCES identity_users (id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            -- The device's WireGuard public key. Its private key is never
+            -- stored.
+            public_key BLOB NOT NULL UNIQUE CHECK (length(public_key) = 32),
+            -- The last part of its address in the tunnel's /24.
+            host INTEGER NOT NULL UNIQUE CHECK (host BETWEEN 2 AND 254),
+            -- The server's home address and the UDP port in its setup, so
+            -- a setup that's out of date shows.
+            home_address TEXT NOT NULL,
+            port INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535),
+            created_at TEXT NOT NULL,
+            -- When it last connected from away.
+            last_connected_at TEXT
+        ) STRICT, WITHOUT ROWID;
+
+        CREATE INDEX identity_remote_devices_user ON identity_remote_devices (user_id);
+    ",
+    },
 ];
 
 /// Names that can't be usernames. Storage's plain view keeps each user's
@@ -161,6 +188,19 @@ pub enum Error {
 
     #[error("This link has expired or was already used. Ask your admin for a new one.")]
     LinkNotValid,
+
+    #[error(
+        "You can add up to {} devices for remote access. Remove one you don't use, then try \
+         again.",
+        remote_device::MAX_PER_PERSON
+    )]
+    TooManyRemoteDevices,
+
+    #[error(
+        "The server has no room for another remote access device. Ask your admin to remove \
+         devices nobody uses."
+    )]
+    NoRemoteAddressLeft,
 
     /// Deliberately vague, so sign-in pages don't reveal which usernames exist.
     #[error("The username or password is incorrect.")]
@@ -215,6 +255,8 @@ pub struct NewUser {
 pub struct Identity {
     db: Database,
     ended: broadcast::Sender<SessionId>,
+    /// Counts changes to the devices that may use remote access.
+    remote_devices_changed: Arc<watch::Sender<u64>>,
     limits: Arc<Mutex<limits::Limits>>,
     actor: Actor,
 }
@@ -230,6 +272,7 @@ impl Identity {
         Ok(Self {
             db,
             ended,
+            remote_devices_changed: Arc::new(watch::Sender::new(0)),
             limits: Arc::default(),
             actor: Actor::SERVER,
         })

@@ -103,7 +103,8 @@ impl From<identity::Error> for ApiError {
         let status = match err {
             InvalidUsername | InvalidDisplayName | PasswordTooShort | PasswordTooLong
             | RoleNotAllowed => StatusCode::BAD_REQUEST,
-            UsernameTaken | UsernameReserved | OwnerExists | OwnerAccount => StatusCode::CONFLICT,
+            UsernameTaken | UsernameReserved | OwnerExists | OwnerAccount
+            | TooManyRemoteDevices | NoRemoteAddressLeft => StatusCode::CONFLICT,
             UserNotFound => StatusCode::NOT_FOUND,
             TurnedOff => StatusCode::FORBIDDEN,
             LinkNotValid => StatusCode::GONE,

@@ -265,6 +265,13 @@ pub enum Action {
     AppPasswordCreated,
     /// Details: `device`.
     AppPasswordRemoved,
+    /// A device added for remote access (decision 21). `other` is whose.
+    /// Details: `device`.
+    RemoteDeviceAdded,
+    /// `other` is whose. Details: `device`.
+    RemoteDeviceRemoved,
+    /// Details: `on`, and `port` when it's on.
+    RemoteAccessChanged,
     /// `other` is the new account. Details: `role`.
     AccountCreated,
     /// `other` is the account. Details: `change`, one of `role`, `name`,
@@ -306,6 +313,9 @@ impl Action {
             Self::PasswordChanged => "password_changed",
             Self::AppPasswordCreated => "app_password_created",
             Self::AppPasswordRemoved => "app_password_removed",
+            Self::RemoteDeviceAdded => "remote_device_added",
+            Self::RemoteDeviceRemoved => "remote_device_removed",
+            Self::RemoteAccessChanged => "remote_access_changed",
             Self::AccountCreated => "account_created",
             Self::AccountChanged => "account_changed",
             Self::AccountDeleted => "account_deleted",
@@ -317,7 +327,7 @@ impl Action {
         }
     }
 
-    const ALL: [Self; 27] = [
+    const ALL: [Self; 30] = [
         Self::Added,
         Self::Edited,
         Self::Renamed,
@@ -337,6 +347,9 @@ impl Action {
         Self::PasswordChanged,
         Self::AppPasswordCreated,
         Self::AppPasswordRemoved,
+        Self::RemoteDeviceAdded,
+        Self::RemoteDeviceRemoved,
+        Self::RemoteAccessChanged,
         Self::AccountCreated,
         Self::AccountChanged,
         Self::AccountDeleted,

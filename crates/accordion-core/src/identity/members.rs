@@ -369,6 +369,8 @@ impl Identity {
             })
             .await?;
         self.announce_ended(&ended);
+        self.remote_devices_changed
+            .send_modify(|version| *version += 1);
         Ok(())
     }
 
@@ -446,6 +448,8 @@ impl Identity {
             })
             .await?;
         self.announce_ended(&ended);
+        self.remote_devices_changed
+            .send_modify(|version| *version += 1);
         Ok(())
     }
 
@@ -463,9 +467,12 @@ impl Identity {
                 if turned_on > 0 {
                     record(tx, actor, changed(id, "turned_on"))?;
                 }
-                Ok(())
+                Ok::<_, Error>(())
             })
-            .await
+            .await?;
+        self.remote_devices_changed
+            .send_modify(|version| *version += 1);
+        Ok(())
     }
 }
 

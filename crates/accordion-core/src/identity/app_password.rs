@@ -16,7 +16,8 @@ use rusqlite::{OptionalExtension, Row};
 use sha2::{Digest, Sha256};
 
 use super::session::{bad_value, clean_device_name, last_used_precision};
-use super::{Error, Identity, User, normalize_username, user_from_row};
+use super::{Error, Identity, User, normalize_username, record, user_from_row};
+use crate::events::{Action, NewEvent};
 use crate::{random, sql_now};
 
 /// 16 lowercase letters is about 75 bits, far more than anyone can guess
@@ -108,6 +109,7 @@ impl Identity {
         let (secret, hash) = new_secret();
         let id = AppPasswordId::generate();
         let device_name = clean_device_name(device_name);
+        let actor = self.actor_or(user_id);
         let created = self
             .db
             .write(move |tx| {
@@ -143,6 +145,13 @@ impl Identity {
                     ),
                     [id.as_uuid()],
                     app_password_from_row,
+                )?;
+                record(
+                    tx,
+                    actor,
+                    NewEvent::new(Action::AppPasswordCreated)
+                        .other(user_id)
+                        .details(serde_json::json!({ "device": created.device_name })),
                 )?;
                 Ok(created)
             })
@@ -244,16 +253,30 @@ impl Identity {
         user_id: UserId,
         id: AppPasswordId,
     ) -> Result<bool, Error> {
-        let deleted = self
-            .db
+        let actor = self.actor_or(user_id);
+        self.db
             .write(move |tx| {
-                tx.execute(
-                    "DELETE FROM identity_app_passwords WHERE user_id = ?1 AND id = ?2",
-                    (user_id.as_uuid(), id.as_uuid()),
-                )
+                let device: Option<String> = tx
+                    .query_row(
+                        "DELETE FROM identity_app_passwords WHERE user_id = ?1 AND id = ?2
+                         RETURNING device_name",
+                        (user_id.as_uuid(), id.as_uuid()),
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let Some(device) = device else {
+                    return Ok(false);
+                };
+                record(
+                    tx,
+                    actor,
+                    NewEvent::new(Action::AppPasswordRemoved)
+                        .other(user_id)
+                        .details(serde_json::json!({ "device": device })),
+                )?;
+                Ok(true)
             })
-            .await?;
-        Ok(deleted > 0)
+            .await
     }
 }
 

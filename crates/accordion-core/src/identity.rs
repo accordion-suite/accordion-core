@@ -22,6 +22,7 @@ use rusqlite::{Connection, OptionalExtension, Row, Transaction};
 use tokio::sync::broadcast;
 
 use crate::db::{self, Database, Migration};
+use crate::events::{self, Action, Actor, NewEvent};
 
 const OWNER: &str = "identity";
 
@@ -206,17 +207,23 @@ pub struct NewUser {
 }
 
 /// The identity service. Cloning it is cheap.
+///
+/// Sign-ins and changes to accounts are recorded in the event log as the
+/// handle's actor, which is the server unless the handle came from
+/// [`Identity::acting_as`].
 #[derive(Clone)]
 pub struct Identity {
     db: Database,
     ended: broadcast::Sender<SessionId>,
     limits: Arc<Mutex<limits::Limits>>,
+    actor: Actor,
 }
 
 impl Identity {
     /// Starts the identity service, creating or updating its tables first.
     pub async fn new(db: Database) -> Result<Self, Error> {
         db.migrate(OWNER, MIGRATIONS).await?;
+        events::migrate(&db).await?;
         // Sign-outs come in bursts of at most a few dozen, such as signing
         // out everywhere, so this is plenty.
         let (ended, _) = broadcast::channel(256);
@@ -224,7 +231,26 @@ impl Identity {
             db,
             ended,
             limits: Arc::default(),
+            actor: Actor::SERVER,
         })
+    }
+
+    /// A handle that records sign-ins and account changes as `actor`, such
+    /// as the person making a request and where it came from.
+    pub fn acting_as(&self, actor: Actor) -> Self {
+        Self {
+            actor,
+            ..self.clone()
+        }
+    }
+
+    /// The handle's actor, or `user` acting for themselves if the handle
+    /// has nobody, such as the server.
+    fn actor_or(&self, user: UserId) -> Actor {
+        Actor {
+            user: self.actor.user.or(Some(user)),
+            ..self.actor
+        }
     }
 
     /// Whether the server has an owner yet. The setup wizard runs until it
@@ -248,8 +274,12 @@ impl Identity {
         let hash = password::hash(new.password).await?;
 
         let created = user.clone();
+        let actor = self.actor;
         self.db
-            .write(move |tx| insert_user(tx, &user, Some(&hash)))
+            .write(move |tx| {
+                insert_user(tx, &user, Some(&hash))?;
+                record(tx, actor, account_created(&user))
+            })
             .await?;
         Ok(created)
     }
@@ -300,7 +330,30 @@ impl Identity {
         self.limits()
             .start(username, from, Instant::now())
             .map_err(|wait| Error::TooManyTries { wait })?;
-        let user = self.verify_password(username, password).await?;
+        let user = match self.verify_password(username, password).await {
+            Err(Failed::Wrong(Some(id))) => {
+                let actor = Actor {
+                    user: None,
+                    address: Some(from.address),
+                    ..self.actor
+                };
+                self.db
+                    .write(move |tx| {
+                        record(
+                            tx,
+                            actor,
+                            NewEvent::new(Action::SignInFailed)
+                                .other(id)
+                                .details(serde_json::json!({ "address": from.address })),
+                        )
+                    })
+                    .await?;
+                return Err(Error::WrongCredentials);
+            }
+            Err(Failed::Wrong(None)) => return Err(Error::WrongCredentials),
+            Err(Failed::Other(err)) => return Err(err),
+            Ok(user) => user,
+        };
         self.limits().succeeded(username, from);
         Ok(user)
     }
@@ -311,8 +364,8 @@ impl Identity {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    async fn verify_password(&self, username: &str, password: &str) -> Result<User, Error> {
-        let found = match normalize_username(username) {
+    async fn verify_password(&self, username: &str, password: &str) -> Result<User, Failed> {
+        let found: Result<_, rusqlite::Error> = match normalize_username(username) {
             Ok(username) => {
                 self.db
                     .read(move |conn| {
@@ -331,10 +384,11 @@ impl Identity {
                         )
                         .optional()
                     })
-                    .await?
+                    .await
             }
-            Err(_) => None,
+            Err(_) => Ok(None),
         };
+        let found = found.map_err(|err| Failed::Other(err.into()))?;
         let (user, hash, turned_off) = match found {
             Some((user, hash, turned_off)) => (Some(user), hash, turned_off),
             None => (None, None, false),
@@ -345,9 +399,9 @@ impl Identity {
         let matched = password::verify(password, hash).await;
         match user {
             // Only someone with the right password learns the account is off.
-            Some(_) if matched && turned_off => Err(Error::TurnedOff),
+            Some(_) if matched && turned_off => Err(Failed::Other(Error::TurnedOff)),
             Some(user) if matched => Ok(user),
-            _ => Err(Error::WrongCredentials),
+            user => Err(Failed::Wrong(user.map(|user| user.id))),
         }
     }
 
@@ -364,6 +418,7 @@ impl Identity {
     ) -> Result<(), Error> {
         check_password_rules(&password)?;
         let hash = password::hash(password).await?;
+        let actor = self.actor;
         let ended = self
             .db
             .write(move |tx| {
@@ -374,6 +429,7 @@ impl Identity {
                 if changed == 0 {
                     return Err(Error::UserNotFound);
                 }
+                record(tx, actor, NewEvent::new(Action::PasswordChanged).other(id))?;
                 // A nil UUID matches no session, so `None` keeps none.
                 let keep = keep.map_or(uuid::Uuid::nil(), |keep| keep.as_uuid());
                 Ok(session::delete_sessions(
@@ -386,6 +442,30 @@ impl Identity {
         self.announce_ended(&ended);
         Ok(())
     }
+}
+
+/// Why a password check failed.
+enum Failed {
+    /// The username or password was wrong, with the account if there's one
+    /// by that username.
+    Wrong(Option<UserId>),
+    Other(Error),
+}
+
+impl From<rusqlite::Error> for Failed {
+    fn from(err: rusqlite::Error) -> Self {
+        Self::Other(err.into())
+    }
+}
+
+pub(super) fn record(conn: &Connection, actor: Actor, event: NewEvent) -> Result<(), Error> {
+    Ok(events::record(conn, actor, &event)?)
+}
+
+pub(super) fn account_created(user: &User) -> NewEvent {
+    NewEvent::new(Action::AccountCreated)
+        .other(user.id)
+        .details(serde_json::json!({ "role": user.role.as_str() }))
 }
 
 /// Checks the details of a new account, before it has a password.

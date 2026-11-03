@@ -9,7 +9,8 @@ use std::time::Duration;
 use rusqlite::params_from_iter;
 
 use super::blobs::Problem;
-use super::{Blob, ContentHash, Error, Storage, delete_subtree, hash_from, size_from};
+use super::{Blob, ContentHash, Error, Storage, delete_for_good, hash_from, item, size_from};
+use crate::events::Actor;
 use crate::sql_now;
 
 /// SQL that's true for a `storage_blobs` row that no version and no module
@@ -173,7 +174,9 @@ impl Storage {
                         })?
                         .collect::<Result<_, _>>()?;
                     for &id in &ids {
-                        delete_subtree(tx, id)?;
+                        if let Some(item) = item(tx, id)? {
+                            delete_for_good(tx, &item, Actor::SERVER)?;
+                        }
                     }
                     Ok::<_, Error>(ids.len())
                 })

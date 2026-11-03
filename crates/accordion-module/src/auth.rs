@@ -8,8 +8,9 @@
 //! Both checks find identity in the router's state, so a module's state only
 //! has to implement `FromRef` for [`Identity`].
 
+use accordion_core::events::{Actor, Via};
 use accordion_core::identity::{
-    AppPasswordUse, Identity, SessionToken, SignedIn, UsingAppPassword,
+    AppPasswordUse, Client, Identity, SessionToken, SignedIn, UsingAppPassword,
 };
 use axum::extract::{FromRef, FromRequestParts};
 use axum::http::header::{AUTHORIZATION, COOKIE, WWW_AUTHENTICATE};
@@ -50,6 +51,23 @@ where
     }
 }
 
+impl Authenticated {
+    /// Who's making the request, for the event log.
+    pub fn actor(&self) -> Actor {
+        actor(&self.0)
+    }
+}
+
+/// Who's making a request from a signed-in session, for the event log: the
+/// person, in the web app or one of Accordion's apps.
+pub fn actor(signed_in: &SignedIn) -> Actor {
+    let via = match signed_in.session.client {
+        Client::Browser => Via::Web,
+        Client::App => Via::App,
+    };
+    Actor::person(signed_in.user.id, via)
+}
+
 /// A request from a standard client that signed in with an app password for
 /// files, calendars, and contacts. Requests without one get a 401 response
 /// that asks the client for a username and password.
@@ -77,6 +95,13 @@ where
             Ok(None) => Err(ask_for_app_password()),
             Err(err) => Err(ApiError::from(err).into_response()),
         }
+    }
+}
+
+impl DavUser {
+    /// Who's making the request, for the event log.
+    pub fn actor(&self) -> Actor {
+        Actor::person(self.0.user.id, Via::WebDav)
     }
 }
 

@@ -26,6 +26,7 @@ mod uploads;
 mod view;
 
 pub use blobs::{Blob, ContentHash, Problem};
+pub(crate) use shares::access;
 pub use shares::{Access, Share, ShareEvent, ShareLevel, Shared, SharedOut};
 pub use upkeep::{Checked, Cleaned, Damage, Purged, Retention, StorageStatus};
 pub use uploads::Upload;
@@ -42,6 +43,7 @@ use tokio::io::AsyncRead;
 use tokio::sync::watch;
 
 use crate::db::{self, Database, Migration};
+use crate::events::{self, Action, Actor, NewEvent};
 use crate::identity::{self, Identity};
 use crate::sql_now;
 use blobs::{Blobs, Received};
@@ -175,6 +177,23 @@ static MIGRATIONS: &[Migration] = &[
         -- Who's sending an upload into someone else's storage, such as an
         -- editor of a shared folder. NULL when it's the owner.
         ALTER TABLE storage_uploads ADD COLUMN started_by BLOB;
+    ",
+    },
+    Migration {
+        version: 4,
+        name: "Move sharing history into the event log",
+        sql: "
+        -- Earlier versions didn't record how a share was made or whether it
+        -- changed someone's access, so each becomes a share from the web app.
+        INSERT INTO events_log (at, actor_id, via, action, item_id, owner_id, other_id, details)
+        SELECT e.at, e.by_id, 'web',
+               CASE WHEN e.level IS NULL THEN 'unshared' ELSE 'shared' END,
+               e.item_id, i.owner_id, e.user_id,
+               CASE WHEN e.level IS NULL THEN NULL
+                    ELSE json_object('level', e.level) END
+        FROM storage_share_events e LEFT JOIN storage_items i ON i.id = e.item_id
+        ORDER BY e.id;
+        DROP TABLE storage_share_events;
     ",
     },
 ];
@@ -391,9 +410,13 @@ pub enum LeaveFiles {
 }
 
 /// The storage service. Cloning it is cheap.
+///
+/// Each change is recorded in the event log as the handle's actor, which is
+/// the server unless the handle came from [`Storage::acting_as`].
 #[derive(Clone)]
 pub struct Storage {
     inner: Arc<Inner>,
+    actor: Actor,
 }
 
 struct Inner {
@@ -433,6 +456,9 @@ impl Storage {
     /// Starts the storage service in `dir`, creating its tables and folders
     /// first, and checks that the plain view can use hard links.
     pub async fn open(db: Database, identity: Identity, dir: &Path) -> Result<Self, Error> {
+        // The event log comes first, since migration 4 moves sharing
+        // history into it.
+        events::migrate(&db).await?;
         db.migrate(OWNER, MIGRATIONS).await?;
         let blobs = Blobs::open(dir)?;
         let view = View::open(&dir.join("files"))?;
@@ -449,7 +475,17 @@ impl Storage {
                 saved: watch::Sender::new(0),
                 holds: AtomicUsize::new(0),
             }),
+            actor: Actor::SERVER,
         })
+    }
+
+    /// A handle that records its changes in the event log as `actor`, such
+    /// as the person making a request.
+    pub fn acting_as(&self, actor: Actor) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            actor,
+        }
     }
 
     /// Stops upkeep from removing stored contents until the hold is dropped.
@@ -744,6 +780,7 @@ impl Storage {
         let name = check_name(name)?;
         let _changes = self.inner.changes.lock().await;
         let id = ItemId::generate();
+        let actor = self.actor;
         let item = self
             .inner
             .db
@@ -753,6 +790,7 @@ impl Storage {
                     return Err(other.name_taken());
                 }
                 insert_item(tx, id, parent.owner, parent.id, &name, "folder")?;
+                record(tx, actor, added(id, parent.owner, "created"))?;
                 item(tx, id)?.ok_or(Error::NotFound)
             })
             .await?;
@@ -800,6 +838,7 @@ impl Storage {
         let kept = self.keep(received).await?;
         let stored = kept.stored;
         let new_id = ItemId::generate();
+        let actor = self.actor;
         let item = self
             .inner
             .db
@@ -807,9 +846,13 @@ impl Storage {
                 let (parent, existing) = check_save(tx, parent, &name, blob.size, upload)?;
                 insert_blob(tx, blob, stored)?;
                 let id = match existing {
-                    Some(id) => id,
+                    Some(id) => {
+                        record(tx, actor, NewEvent::about(Action::Edited, id, parent.owner))?;
+                        id
+                    }
                     None => {
                         insert_item(tx, new_id, parent.owner, parent.id, &name, "file")?;
+                        record(tx, actor, added(new_id, parent.owner, "uploaded"))?;
                         new_id
                     }
                 };
@@ -952,6 +995,7 @@ impl Storage {
     /// Every version stays in the history, apart from an empty current one.
     pub async fn restore_version(&self, id: ItemId, version: VersionId) -> Result<Item, Error> {
         let _changes = self.inner.changes.lock().await;
+        let actor = self.actor;
         let item = self
             .inner
             .db
@@ -960,23 +1004,32 @@ impl Storage {
                 if !location(tx, id)?.visible {
                     return Err(Error::InTrash);
                 }
-                let blob = tx
+                let (blob, number) = tx
                     .query_row(
-                        "SELECT v.blob, b.size FROM storage_versions v
+                        "SELECT v.blob, b.size, v.number FROM storage_versions v
                          JOIN storage_blobs b ON b.hash = v.blob
                          WHERE v.item_id = ?1 AND v.id = ?2",
                         (item.id.as_uuid(), version.as_uuid()),
                         |row| {
-                            Ok(Blob {
-                                hash: hash_from(row, 0)?,
-                                size: size_from(row, 1)?,
-                            })
+                            Ok((
+                                Blob {
+                                    hash: hash_from(row, 0)?,
+                                    size: size_from(row, 1)?,
+                                },
+                                row.get::<_, u32>(2)?,
+                            ))
                         },
                     )
                     .optional()?
                     .ok_or(Error::NotFound)?;
                 check_space(tx, item.owner, blob.size, None)?;
                 add_version(tx, id, blob)?;
+                record(
+                    tx,
+                    actor,
+                    NewEvent::about(Action::VersionRestored, id, item.owner)
+                        .details(serde_json::json!({ "number": number })),
+                )?;
                 item_or_missing(tx, id)
             })
             .await?;
@@ -993,6 +1046,7 @@ impl Storage {
         let name = check_name(name)?;
         let _changes = self.inner.changes.lock().await;
         let new_id = ItemId::generate();
+        let actor = self.actor;
         let item = self
             .inner
             .db
@@ -1011,6 +1065,7 @@ impl Storage {
                 check_space(tx, parent.owner, blob.size, None)?;
                 insert_item(tx, new_id, parent.owner, parent.id, &name, "file")?;
                 add_version(tx, new_id, blob)?;
+                record(tx, actor, added(new_id, parent.owner, "copied"))?;
                 item_or_missing(tx, new_id)
             })
             .await?;
@@ -1028,6 +1083,7 @@ impl Storage {
         let new_name = check_name(new_name)?;
         let _changes = self.inner.changes.lock().await;
         let before = self.view_path(id).await?;
+        let actor = self.actor;
         let item = self
             .inner
             .db
@@ -1059,6 +1115,28 @@ impl Storage {
                     ),
                     (id.as_uuid(), parent.id.as_uuid(), &new_name),
                 )?;
+                if item.parent != Some(parent.id) {
+                    record(
+                        tx,
+                        actor,
+                        NewEvent::about(Action::Moved, id, item.owner).details(serde_json::json!({
+                            "from": item.parent,
+                            "to": parent.id,
+                        })),
+                    )?;
+                }
+                if item.name != new_name {
+                    record(
+                        tx,
+                        actor,
+                        NewEvent::about(Action::Renamed, id, item.owner).details(
+                            serde_json::json!({
+                                "from": item.name,
+                                "to": new_name,
+                            }),
+                        ),
+                    )?;
+                }
                 item_or_missing(tx, id)
             })
             .await?;
@@ -1070,6 +1148,7 @@ impl Storage {
     pub async fn delete(&self, id: ItemId) -> Result<Item, Error> {
         let _changes = self.inner.changes.lock().await;
         let before = self.view_path(id).await?;
+        let actor = self.actor;
         let item = self
             .inner
             .db
@@ -1089,6 +1168,7 @@ impl Storage {
                     ),
                     [id.as_uuid()],
                 )?;
+                record(tx, actor, NewEvent::about(Action::Trashed, id, item.owner))?;
                 item_or_missing(tx, id)
             })
             .await?;
@@ -1099,6 +1179,7 @@ impl Storage {
     /// Takes an item out of the trash, back to the folder it was in.
     pub async fn restore(&self, id: ItemId) -> Result<Item, Error> {
         let _changes = self.inner.changes.lock().await;
+        let actor = self.actor;
         let item = self
             .inner
             .db
@@ -1115,6 +1196,7 @@ impl Storage {
                     "UPDATE storage_items SET trashed_at = NULL WHERE id = ?1",
                     [id.as_uuid()],
                 )?;
+                record(tx, actor, NewEvent::about(Action::Restored, id, item.owner))?;
                 item_or_missing(tx, id)
             })
             .await?;
@@ -1127,6 +1209,7 @@ impl Storage {
     /// them.
     pub async fn delete_forever(&self, id: ItemId) -> Result<(), Error> {
         let _changes = self.inner.changes.lock().await;
+        let actor = self.actor;
         self.inner
             .db
             .write(move |tx| {
@@ -1134,7 +1217,7 @@ impl Storage {
                 if item.trashed_at.is_none() {
                     return Err(Error::NotInTrash);
                 }
-                delete_subtree(tx, id)
+                delete_for_good(tx, &item, actor)
             })
             .await
     }
@@ -1142,18 +1225,18 @@ impl Storage {
     /// Deletes everything in `owner`'s trash for good.
     pub async fn empty_trash(&self, owner: UserId) -> Result<(), Error> {
         let _changes = self.inner.changes.lock().await;
+        let actor = self.actor;
         self.inner
             .db
             .write(move |tx| {
-                let trashed: Vec<ItemId> = tx
-                    .prepare(
-                        "SELECT id FROM storage_items
-                         WHERE owner_id = ?1 AND trashed_at IS NOT NULL",
-                    )?
-                    .query_map([owner.as_uuid()], |row| Ok(ItemId::from_uuid(row.get(0)?)))?
+                let trashed: Vec<Item> = tx
+                    .prepare(&format!(
+                        "{ITEM_SELECT} WHERE i.owner_id = ?1 AND i.trashed_at IS NOT NULL"
+                    ))?
+                    .query_map([owner.as_uuid()], item_from_row)?
                     .collect::<Result<_, _>>()?;
-                for id in trashed {
-                    delete_subtree(tx, id)?;
+                for item in trashed {
+                    delete_for_good(tx, &item, actor)?;
                 }
                 Ok(())
             })
@@ -1183,9 +1266,17 @@ impl Storage {
             .user(owner)
             .await?
             .ok_or(Error::UserNotFound)?;
+        let actor = self.actor;
         self.inner
             .db
             .write(move |tx| {
+                record(
+                    tx,
+                    actor,
+                    NewEvent::new(Action::AccountChanged)
+                        .other(owner)
+                        .details(serde_json::json!({ "change": "quota", "bytes": bytes })),
+                )?;
                 match bytes {
                     Some(bytes) => tx.execute(
                         "INSERT INTO storage_quotas (owner_id, bytes) VALUES (?1, ?2)
@@ -1279,6 +1370,7 @@ impl Storage {
                             "UPDATE storage_items SET owner_id = ?2 WHERE owner_id = ?1",
                             (owner.as_uuid(), to.as_uuid()),
                         )?;
+                        events::change_owner(tx, owner, to)?;
                         // What they shared with the new owner is the new
                         // owner's own now.
                         tx.execute(
@@ -1706,6 +1798,20 @@ fn item(conn: &Connection, id: ItemId) -> Result<Option<Item>, Error> {
         .optional()?)
 }
 
+/// An item's folder, or `Some(None)` for a top folder, or `None` if the item
+/// doesn't exist.
+pub(crate) fn item_parent(
+    conn: &Connection,
+    id: ItemId,
+) -> rusqlite::Result<Option<Option<ItemId>>> {
+    conn.query_row(
+        "SELECT parent_id FROM storage_items WHERE id = ?1",
+        [id.as_uuid()],
+        |row| Ok(row.get::<_, Option<uuid::Uuid>>(0)?.map(ItemId::from_uuid)),
+    )
+    .optional()
+}
+
 fn item_or_missing(conn: &Connection, id: ItemId) -> Result<Item, Error> {
     item(conn, id)?.ok_or(Error::NotFound)
 }
@@ -1876,8 +1982,10 @@ pub(crate) fn sample_contents(conn: &Connection, count: usize) -> rusqlite::Resu
     .collect()
 }
 
-/// Deletes an item, everything inside it, and all their versions.
+/// Deletes an item, everything inside it, all their versions, and their
+/// activity.
 fn delete_subtree(conn: &Connection, id: ItemId) -> Result<(), Error> {
+    events::forget_items(conn, id)?;
     conn.execute(
         "WITH RECURSIVE down (id) AS (
              SELECT ?1
@@ -1888,6 +1996,34 @@ fn delete_subtree(conn: &Connection, id: ItemId) -> Result<(), Error> {
         [id.as_uuid()],
     )?;
     Ok(())
+}
+
+/// Deletes an item in the trash for good, and records it on the folder it
+/// was in, since its own activity goes with it.
+fn delete_for_good(conn: &Connection, item: &Item, actor: Actor) -> Result<(), Error> {
+    delete_subtree(conn, item.id)?;
+    if let Some(parent) = item.parent {
+        let mut details = serde_json::json!({ "name": item.name });
+        if item.kind == ItemKind::Folder {
+            details["folder"] = true.into();
+        }
+        record(
+            conn,
+            actor,
+            NewEvent::about(Action::Deleted, parent, item.owner).details(details),
+        )?;
+    }
+    Ok(())
+}
+
+fn record(conn: &Connection, actor: Actor, event: NewEvent) -> Result<(), Error> {
+    Ok(events::record(conn, actor, &event)?)
+}
+
+/// An event for an item that was just added, `how` being "created",
+/// "uploaded", or "copied".
+fn added(id: ItemId, owner: UserId, how: &str) -> NewEvent {
+    NewEvent::about(Action::Added, id, owner).details(serde_json::json!({ "how": how }))
 }
 
 /// Adds `blob` as the newest version of `item`. An empty current version

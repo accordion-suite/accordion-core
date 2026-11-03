@@ -18,6 +18,7 @@ use super::{
     Error, FOUND_SELECT, Found, Item, SHARED_SELECT, Storage, found_from_row, item, item_from_row,
     location,
 };
+use crate::events::{self, Action, Actor, NewEvent};
 use crate::sql_now;
 
 /// What a share lets someone do.
@@ -109,6 +110,14 @@ pub struct ShareEvent {
 }
 
 impl Storage {
+    /// The handle's actor, as `by`, who the caller says is sharing.
+    fn sharer(&self, by: UserId) -> Actor {
+        Actor {
+            user: Some(by),
+            ..self.actor
+        }
+    }
+
     /// What `user` may do with an item, or `None` if they can't see it at
     /// all. Treat `None` as "not found", so nobody learns what exists.
     pub async fn access(&self, user: UserId, id: ItemId) -> Result<Option<Access>, Error> {
@@ -129,6 +138,7 @@ impl Storage {
             .user(with)
             .await?
             .ok_or(Error::UserNotFound)?;
+        let actor = self.sharer(by);
         self.inner
             .db
             .write(move |tx| {
@@ -155,7 +165,12 @@ impl Storage {
                     ),
                     (id.as_uuid(), with.as_uuid(), level.as_str(), by.as_uuid()),
                 )?;
-                record(tx, id, with, Some(level), by)?;
+                let action = if before.is_some() {
+                    Action::ShareChanged
+                } else {
+                    Action::Shared
+                };
+                record(tx, actor, &item, with, action, Some(level))?;
                 share(tx, id, with)?.ok_or(Error::NotFound)
             })
             .await
@@ -164,6 +179,7 @@ impl Storage {
     /// Takes away the access a share on this item gave `with`. They may
     /// still reach it through a share on a folder above it.
     pub async fn unshare(&self, id: ItemId, with: UserId, by: UserId) -> Result<(), Error> {
+        let actor = self.sharer(by);
         self.inner
             .db
             .write(move |tx| {
@@ -171,8 +187,10 @@ impl Storage {
                     "DELETE FROM storage_shares WHERE item_id = ?1 AND user_id = ?2",
                     (id.as_uuid(), with.as_uuid()),
                 )?;
-                if removed > 0 {
-                    record(tx, id, with, None, by)?;
+                if removed > 0
+                    && let Some(item) = item(tx, id)?
+                {
+                    record(tx, actor, &item, with, Action::Unshared, None)?;
                 }
                 Ok(())
             })
@@ -182,9 +200,11 @@ impl Storage {
     /// Stops sharing an item with everyone it's shared with directly, and
     /// returns the shares it removed.
     pub async fn unshare_all(&self, id: ItemId, by: UserId) -> Result<Vec<Share>, Error> {
+        let actor = self.sharer(by);
         self.inner
             .db
             .write(move |tx| {
+                let item = item(tx, id)?.ok_or(Error::NotFound)?;
                 let removed = tx
                     .prepare(
                         "DELETE FROM storage_shares WHERE item_id = ?1
@@ -193,7 +213,7 @@ impl Storage {
                     .query_map([id.as_uuid()], |row| share_from_row(row, 0))?
                     .collect::<Result<Vec<_>, _>>()?;
                 for share in &removed {
-                    record(tx, id, share.user, None, by)?;
+                    record(tx, actor, &item, share.user, Action::Unshared, None)?;
                 }
                 Ok(removed)
             })
@@ -326,8 +346,10 @@ impl Storage {
             .read(move |conn| {
                 let events = conn
                     .prepare(
-                        "SELECT at, item_id, user_id, level, by_id FROM storage_share_events
-                         WHERE item_id = ?1 ORDER BY id",
+                        "SELECT at, item_id, other_id, details ->> 'level', actor_id
+                         FROM events_log
+                         WHERE item_id = ?1 AND action IN ('shared', 'share_changed', 'unshared')
+                         ORDER BY id",
                     )?
                     .query_map([id.as_uuid()], |row| {
                         Ok(ShareEvent {
@@ -373,31 +395,24 @@ fn share(conn: &Connection, id: ItemId, with: UserId) -> Result<Option<Share>, E
         .optional()?)
 }
 
+/// Records sharing `item` with `with`, changing their access to `level`,
+/// or stopping.
 fn record(
     conn: &Connection,
-    id: ItemId,
+    actor: Actor,
+    item: &Item,
     with: UserId,
+    action: Action,
     level: Option<ShareLevel>,
-    by: UserId,
 ) -> Result<(), Error> {
-    conn.execute(
-        concat!(
-            "INSERT INTO storage_share_events (at, item_id, user_id, level, by_id)
-             VALUES (",
-            sql_now!(),
-            ", ?1, ?2, ?3, ?4)"
-        ),
-        (
-            id.as_uuid(),
-            with.as_uuid(),
-            level.map(ShareLevel::as_str),
-            by.as_uuid(),
-        ),
-    )?;
-    Ok(())
+    let mut event = NewEvent::about(action, item.id, item.owner).other(with);
+    if let Some(level) = level {
+        event = event.details(serde_json::json!({ "level": level.as_str() }));
+    }
+    Ok(events::record(conn, actor, &event)?)
 }
 
-pub(super) fn access(conn: &Connection, user: UserId, id: ItemId) -> Result<Option<Access>, Error> {
+pub(crate) fn access(conn: &Connection, user: UserId, id: ItemId) -> Result<Option<Access>, Error> {
     let Some(item) = item(conn, id)? else {
         return Ok(None);
     };

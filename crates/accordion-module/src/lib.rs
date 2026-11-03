@@ -16,6 +16,7 @@ use std::error::Error as StdError;
 use std::pin::Pin;
 
 use accordion_core::db::Database;
+use accordion_core::events::Events;
 use accordion_core::identity::Identity;
 use accordion_core::storage::Storage;
 use accordion_core::thumbnails::Thumbnails;
@@ -64,6 +65,9 @@ pub struct Services {
     pub db: Database,
     pub identity: Identity,
     pub storage: Storage,
+    /// The event log, for the module's own events, and for showing activity
+    /// and notifications. Changes made through storage record themselves.
+    pub events: Events,
     /// Thumbnails of stored files, by their contents' hash.
     pub thumbnails: Thumbnails,
 }

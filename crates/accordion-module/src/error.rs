@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use accordion_core::{identity, storage};
+use accordion_core::{events, identity, storage};
 use axum::Json;
 use axum::http::StatusCode;
 use axum::http::header::RETRY_AFTER;
@@ -149,6 +149,20 @@ impl From<storage::Error> for ApiError {
             }
         };
         Self::new(status, err.to_string())
+    }
+}
+
+impl From<events::Error> for ApiError {
+    fn from(err: events::Error) -> Self {
+        match err {
+            events::Error::InvalidRetention => Self::new(StatusCode::BAD_REQUEST, err.to_string()),
+            events::Error::NotFound => Self::not_found(),
+            events::Error::Storage(err) => (*err).into(),
+            events::Error::Database(_) => {
+                tracing::error!("event log error: {err}");
+                Self::server_problem()
+            }
+        }
     }
 }
 

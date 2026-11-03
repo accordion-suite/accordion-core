@@ -19,9 +19,11 @@ use sha2::{Digest, Sha256};
 
 use super::session::{bad_value, delete_sessions};
 use super::{
-    Error, Identity, RESERVED_USERNAMES, User, check_password_rules, exists, insert_user,
-    new_account, normalize_username, password, user_from_row, validate_display_name,
+    Error, Identity, RESERVED_USERNAMES, User, account_created, check_password_rules, exists,
+    insert_user, new_account, normalize_username, password, record, user_from_row,
+    validate_display_name,
 };
+use crate::events::{self, Action, Actor, NewEvent};
 use crate::sql_now;
 
 /// Marks the string as an Accordion password link token, so a leaked one is
@@ -161,10 +163,12 @@ impl Identity {
         let user = new_account(username, display_name, role)?;
         let (token, hash) = new_token();
         let created = user.clone();
+        let actor = self.actor;
         let link = self
             .db
             .write(move |tx| -> Result<_, Error> {
                 insert_user(tx, &user, None)?;
+                record(tx, actor, account_created(&user))?;
                 Ok(insert_link(tx, user.id, &hash, LinkPurpose::NewAccount)?)
             })
             .await?;
@@ -183,6 +187,7 @@ impl Identity {
         app_passwords: AppPasswords,
     ) -> Result<(LinkToken, PasswordLink), Error> {
         let (token, hash) = new_token();
+        let actor = self.actor;
         let (link, ended) = self
             .db
             .write(move |tx| {
@@ -222,6 +227,17 @@ impl Identity {
                         [id.as_uuid()],
                     )?;
                 }
+                record(
+                    tx,
+                    actor,
+                    changed(
+                        id,
+                        match purpose {
+                            LinkPurpose::Reset => "password_reset",
+                            LinkPurpose::NewAccount => "password_link",
+                        },
+                    ),
+                )?;
                 Ok((insert_link(tx, id, &hash, purpose)?, ended))
             })
             .await?;
@@ -261,6 +277,7 @@ impl Identity {
         let hash = parse_token(token).ok_or(Error::LinkNotValid)?;
         check_password_rules(&password)?;
         let password_hash = password::hash(password).await?;
+        let actor = self.actor;
         self.db
             .write(move |tx| {
                 let user = tx
@@ -278,12 +295,22 @@ impl Identity {
                     )
                     .optional()?
                     .ok_or(Error::LinkNotValid)?;
-                Ok(tx.query_row(
+                let user = tx.query_row(
                     "UPDATE identity_users SET password_hash = ?2 WHERE id = ?1
                      RETURNING id, username, display_name, role",
                     (user, &password_hash),
                     |row| user_from_row(row, 0),
-                )?)
+                )?;
+                let actor = Actor {
+                    user: Some(user.id),
+                    ..actor
+                };
+                record(
+                    tx,
+                    actor,
+                    NewEvent::new(Action::PasswordChanged).other(user.id),
+                )?;
+                Ok(user)
             })
             .await
     }
@@ -291,6 +318,7 @@ impl Identity {
     /// Makes an account an admin or a standard account.
     pub async fn set_role(&self, id: UserId, role: Role) -> Result<User, Error> {
         check_member_role(role)?;
+        let actor = self.actor;
         self.db
             .write(move |tx| {
                 let user = current_user(tx, id)?;
@@ -301,6 +329,11 @@ impl Identity {
                     "UPDATE identity_users SET role = ?2 WHERE id = ?1",
                     (id.as_uuid(), role.as_str()),
                 )?;
+                if user.role != role {
+                    let mut event = changed(id, "role");
+                    event.details["role"] = role.as_str().into();
+                    record(tx, actor, event)?;
+                }
                 Ok(User { role, ..user })
             })
             .await
@@ -310,13 +343,14 @@ impl Identity {
     /// including its app passwords. Its files and settings stay, for when
     /// it's turned back on.
     pub async fn turn_off_member(&self, id: UserId) -> Result<(), Error> {
+        let actor = self.actor;
         let ended = self
             .db
             .write(move |tx| {
                 if current_user(tx, id)?.role == Role::Owner {
                     return Err(Error::OwnerAccount);
                 }
-                tx.execute(
+                let turned_off = tx.execute(
                     concat!(
                         "UPDATE identity_users SET turned_off_at = ",
                         sql_now!(),
@@ -324,6 +358,9 @@ impl Identity {
                     ),
                     [id.as_uuid()],
                 )?;
+                if turned_off > 0 {
+                    record(tx, actor, changed(id, "turned_off"))?;
+                }
                 tx.execute(
                     "DELETE FROM identity_password_links WHERE user_id = ?1",
                     [id.as_uuid()],
@@ -352,6 +389,7 @@ impl Identity {
             return Err(Error::UsernameReserved);
         }
         let display_name = validate_display_name(display_name)?;
+        let actor = self.actor;
         self.db
             .write(move |tx| {
                 let user = current_user(tx, id)?;
@@ -362,6 +400,12 @@ impl Identity {
                     "UPDATE identity_users SET username = ?2, display_name = ?3 WHERE id = ?1",
                     (id.as_uuid(), &username, &display_name),
                 )?;
+                if username != user.username || display_name != user.display_name {
+                    let mut event = changed(id, "name");
+                    event.details["name"] = display_name.clone().into();
+                    event.details["username"] = username.clone().into();
+                    record(tx, actor, event)?;
+                }
                 Ok(User {
                     username,
                     display_name,
@@ -380,14 +424,24 @@ impl Identity {
     /// the database refuses, so nothing is left behind pointing at an
     /// account that's gone.
     pub async fn delete_member(&self, id: UserId) -> Result<(), Error> {
+        let actor = self.actor;
         let ended = self
             .db
             .write(move |tx| {
-                if current_user(tx, id)?.role == Role::Owner {
+                let user = current_user(tx, id)?;
+                if user.role == Role::Owner {
                     return Err(Error::OwnerAccount);
                 }
                 let ended = delete_sessions(tx, "user_id = ?1", [id.as_uuid()])?;
                 tx.execute("DELETE FROM identity_users WHERE id = ?1", [id.as_uuid()])?;
+                events::forget_person(tx, id)?;
+                record(
+                    tx,
+                    actor,
+                    NewEvent::new(Action::AccountDeleted)
+                        .other(id)
+                        .details(serde_json::json!({ "name": user.display_name })),
+                )?;
                 Ok(ended)
             })
             .await?;
@@ -397,17 +451,29 @@ impl Identity {
 
     /// Lets a turned-off account sign in again.
     pub async fn turn_on_member(&self, id: UserId) -> Result<(), Error> {
+        let actor = self.actor;
         self.db
             .write(move |tx| {
                 current_user(tx, id)?;
-                tx.execute(
-                    "UPDATE identity_users SET turned_off_at = NULL WHERE id = ?1",
+                let turned_on = tx.execute(
+                    "UPDATE identity_users SET turned_off_at = NULL
+                     WHERE id = ?1 AND turned_off_at IS NOT NULL",
                     [id.as_uuid()],
                 )?;
+                if turned_on > 0 {
+                    record(tx, actor, changed(id, "turned_on"))?;
+                }
                 Ok(())
             })
             .await
     }
+}
+
+/// An admin's change to an account, as `change` says.
+fn changed(id: UserId, change: &str) -> NewEvent {
+    NewEvent::new(Action::AccountChanged)
+        .other(id)
+        .details(serde_json::json!({ "change": change }))
 }
 
 /// The owner comes from the setup wizard, and guests from shared links, so

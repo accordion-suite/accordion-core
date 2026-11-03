@@ -11,7 +11,8 @@ use base64ct::{Base64UrlUnpadded, Encoding};
 use rusqlite::{OptionalExtension, Row, Transaction};
 use sha2::{Digest, Sha256};
 
-use super::{Error, Identity, User, user_from_row};
+use super::{Error, Identity, User, record, user_from_row};
+use crate::events::{Action, Actor, NewEvent, Via};
 use crate::sql_now;
 
 /// Marks the string as an Accordion session token, so a leaked one is
@@ -166,6 +167,14 @@ impl Identity {
         let (token, hash) = new_token();
         let id = SessionId::generate();
         let device_name = clean_device_name(device_name);
+        let actor = Actor {
+            user: Some(user_id),
+            via: match client {
+                Client::Browser => Via::Web,
+                Client::App => Via::App,
+            },
+            ..self.actor
+        };
 
         let session = self
             .db
@@ -208,6 +217,11 @@ impl Identity {
                     [id.as_uuid()],
                     session_from_row,
                 )?;
+                let mut details = serde_json::json!({ "device": session.device_name });
+                if let Some(address) = actor.address {
+                    details["address"] = address.to_string().into();
+                }
+                record(tx, actor, NewEvent::new(Action::SignedIn).details(details))?;
                 Ok(session)
             })
             .await?;
@@ -319,6 +333,30 @@ impl Identity {
             .map_err(Error::from)
     }
 
+    /// Signs out the session making the request, at the user's asking.
+    pub async fn sign_out(&self, user_id: UserId, session_id: SessionId) -> Result<(), Error> {
+        let actor = Actor {
+            user: Some(user_id),
+            ..self.actor
+        };
+        let ended = self
+            .db
+            .write(move |tx| {
+                let ended = delete_sessions(
+                    tx,
+                    "user_id = ?1 AND id = ?2",
+                    (user_id.as_uuid(), session_id.as_uuid()),
+                )?;
+                if !ended.is_empty() {
+                    record(tx, actor, NewEvent::new(Action::SignedOut))?;
+                }
+                Ok::<_, Error>(ended)
+            })
+            .await?;
+        self.announce_ended(&ended);
+        Ok(())
+    }
+
     /// Signs out one of the user's sessions. Returns `false` if the user has
     /// no such session.
     ///
@@ -329,6 +367,7 @@ impl Identity {
             .end_sessions_where(
                 "user_id = ?1 AND id = ?2",
                 (user_id.as_uuid(), session_id.as_uuid()),
+                Some(user_id),
             )
             .await?;
         Ok(!ended.is_empty())
@@ -345,6 +384,7 @@ impl Identity {
             .end_sessions_where(
                 "user_id = ?1 AND id != ?2",
                 (user_id.as_uuid(), keep.as_uuid()),
+                Some(user_id),
             )
             .await?;
         Ok(ended.len())
@@ -353,7 +393,7 @@ impl Identity {
     /// Signs out every session of the user's. Returns how many ended.
     pub async fn end_all_sessions(&self, user_id: UserId) -> Result<usize, Error> {
         let ended = self
-            .end_sessions_where("user_id = ?1", [user_id.as_uuid()])
+            .end_sessions_where("user_id = ?1", [user_id.as_uuid()], Some(user_id))
             .await?;
         Ok(ended.len())
     }
@@ -362,7 +402,7 @@ impl Identity {
     /// so this only keeps the table small. Run it from a daily job.
     pub async fn delete_expired_sessions(&self) -> Result<usize, Error> {
         let ended = self
-            .end_sessions_where(concat!("NOT (", not_expired!(), ")"), ())
+            .end_sessions_where(concat!("NOT (", not_expired!(), ")"), (), None)
             .await?;
         Ok(ended.len())
     }
@@ -377,14 +417,40 @@ impl Identity {
         self.ended.subscribe()
     }
 
+    /// Ends the sessions that match `condition`. With `owner`, each one is
+    /// recorded in that person's activity log.
     async fn end_sessions_where(
         &self,
         condition: &'static str,
         params: impl rusqlite::Params + Send + 'static,
+        owner: Option<UserId>,
     ) -> Result<Vec<SessionId>, Error> {
+        let actor = self.actor;
         let ended = self
             .db
-            .write(move |tx| delete_sessions(tx, condition, params))
+            .write(move |tx| {
+                let ended: Vec<(SessionId, String)> = tx
+                    .prepare(&format!(
+                        "DELETE FROM identity_sessions AS s WHERE {condition}
+                         RETURNING id, device_name"
+                    ))?
+                    .query_map(params, |row| {
+                        Ok((SessionId::from_uuid(row.get(0)?), row.get(1)?))
+                    })?
+                    .collect::<Result<_, _>>()?;
+                if let Some(owner) = owner {
+                    for (_, device) in &ended {
+                        record(
+                            tx,
+                            actor,
+                            NewEvent::new(Action::SessionEnded)
+                                .other(owner)
+                                .details(serde_json::json!({ "device": device })),
+                        )?;
+                    }
+                }
+                Ok::<_, Error>(ended.into_iter().map(|(id, _)| id).collect::<Vec<_>>())
+            })
             .await?;
         self.announce_ended(&ended);
         Ok(ended)

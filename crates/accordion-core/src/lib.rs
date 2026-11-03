@@ -7,6 +7,7 @@
 
 pub mod backup;
 pub mod db;
+pub mod events;
 pub mod identity;
 mod random;
 pub mod storage;

@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 use super::blobs::{self, BUFFER_LEN, ContentHash, Received};
-use super::{Blob, Error, Item, Storage, check_name, check_space, size_from, to_sql_size};
+use super::{Blob, Error, Item, Over, Storage, check_name, check_space, size_from, to_sql_size};
 use crate::sql_now;
 
 /// An upload in progress.
@@ -237,7 +237,9 @@ impl Storage {
                 size: upload.size,
             },
         };
-        let result = self.save(parent, name, &received, Some(id)).await;
+        let result = self
+            .save(parent, name, &received, Some(id), Over::Any)
+            .await;
         match result {
             Ok(_) => self.forget(id),
             // The upload stays, so the client can try again, such as with

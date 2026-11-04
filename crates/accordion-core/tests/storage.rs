@@ -210,6 +210,78 @@ async fn keeps_every_version() {
 }
 
 #[tokio::test]
+async fn saves_an_edit_only_over_what_the_editor_opened() {
+    let server = start().await;
+    let alex = server.user("alex").await;
+    let top = server.storage.top_folder(alex).await.unwrap();
+    // A new empty file, as the web app's editor makes one.
+    let file = server
+        .storage
+        .create_file(top, "list.txt", &b""[..])
+        .await
+        .unwrap();
+    assert!(matches!(
+        server
+            .storage
+            .create_file(top, "list.txt", &b"again"[..])
+            .await,
+        Err(Error::NameTaken { folder: false })
+    ));
+    let opened = hash(&file);
+
+    // Two people open the empty file. The first to save wins.
+    let saved = server
+        .storage
+        .write_version(file.id, opened, &b"milk"[..])
+        .await
+        .unwrap();
+    assert!(matches!(
+        server
+            .storage
+            .write_version(file.id, opened, &b"eggs"[..])
+            .await,
+        Err(Error::Changed)
+    ));
+    assert_eq!(read(&server.storage, file.id).await, "milk");
+
+    // Saving again from what was saved works.
+    server
+        .storage
+        .write_version(file.id, hash(&saved), &b"milk, eggs"[..])
+        .await
+        .unwrap();
+    assert_eq!(read(&server.storage, file.id).await, "milk, eggs");
+
+    // A renamed file still saves, but a file in the trash doesn't.
+    let renamed = server
+        .storage
+        .move_item(file.id, top, "shopping.txt")
+        .await
+        .unwrap();
+    let saved = server
+        .storage
+        .write_version(file.id, hash(&renamed), &b"bread"[..])
+        .await
+        .unwrap();
+    assert_eq!(saved.name, "shopping.txt");
+    server.storage.delete(file.id).await.unwrap();
+    assert!(matches!(
+        server
+            .storage
+            .write_version(file.id, hash(&saved), &b"jam"[..])
+            .await,
+        Err(Error::InTrash)
+    ));
+}
+
+fn hash(file: &accordion_core::storage::Item) -> accordion_core::storage::ContentHash {
+    match file.kind {
+        ItemKind::File { blob, .. } => blob.hash,
+        ItemKind::Folder => panic!("{} is a folder", file.name),
+    }
+}
+
+#[tokio::test]
 async fn renames_and_moves() {
     let server = start().await;
     let alex = server.user("alex").await;

@@ -141,6 +141,7 @@ impl From<storage::Error> for ApiError {
             | NotInTrash
             | UploadOffset { .. }
             | UploadIncomplete { .. } => StatusCode::CONFLICT,
+            Changed => StatusCode::PRECONDITION_FAILED,
             QuotaFull => StatusCode::INSUFFICIENT_STORAGE,
             UploadTooLong { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Identity(err) => return err.into(),

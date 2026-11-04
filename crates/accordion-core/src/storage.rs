@@ -244,6 +244,9 @@ pub enum Error {
     #[error("That isn't in the trash.")]
     NotInTrash,
 
+    #[error("Someone changed this file since you opened it. Open it again to see their changes.")]
+    Changed,
+
     #[error(
         "There isn't enough space left in your storage. Delete some files and empty the \
          trash, or ask your admin for more space."
@@ -959,10 +962,54 @@ impl Storage {
         contents: impl AsyncRead + Unpin,
     ) -> Result<Item, Error> {
         let name = check_name(name)?;
+        self.receive_and_save(parent, name, contents, Over::Any)
+            .await
+    }
+
+    /// Saves `contents` as a new file `name` in `parent`, refusing the name
+    /// if a file already has it, rather than adding a version to that file.
+    pub async fn create_file(
+        &self,
+        parent: ItemId,
+        name: &str,
+        contents: impl AsyncRead + Unpin,
+    ) -> Result<Item, Error> {
+        let name = check_name(name)?;
+        self.receive_and_save(parent, name, contents, Over::Nothing)
+            .await
+    }
+
+    /// Saves `contents` as the file's new version, but only if its contents
+    /// are still `base`, so an editor doesn't save over changes it never saw.
+    pub async fn write_version(
+        &self,
+        id: ItemId,
+        base: ContentHash,
+        contents: impl AsyncRead + Unpin,
+    ) -> Result<Item, Error> {
+        let file = self.item(id).await?.ok_or(Error::NotFound)?;
+        if file.kind == ItemKind::Folder {
+            return Err(Error::NotAFile);
+        }
+        if file.trashed_at.is_some() {
+            return Err(Error::InTrash);
+        }
+        let parent = file.parent.ok_or(Error::NotAFile)?;
+        self.receive_and_save(parent, file.name, contents, Over::File(id, base))
+            .await
+    }
+
+    async fn receive_and_save(
+        &self,
+        parent: ItemId,
+        name: String,
+        contents: impl AsyncRead + Unpin,
+        over: Over,
+    ) -> Result<Item, Error> {
         // Receiving the contents is the slow part, so it happens before
         // taking the lock.
         let received = self.inner.blobs.receive(contents).await?;
-        let result = self.save(parent, name, &received, None).await;
+        let result = self.save(parent, name, &received, None, over).await;
         // Gone already if it was stored. Otherwise nothing uses it.
         let _ = tokio::fs::remove_file(&received.path).await;
         result
@@ -977,6 +1024,7 @@ impl Storage {
         name: String,
         received: &Received,
         upload: Option<UploadId>,
+        over: Over,
     ) -> Result<Item, Error> {
         let blob = received.blob;
         let _changes = self.inner.changes.lock().await;
@@ -985,7 +1033,7 @@ impl Storage {
         let checked = name.clone();
         self.inner
             .db
-            .read(move |conn| check_save(conn, parent, &checked, blob.size, upload))
+            .read(move |conn| check_save(conn, parent, &checked, blob.size, upload, over))
             .await?;
         let kept = self.keep(received).await?;
         let stored = kept.stored;
@@ -995,7 +1043,7 @@ impl Storage {
             .inner
             .db
             .write(move |tx| {
-                let (parent, existing) = check_save(tx, parent, &name, blob.size, upload)?;
+                let (parent, existing) = check_save(tx, parent, &name, blob.size, upload, over)?;
                 insert_blob(tx, blob, stored)?;
                 let id = match existing {
                     Some(id) => {
@@ -2172,6 +2220,19 @@ fn to_sql_size(size: u64) -> i64 {
     i64::try_from(size).unwrap_or(i64::MAX)
 }
 
+/// What a save may write over.
+#[derive(Clone, Copy)]
+enum Over {
+    /// The file with the same name, if there is one, as its new version.
+    Any,
+    /// Nothing: the name must be free.
+    Nothing,
+    /// This file, and only while its contents are still these. Contents
+    /// rather than a version ID, because a save over an empty version
+    /// keeps its ID.
+    File(ItemId, ContentHash),
+}
+
 /// Checks that `name` in `parent` can take a new file or version of
 /// `size` bytes. Returns the folder, and the file already there if any.
 fn check_save(
@@ -2180,11 +2241,25 @@ fn check_save(
     name: &str,
     size: u64,
     upload: Option<UploadId>,
+    over: Over,
 ) -> Result<(Item, Option<ItemId>), Error> {
     let parent = writable_folder(conn, parent)?;
-    let existing = match child_named(conn, parent.id, name)? {
-        Some(existing) if existing.kind == ItemKind::Folder => return Err(existing.name_taken()),
-        existing => existing.map(|existing| existing.id),
+    let existing = match (child_named(conn, parent.id, name)?, over) {
+        (Some(existing), Over::Nothing) => return Err(existing.name_taken()),
+        (Some(existing), _) if existing.kind == ItemKind::Folder => {
+            return Err(existing.name_taken());
+        }
+        // Renamed, moved, or deleted since, or holding other contents.
+        (
+            Some(Item {
+                id,
+                kind: ItemKind::File { blob, .. },
+                ..
+            }),
+            Over::File(file, base),
+        ) if id == file && blob.hash == base => Some(id),
+        (_, Over::File(..)) => return Err(Error::Changed),
+        (existing, _) => existing.map(|existing| existing.id),
     };
     if let Some(upload) = upload {
         let owner = uploads::owner(conn, upload)?;

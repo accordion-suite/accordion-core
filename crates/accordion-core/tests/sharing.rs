@@ -470,6 +470,32 @@ async fn removing_an_account_removes_its_shares() {
 }
 
 #[tokio::test]
+async fn found_items_says_where_the_owners_items_are() {
+    let f = family().await;
+    let s = &f.server;
+    let sams_top = s.storage.top_folder(f.sam).await.unwrap();
+    let sams = s.storage.create_folder(sams_top, "Sam's").await.unwrap();
+    let ids = vec![f.photo, f.holiday, sams.id, ItemId::generate()];
+
+    let found = s.storage.found_items(f.alex, ids.clone()).await.unwrap();
+    let mut found = paths(&found);
+    found.sort();
+    assert_eq!(found, ["Holiday", "Holiday/Album/beach.jpg"]);
+    assert!(
+        s.storage
+            .found_items(f.alex, Vec::new())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // The trash leaves out what's in it.
+    s.storage.delete(f.album).await.unwrap();
+    let found = s.storage.found_items(f.alex, ids).await.unwrap();
+    assert_eq!(paths(&found), ["Holiday"]);
+}
+
+#[tokio::test]
 async fn shared_by_lists_what_the_owner_shared_and_unshare_all_ends_it() {
     let f = family().await;
     let s = &f.server;

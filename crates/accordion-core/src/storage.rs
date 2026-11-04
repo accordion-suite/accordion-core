@@ -632,6 +632,42 @@ impl Storage {
             .await
     }
 
+    /// Which of `ids` are `owner`'s items outside the trash, with where
+    /// each is, such as for **Shared by me** to list what a module shared
+    /// in its own way. Other people's items, and ids that don't exist, are
+    /// left out.
+    pub async fn found_items(&self, owner: UserId, ids: Vec<ItemId>) -> Result<Vec<Found>, Error> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.inner
+            .db
+            .read(move |conn| {
+                let Some(top) = conn
+                    .query_row(
+                        "SELECT id FROM storage_items WHERE owner_id = ?1 AND parent_id IS NULL",
+                        [owner.as_uuid()],
+                        |row| row.get::<_, uuid::Uuid>(0),
+                    )
+                    .optional()?
+                else {
+                    return Ok(Vec::new());
+                };
+                let placeholders = vec!["?"; ids.len()].join(", ");
+                let found = conn
+                    .prepare(&format!("{FOUND_SELECT} WHERE i.id IN ({placeholders})"))?
+                    .query_map(
+                        rusqlite::params_from_iter(
+                            std::iter::once(top).chain(ids.iter().map(|id| id.as_uuid())),
+                        ),
+                        found_from_row,
+                    )?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(found)
+            })
+            .await
+    }
+
     /// What's in a folder, apart from the trash, sorted by name.
     pub async fn children(&self, folder: ItemId) -> Result<Vec<Item>, Error> {
         self.inner

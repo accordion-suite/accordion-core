@@ -924,3 +924,54 @@ async fn sizes_folders_and_lists_the_largest_files() {
         ["Trip/Day 1/beach.jpg"]
     );
 }
+
+#[tokio::test]
+async fn reaches_only_whats_inside_a_linked_folder() {
+    let server = start().await;
+    let alex = server.user("alex").await;
+    let top = server.storage.top_folder(alex).await.unwrap();
+    let photos = server.storage.create_folder(top, "Photos").await.unwrap();
+    let trip = server
+        .storage
+        .create_folder(photos.id, "Trip")
+        .await
+        .unwrap();
+    let beach = server
+        .storage
+        .write_file(trip.id, "beach.jpg", &b"jpg"[..])
+        .await
+        .unwrap();
+    let taxes = server
+        .storage
+        .write_file(top, "taxes.pdf", &b"pdf"[..])
+        .await
+        .unwrap();
+
+    let names = |path: Option<Vec<accordion_core::storage::Item>>| {
+        path.map(|path| path.into_iter().map(|item| item.name).collect::<Vec<_>>())
+    };
+    let within = |id| server.storage.path_within(photos.id, id);
+    assert_eq!(
+        names(within(beach.id).await.unwrap()),
+        Some(vec!["Photos".to_owned(), "Trip".into(), "beach.jpg".into()])
+    );
+    assert_eq!(
+        names(within(photos.id).await.unwrap()),
+        Some(vec!["Photos".to_owned()])
+    );
+    // Beside the folder, above it, and missing.
+    assert_eq!(within(taxes.id).await.unwrap(), None);
+    assert_eq!(within(top).await.unwrap(), None);
+    assert_eq!(
+        within(accordion_types::ItemId::generate()).await.unwrap(),
+        None
+    );
+
+    // A folder in the trash takes what's inside with it.
+    server.storage.delete(trip.id).await.unwrap();
+    assert_eq!(within(beach.id).await.unwrap(), None);
+    server.storage.restore(trip.id).await.unwrap();
+    server.storage.delete(photos.id).await.unwrap();
+    assert_eq!(within(beach.id).await.unwrap(), None);
+    assert_eq!(within(photos.id).await.unwrap(), None);
+}

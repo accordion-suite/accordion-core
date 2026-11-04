@@ -77,6 +77,9 @@ pub struct Services {
     /// Live updates, for hints about the module's own changes. Changes made
     /// through storage and the event log send their own.
     pub live: Live,
+    /// Where link pages are, such as `https://f8q2m.ourhome.dedyn.io`, while
+    /// an admin has link sharing on (decision 22).
+    pub link_origin: watch::Receiver<Option<String>>,
 }
 
 /// What a module gives the server when it starts.
@@ -105,6 +108,10 @@ pub struct Routes {
     pub more_dav: Vec<(&'static str, Router)>,
     /// The module's pages in the web app, at `/<id>`.
     pub pages: Option<Router>,
+    /// Pages for people with a link, on the link sharing listener, which
+    /// answers on the internet (decision 22). Nothing else is served
+    /// there, so these routes check each link themselves.
+    pub links: Option<Router>,
 }
 
 /// Fires when the server stops, or when the admin turns the module off.

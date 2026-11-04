@@ -272,6 +272,18 @@ pub enum Action {
     RemoteDeviceRemoved,
     /// Details: `on`, and `port` when it's on.
     RemoteAccessChanged,
+    /// A link to an item (decision 22). Details: `link`, its ID, and
+    /// `expires`, when it does.
+    LinkCreated,
+    /// Details: `link`.
+    LinkRemoved,
+    /// Someone opened a link. There's no actor, and `other` is who made the
+    /// link, who hears about it, at most once a day for each link.
+    /// Details: `link`.
+    LinkOpened,
+    /// An admin turned link sharing on or off. Details: `on`, and `port`
+    /// when it's on.
+    LinkSharingChanged,
     /// `other` is the new account. Details: `role`.
     AccountCreated,
     /// `other` is the account. Details: `change`, one of `role`, `name`,
@@ -316,6 +328,10 @@ impl Action {
             Self::RemoteDeviceAdded => "remote_device_added",
             Self::RemoteDeviceRemoved => "remote_device_removed",
             Self::RemoteAccessChanged => "remote_access_changed",
+            Self::LinkCreated => "link_created",
+            Self::LinkRemoved => "link_removed",
+            Self::LinkOpened => "link_opened",
+            Self::LinkSharingChanged => "link_sharing_changed",
             Self::AccountCreated => "account_created",
             Self::AccountChanged => "account_changed",
             Self::AccountDeleted => "account_deleted",
@@ -327,7 +343,7 @@ impl Action {
         }
     }
 
-    const ALL: [Self; 30] = [
+    const ALL: [Self; 34] = [
         Self::Added,
         Self::Edited,
         Self::Renamed,
@@ -350,6 +366,10 @@ impl Action {
         Self::RemoteDeviceAdded,
         Self::RemoteDeviceRemoved,
         Self::RemoteAccessChanged,
+        Self::LinkCreated,
+        Self::LinkRemoved,
+        Self::LinkOpened,
+        Self::LinkSharingChanged,
         Self::AccountCreated,
         Self::AccountChanged,
         Self::AccountDeleted,
@@ -880,6 +900,7 @@ pub(crate) fn record(conn: &Connection, actor: Actor, event: &NewEvent) -> rusql
         Action::Shared | Action::ShareChanged => {
             event.other.filter(|&other| Some(other) != actor.user)
         }
+        Action::LinkOpened => event.other,
         action if action.changes_files() => match (actor.user, event.owner) {
             (Some(user), Some(owner)) if user != owner => Some(owner),
             _ => None,

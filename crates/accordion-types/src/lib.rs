@@ -74,6 +74,12 @@ id_type!(
 );
 
 id_type!(
+    /// The ID of a link to a file or folder, for people without an account
+    /// (decision 22).
+    LinkId
+);
+
+id_type!(
     /// The ID of a file or folder in storage. It stays the same when the
     /// item is renamed, moved, or changed, so sync clients can follow it.
     ItemId

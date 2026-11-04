@@ -599,6 +599,39 @@ impl Storage {
         self.inner.db.read(move |conn| item(conn, id)).await
     }
 
+    /// The items from `root` down to `id`, if `id` is `root` or inside it,
+    /// and neither it nor any folder above it is in the trash. This is how
+    /// a link reaches an item: what's in a linked folder is reachable, and
+    /// nothing else is (decision 22).
+    pub async fn path_within(&self, root: ItemId, id: ItemId) -> Result<Option<Vec<Item>>, Error> {
+        self.inner
+            .db
+            .read(move |conn| {
+                let mut path = Vec::new();
+                let mut next = Some(id);
+                let mut reached = false;
+                while let Some(current) = next {
+                    let Some(found) = item(conn, current)? else {
+                        return Ok(None);
+                    };
+                    if found.trashed_at.is_some() {
+                        return Ok(None);
+                    }
+                    next = found.parent;
+                    if !reached {
+                        path.push(found);
+                        reached = current == root;
+                    }
+                }
+                if !reached {
+                    return Ok(None);
+                }
+                path.reverse();
+                Ok(Some(path))
+            })
+            .await
+    }
+
     /// What's in a folder, apart from the trash, sorted by name.
     pub async fn children(&self, folder: ItemId) -> Result<Vec<Item>, Error> {
         self.inner

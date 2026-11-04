@@ -5,3 +5,29 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
+
+# The sync engine (decision 23), and `accordion-sync`, the command-line client
+# that keeps a plain folder in sync on Linux. The desktop and phone apps use
+# the same engine.
+
+[dependencies]
+bytes = "1.12.1"
+http-body-util = "0.1.5"
+# The same versions and features as the server's update check, so the suite
+# builds one copy.
+hyper = "1.12.0"
+hyper-rustls = { version = "0.27.10", default-features = false, features = ["http1", "http2", "ring", "rustls-platform-verifier"] }
+hyper-util = { version = "0.1.21", features = ["client-legacy", "http1", "http2", "tokio"] }
+# For dates in conflict copies' names, in the device's time zone. The same
+# version and features as core.
+jiff = { version = "0.2.38", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
+rusqlite = { version = "0.41.1", features = ["bundled"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+thiserror = "2.0.21"
+tokio = { version = "1.53.3", features = ["fs", "io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

@@ -2140,6 +2140,9 @@ impl Backup {
             if check != "ok" {
                 return Err(Error::DamagedDatabase(check));
             }
+            // The restored list of changes is behind what devices have
+            // seen, so each one starts over and compares.
+            crate::storage::forget_cursors(&conn)?;
             Ok(())
         })
         .await

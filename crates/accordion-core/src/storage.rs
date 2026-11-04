@@ -20,12 +20,15 @@
 //! sharing works the same way everywhere. See decision 16.
 
 pub mod blobs;
+mod changes;
 mod shares;
 mod upkeep;
 mod uploads;
 mod view;
 
 pub use blobs::{Blob, ContentHash, Problem};
+pub(crate) use changes::forget_cursors;
+pub use changes::{Changes, PAGE as SYNC_PAGE, SyncChange, SyncItem, SyncPage, SyncStart};
 pub use shares::{Access, Share, ShareEvent, ShareLevel, Shared, SharedOut};
 pub(crate) use shares::{access, people_with_access};
 pub use upkeep::{Checked, Cleaned, Damage, Purged, Retention, StorageStatus};
@@ -197,6 +200,38 @@ static MIGRATIONS: &[Migration] = &[
         DROP TABLE storage_share_events;
     ",
     },
+    Migration {
+        version: 5,
+        name: "Add the list of changes for sync",
+        sql: "
+        -- What changed for each person, for sync (decision 23). An entry
+        -- names the item, not what happened to it: devices load it as it is
+        -- now. Each change has one seq, shared by everyone it affects.
+        CREATE TABLE storage_changes (
+            user_id BLOB NOT NULL REFERENCES identity_users (id) ON DELETE CASCADE,
+            seq INTEGER NOT NULL,
+            -- Not a reference, so the entry outlives an item deleted for good.
+            item_id BLOB NOT NULL,
+            -- 1 when everything inside changed for them too, such as when it
+            -- was shared with them.
+            whole INTEGER NOT NULL CHECK (whole IN (0, 1)),
+            at TEXT NOT NULL,
+            PRIMARY KEY (user_id, seq)
+        ) STRICT, WITHOUT ROWID;
+        CREATE INDEX storage_changes_at ON storage_changes (at);
+
+        -- Where the list is up to. A restored backup gets a new generation,
+        -- so devices with a cursor from the old one start over.
+        CREATE TABLE storage_sync (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            generation BLOB NOT NULL,
+            last_seq INTEGER NOT NULL,
+            -- Changes up to here were pruned.
+            pruned_through INTEGER NOT NULL
+        ) STRICT;
+        INSERT INTO storage_sync VALUES (1, randomblob(16), 0, 0);
+    ",
+    },
 ];
 
 /// The longest name, in bytes of UTF-8. Most file systems allow 255, so the
@@ -246,6 +281,12 @@ pub enum Error {
 
     #[error("Someone changed this file since you opened it. Open it again to see their changes.")]
     Changed,
+
+    #[error(
+        "Accordion can't tell what changed since this device last synced, so it needs to \
+         compare everything again."
+    )]
+    StartOver,
 
     #[error(
         "There isn't enough space left in your storage. Delete some files and empty the \
@@ -1578,9 +1619,13 @@ impl Storage {
                                  (SELECT id FROM storage_items WHERE owner_id = ?1)",
                             [to.as_uuid()],
                         )?;
+                        changes::note(tx, id, [(to, true)])?;
                         folder = Some(item_or_missing(tx, id)?);
                     }
-                    (Some(top), None) => delete_subtree(tx, top)?,
+                    (Some(top), None) => {
+                        changes::record_owner_deleting(tx, owner)?;
+                        delete_subtree(tx, top)?;
+                    }
                     (None, _) => {}
                 }
                 tx.execute(
@@ -2359,6 +2404,7 @@ fn delete_subtree(conn: &Connection, id: ItemId) -> Result<(), Error> {
 /// Deletes an item in the trash for good, and records it on the folder it
 /// was in, since its own activity goes with it.
 fn delete_for_good(conn: &Connection, item: &Item, actor: Actor) -> Result<(), Error> {
+    changes::record_deleting(conn, item.id)?;
     delete_subtree(conn, item.id)?;
     if let Some(parent) = item.parent {
         let mut details = serde_json::json!({ "name": item.name });
@@ -2375,6 +2421,7 @@ fn delete_for_good(conn: &Connection, item: &Item, actor: Actor) -> Result<(), E
 }
 
 fn record(conn: &Connection, actor: Actor, event: NewEvent) -> Result<(), Error> {
+    changes::record_event(conn, &event)?;
     Ok(events::record(conn, actor, &event)?)
 }
 

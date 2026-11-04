@@ -142,6 +142,8 @@ impl From<storage::Error> for ApiError {
             | UploadOffset { .. }
             | UploadIncomplete { .. } => StatusCode::CONFLICT,
             Changed => StatusCode::PRECONDITION_FAILED,
+            // The cursor is gone, so the device lists everything again.
+            StartOver => StatusCode::GONE,
             QuotaFull => StatusCode::INSUFFICIENT_STORAGE,
             UploadTooLong { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Identity(err) => return err.into(),

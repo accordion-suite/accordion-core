@@ -16,7 +16,9 @@ use sha2::{Digest, Sha256};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 use super::blobs::{self, BUFFER_LEN, ContentHash, Received};
-use super::{Blob, Error, Item, Over, Storage, check_name, check_space, size_from, to_sql_size};
+use super::{
+    Blob, Error, Item, ItemKind, Over, Storage, check_name, check_space, size_from, to_sql_size,
+};
 use crate::sql_now;
 
 /// An upload in progress.
@@ -216,6 +218,48 @@ impl Storage {
         parent: ItemId,
         name: &str,
     ) -> Result<Item, Error> {
+        self.finish(id, parent, name, Over::Any).await
+    }
+
+    /// Saves a finished upload as a new file `name` in `parent`, refusing
+    /// the name if a file already has it.
+    pub async fn finish_new_upload(
+        &self,
+        id: UploadId,
+        parent: ItemId,
+        name: &str,
+    ) -> Result<Item, Error> {
+        self.finish(id, parent, name, Over::Nothing).await
+    }
+
+    /// Saves a finished upload as the file's new version, but only if its
+    /// contents are still `base`, so a device doesn't save over changes it
+    /// never saw.
+    pub async fn finish_upload_over(
+        &self,
+        id: UploadId,
+        file: ItemId,
+        base: ContentHash,
+    ) -> Result<Item, Error> {
+        let item = self.item(file).await?.ok_or(Error::NotFound)?;
+        if item.kind == ItemKind::Folder {
+            return Err(Error::NotAFile);
+        }
+        if item.trashed_at.is_some() {
+            return Err(Error::InTrash);
+        }
+        let parent = item.parent.ok_or(Error::NotAFile)?;
+        self.finish(id, parent, &item.name, Over::File(file, base))
+            .await
+    }
+
+    async fn finish(
+        &self,
+        id: UploadId,
+        parent: ItemId,
+        name: &str,
+        over: Over,
+    ) -> Result<Item, Error> {
         let name = check_name(name)?;
         let hashed = self.hashed(id);
         let mut hashed = hashed.lock().await;
@@ -237,9 +281,7 @@ impl Storage {
                 size: upload.size,
             },
         };
-        let result = self
-            .save(parent, name, &received, Some(id), Over::Any)
-            .await;
+        let result = self.save(parent, name, &received, Some(id), over).await;
         match result {
             Ok(_) => self.forget(id),
             // The upload stays, so the client can try again, such as with

@@ -3,6 +3,17 @@
 
 [graph]
 all-features = true
+# Core runs in the server, and the sync client runs only on Linux so far.
+# Checking only these targets skips crates used on other platforms, such as
+# the bundled root certificates (webpki-root-certs, CDLA-Permissive-2.0) that
+# rustls-platform-verifier uses on Windows, macOS, and mobile. Decide on that
+# license before the Windows or macOS app is built.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+]
 
 [advisories]
 # To accept a specific advisory, add its ID here with a comment explaining why.

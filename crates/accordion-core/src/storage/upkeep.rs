@@ -144,9 +144,10 @@ impl Storage {
             }
         }
         let purged = self.purge(Retention::default()).await?;
+        let pruned = self.prune_changes().await?;
         let cleaned = self.clean_up().await?;
         let checked = self.check_stored(CHECK_PER_ROUND).await?;
-        tracing::debug!(?purged, ?cleaned, ?checked, "storage upkeep done");
+        tracing::debug!(?purged, pruned, ?cleaned, ?checked, "storage upkeep done");
         Ok(())
     }
 

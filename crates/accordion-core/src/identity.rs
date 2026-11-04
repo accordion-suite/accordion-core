@@ -3,6 +3,7 @@
 //! This is the one place that knows who users are. Modules ask it, through
 //! this API, and never read the `identity_` tables directly.
 
+mod app_code;
 mod app_password;
 pub mod limits;
 mod members;
@@ -10,6 +11,7 @@ pub mod password;
 mod remote_device;
 mod session;
 
+pub use app_code::AppCode;
 pub use app_password::{AppPassword, AppPasswordSecret, AppPasswordUse, UsingAppPassword};
 pub use limits::SignInFrom;
 pub use members::{AppPasswords, LinkPurpose, LinkToken, Member, PasswordLink};
@@ -136,6 +138,24 @@ static MIGRATIONS: &[Migration] = &[
         ) STRICT, WITHOUT ROWID;
 
         CREATE INDEX identity_remote_devices_user ON identity_remote_devices (user_id);
+    ",
+    },
+    Migration {
+        version: 6,
+        name: "Create codes for adding apps",
+        sql: "
+        -- One unused code per person, made in the session that's signed in,
+        -- for adding one of Accordion's apps (decision 23).
+        CREATE TABLE identity_app_codes (
+            user_id BLOB PRIMARY KEY REFERENCES identity_users (id) ON DELETE CASCADE,
+            -- SHA-256 of the code. The code itself is never stored.
+            code_hash BLOB NOT NULL UNIQUE CHECK (length(code_hash) = 32),
+            -- Not a reference: the code stops working when the session ends,
+            -- which redeeming checks.
+            session_id BLOB NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        ) STRICT, WITHOUT ROWID;
     ",
     },
 ];

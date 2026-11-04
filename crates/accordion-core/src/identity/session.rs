@@ -69,6 +69,7 @@ macro_rules! session_columns {
          s.authenticated_at, s.created_at, s.last_used_at"
     };
 }
+pub(super) use session_columns;
 
 /// What kind of client holds a session. It sets how long the session lasts
 /// without use.
@@ -478,7 +479,7 @@ pub(super) fn delete_sessions(
     .collect()
 }
 
-fn new_token() -> (SessionToken, Vec<u8>) {
+pub(super) fn new_token() -> (SessionToken, Vec<u8>) {
     let mut secret = [0u8; SECRET_LEN];
     getrandom::fill(&mut secret).expect("the OS random number generator failed");
     let token = format!(
@@ -509,7 +510,7 @@ pub(super) fn clean_device_name(input: &str) -> String {
     }
 }
 
-fn session_from_row(row: &Row<'_>) -> rusqlite::Result<Session> {
+pub(super) fn session_from_row(row: &Row<'_>) -> rusqlite::Result<Session> {
     Ok(Session {
         id: SessionId::from_uuid(row.get(0)?),
         user_id: UserId::from_uuid(row.get(1)?),

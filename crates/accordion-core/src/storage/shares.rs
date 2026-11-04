@@ -409,6 +409,7 @@ fn record(
     if let Some(level) = level {
         event = event.details(serde_json::json!({ "level": level.as_str() }));
     }
+    super::changes::record_event(conn, &event)?;
     Ok(events::record(conn, actor, &event)?)
 }
 

@@ -11,6 +11,7 @@
 pub mod add;
 pub mod client;
 pub mod engine;
+pub mod oauth;
 mod route;
 pub mod state;
 pub mod tunnel;

@@ -7,6 +7,7 @@ mod app_code;
 mod app_password;
 pub mod limits;
 mod members;
+mod oauth;
 pub mod password;
 mod remote_device;
 mod session;
@@ -15,6 +16,7 @@ pub use app_code::{AppCode, MadeAppCode};
 pub use app_password::{AppPassword, AppPasswordSecret, AppPasswordUse, UsingAppPassword};
 pub use limits::SignInFrom;
 pub use members::{AppPasswords, LinkPurpose, LinkToken, Member, PasswordLink};
+pub use oauth::{AppRequest, AuthorizationCode, is_challenge};
 pub use remote_device::{
     MAX_PER_PERSON as MAX_REMOTE_DEVICES, NewRemoteDevice, RemoteDevice, TunnelPeer,
 };
@@ -179,6 +181,28 @@ static MIGRATIONS: &[Migration] = &[
             CHECK (tunnel_key IS NULL OR length(tunnel_key) = 32);
         ALTER TABLE identity_app_codes ADD COLUMN tunnel_host INTEGER
             CHECK (tunnel_host IS NULL OR tunnel_host BETWEEN 2 AND 254);
+    ",
+    },
+    Migration {
+        version: 8,
+        name: "Create codes for signing in apps through the browser",
+        sql: "
+        -- Codes from allowing one of Accordion's apps in the browser, which
+        -- the app trades for a session with its PKCE secret (decision 3).
+        CREATE TABLE identity_oauth_codes (
+            -- SHA-256 of the code. The code itself is never stored.
+            code_hash BLOB PRIMARY KEY CHECK (length(code_hash) = 32),
+            -- The browser session that allowed the app. Not a reference: the
+            -- code stops working when the session ends, which trading it
+            -- checks.
+            session_id BLOB NOT NULL,
+            client_id TEXT NOT NULL,
+            redirect_uri TEXT NOT NULL,
+            -- SHA-256 of the app's secret, in base64url.
+            code_challenge TEXT NOT NULL,
+            device_name TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        ) STRICT, WITHOUT ROWID;
     ",
     },
 ];

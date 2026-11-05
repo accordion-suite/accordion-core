@@ -3,7 +3,8 @@
 //! sync at once.
 //!
 //! ```text
-//! accordion-sync add [<server>] <folder> [--name <name>] [--device <device>]
+//! accordion-sync add <server> <folder> [--name <name>] [--device <device>]
+//! accordion-sync add [<server>] <folder> --code [--name <name>] [--device <device>]
 //! accordion-sync run [--once] [--allow-deletes] [--bring-back]
 //! accordion-sync list
 //! accordion-sync remove <name>
@@ -27,6 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use accordion_sync::add::add as add_account;
+use accordion_sync::oauth::Pending;
 use accordion_sync::tunnel::{self, TunnelSetup};
 use accordion_sync::{Client, Engine, Error, Reach, State, Via};
 use http_body_util::BodyExt;
@@ -35,11 +37,14 @@ use tokio::sync::Notify;
 
 const USAGE: &str = "\
 Usage:
-  accordion-sync add [<server>] <folder> [--name <name>] [--device <device>]
-      Adds an account. Make a code in Accordion's Settings, under Apps and
-      devices, and enter it when asked. Away from home, copy the whole
-      setup under the QR code instead. <server> is its address, such as
-      https://ourhome.dedyn.io, and isn't needed with the whole setup.
+  accordion-sync add <server> <folder> [--name <name>] [--device <device>]
+      Adds an account, signing in through your browser. <server> is its
+      address, such as https://ourhome.dedyn.io.
+  accordion-sync add [<server>] <folder> --code [--name <name>] [--device <device>]
+      Adds an account with a code instead, such as on a computer without a
+      browser, or away from home. Make a code in Accordion's Settings, under
+      Apps and devices, and enter it when asked. Away from home, copy the
+      whole setup under the QR code, which also says which server it's for.
   accordion-sync run [--once] [--allow-deletes] [--bring-back]
       Keeps every account in sync until you stop it with Ctrl+C. --once
       syncs once and stops. If you delete many files at once, Accordion
@@ -99,11 +104,13 @@ async fn add(args: &[String]) -> Result<(), String> {
     let mut positional = Vec::new();
     let mut name = None;
     let mut device = None;
+    let mut with_code = false;
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         match arg.as_str() {
             "--name" => name = rest.next().cloned(),
             "--device" => device = rest.next().cloned(),
+            "--code" => with_code = true,
             _ => positional.push(arg.clone()),
         }
     }
@@ -125,30 +132,43 @@ async fn add(args: &[String]) -> Result<(), String> {
         ));
     }
     let device = device.unwrap_or_else(device_name);
-    let code = match std::env::var("ACCORDION_SYNC_CODE") {
-        Ok(code) => code,
-        Err(_) => {
-            print!("Code from Settings, under Apps and devices: ");
-            io::stdout().flush().ok();
-            let mut line = String::new();
-            io::stdin()
-                .lock()
-                .read_line(&mut line)
-                .map_err(|err| format!("Couldn't read the code: {err}"))?;
-            line
+    let reach = Reach {
+        only: only_via()?,
+        ..Reach::default()
+    };
+    let typed = std::env::var("ACCORDION_SYNC_CODE").ok();
+    let added = match server {
+        Some(server) if !with_code && typed.is_none() => {
+            let pending = Pending::start(server, &device, reach)
+                .await
+                .map_err(|err| err.to_string())?;
+            println!(
+                "Sign in to Accordion in your browser, then allow this computer. If the browser \
+                 doesn't open, go to this address:\n\n  {}\n",
+                pending.url
+            );
+            open_browser(&pending.url);
+            pending.finish().await.map_err(|err| err.to_string())?
+        }
+        _ => {
+            let code = match typed {
+                Some(code) => code,
+                None => {
+                    print!("Code from Settings, under Apps and devices: ");
+                    io::stdout().flush().ok();
+                    let mut line = String::new();
+                    io::stdin()
+                        .lock()
+                        .read_line(&mut line)
+                        .map_err(|err| format!("Couldn't read the code: {err}"))?;
+                    line
+                }
+            };
+            add_account(code.trim(), server, &device, reach)
+                .await
+                .map_err(|err| err.to_string())?
         }
     };
-    let added = add_account(
-        code.trim(),
-        server,
-        &device,
-        Reach {
-            only: only_via()?,
-            ..Reach::default()
-        },
-    )
-    .await
-    .map_err(|err| err.to_string())?;
     let name = name.unwrap_or_else(|| host_of(&added.server));
     if accounts.accounts.iter().any(|account| account.name == name) {
         return Err(format!(
@@ -183,6 +203,31 @@ async fn add(args: &[String]) -> Result<(), String> {
         folder.display()
     );
     Ok(())
+}
+
+/// Opens `url` in the browser, if this computer has a way to. The address is
+/// printed too, for when it doesn't.
+fn open_browser(url: &str) {
+    use std::process::{Command, Stdio};
+    let browser = std::env::var("BROWSER")
+        .ok()
+        .filter(|browser| !browser.is_empty());
+    // wslview opens the Windows browser from WSL.
+    for program in browser
+        .iter()
+        .map(String::as_str)
+        .chain(["xdg-open", "wslview"])
+    {
+        let opened = Command::new(program)
+            .arg(url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        if opened.is_ok() {
+            return;
+        }
+    }
 }
 
 /// The way `ACCORDION_SYNC_VIA` asks for, if it's set.

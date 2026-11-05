@@ -20,7 +20,7 @@
 use std::fmt;
 
 use accordion_types::{SessionId, UserId};
-use rusqlite::OptionalExtension;
+use rusqlite::{OptionalExtension, Transaction};
 use sha2::{Digest, Sha256};
 
 use super::remote_device::free_temporary_host;
@@ -139,8 +139,7 @@ impl Identity {
             return Ok(None);
         };
         let hash = Sha256::digest(code.as_bytes()).to_vec();
-        let (token, token_hash) = new_token();
-        let id = SessionId::generate();
+        let new = new_token();
         let device_name = clean_device_name(device_name);
         let actor = self.actor;
         let redeemed = self
@@ -158,7 +157,7 @@ impl Identity {
                         |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                     )
                     .optional()?;
-                let Some((user_id, session_id, live, tunnel)) = found else {
+                let Some((_user_id, session_id, live, tunnel)) = found else {
                     return Ok(None);
                 };
                 // Used up whether or not it works, so nobody can try it twice.
@@ -184,64 +183,78 @@ impl Identity {
                 if !live {
                     return Ok(None);
                 }
-                // How and when the person last proved who they are, in the
-                // session that made the code, if it's still signed in.
-                let proved: Option<(String, String)> = tx
-                    .query_row(
-                        "SELECT s.auth_method, s.authenticated_at
-                         FROM identity_sessions s JOIN identity_users u ON u.id = s.user_id
-                         WHERE s.id = ?1 AND u.turned_off_at IS NULL",
-                        [session_id],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )
-                    .optional()?;
-                let Some((auth_method, authenticated_at)) = proved else {
-                    return Ok(None);
-                };
-                tx.execute(
-                    concat!(
-                        "INSERT INTO identity_sessions (id, user_id, token_hash, client, \
-                         device_name, auth_method, authenticated_at, created_at, last_used_at)
-                         VALUES (?1, ?2, ?3, 'app', ?4, ?5, ?6, ",
-                        sql_now!(),
-                        ", ",
-                        sql_now!(),
-                        ")"
-                    ),
-                    (
-                        id.as_uuid(),
-                        user_id,
-                        token_hash,
-                        &device_name,
-                        auth_method,
-                        authenticated_at,
-                    ),
-                )?;
-                let session = tx.query_row(
-                    concat!(
-                        "SELECT ",
-                        session_columns!(),
-                        " FROM identity_sessions s WHERE s.id = ?1"
-                    ),
-                    [id.as_uuid()],
-                    session_from_row,
-                )?;
-                let actor = Actor {
-                    user: Some(UserId::from_uuid(user_id)),
-                    via: Via::App,
-                    ..actor
-                };
-                let mut details =
-                    serde_json::json!({ "device": session.device_name, "code": true });
-                if let Some(address) = actor.address {
-                    details["address"] = address.to_string().into();
-                }
-                record(tx, actor, NewEvent::new(Action::SignedIn).details(details))?;
-                Ok::<_, Error>(Some((token, session)))
+                new_app_session(tx, session_id, &device_name, new, actor, "code")
             })
             .await?;
         Ok(redeemed)
     }
+}
+
+/// Signs in an app as the person signed in to `approving`, named
+/// `device_name`, and records it in their activity log with `how`, such as
+/// "code". The new session counts as signed in the way `approving` was, and
+/// at the same time, so it isn't a fresh sign-in for sensitive actions.
+/// `None` if `approving` has ended, or its account was turned off.
+pub(super) fn new_app_session(
+    tx: &Transaction<'_>,
+    approving: uuid::Uuid,
+    device_name: &str,
+    (token, token_hash): (SessionToken, Vec<u8>),
+    actor: Actor,
+    how: &str,
+) -> Result<Option<(SessionToken, Session)>, Error> {
+    let proved: Option<(uuid::Uuid, String, String)> = tx
+        .query_row(
+            "SELECT s.user_id, s.auth_method, s.authenticated_at
+             FROM identity_sessions s JOIN identity_users u ON u.id = s.user_id
+             WHERE s.id = ?1 AND u.turned_off_at IS NULL",
+            [approving],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((user_id, auth_method, authenticated_at)) = proved else {
+        return Ok(None);
+    };
+    let id = SessionId::generate();
+    tx.execute(
+        concat!(
+            "INSERT INTO identity_sessions (id, user_id, token_hash, client, \
+             device_name, auth_method, authenticated_at, created_at, last_used_at)
+             VALUES (?1, ?2, ?3, 'app', ?4, ?5, ?6, ",
+            sql_now!(),
+            ", ",
+            sql_now!(),
+            ")"
+        ),
+        (
+            id.as_uuid(),
+            user_id,
+            token_hash,
+            device_name,
+            auth_method,
+            authenticated_at,
+        ),
+    )?;
+    let session = tx.query_row(
+        concat!(
+            "SELECT ",
+            session_columns!(),
+            " FROM identity_sessions s WHERE s.id = ?1"
+        ),
+        [id.as_uuid()],
+        session_from_row,
+    )?;
+    let actor = Actor {
+        user: Some(UserId::from_uuid(user_id)),
+        via: Via::App,
+        ..actor
+    };
+    let mut details = serde_json::json!({ "device": session.device_name, how: true });
+    if let Some(address) = actor.address {
+        details["address"] = address.to_string().into();
+    }
+    record(tx, actor, NewEvent::new(Action::SignedIn).details(details))?;
+    Ok(Some((token, session)))
 }
 
 #[cfg(test)]

@@ -157,6 +157,18 @@ impl TunnelReply {
     }
 }
 
+/// The token endpoint's answer.
+#[derive(Deserialize)]
+struct TokenReply {
+    access_token: String,
+    username: String,
+    display_name: String,
+    #[serde(default)]
+    tunnel: Option<TunnelReply>,
+    #[serde(default)]
+    tunnel_problem: Option<String>,
+}
+
 /// Who the session belongs to.
 #[derive(Deserialize)]
 pub struct Me {
@@ -302,6 +314,53 @@ impl Client {
             )),
             Err(err) => Err(err),
         }
+    }
+
+    /// Trades a code from signing in through the browser, and the secret
+    /// its challenge came from, for a session token (RFC 6749 and 7636).
+    /// With `tunnel_key`, the server registers that public key for the new
+    /// session too.
+    pub async fn exchange_code(
+        &self,
+        client_id: &str,
+        code: &str,
+        redirect_uri: &str,
+        verifier: &str,
+        tunnel_key: Option<&str>,
+    ) -> Result<SignedIn, Error> {
+        let mut form = format!(
+            "grant_type=authorization_code&client_id={}&code={}&redirect_uri={}&code_verifier={}",
+            form_encode(client_id),
+            form_encode(code),
+            form_encode(redirect_uri),
+            form_encode(verifier),
+        );
+        if let Some(key) = tunnel_key {
+            form.push_str(&format!("&tunnel_key={}", form_encode(key)));
+        }
+        let reply = self
+            .send_bytes(
+                Method::POST,
+                "/api/oauth/token",
+                &[(CONTENT_TYPE.as_str(), "application/x-www-form-urlencoded")],
+                Bytes::from(form),
+            )
+            .await
+            .map_err(|err| match err {
+                // Not a session that ended: the sign-in itself didn't work.
+                Error::SignedOut => {
+                    Error::Refused("That sign-in didn't work. Sign in from the app again.".into())
+                }
+                err => err,
+            })?;
+        let token: TokenReply = parse(&reply)?;
+        Ok(SignedIn {
+            token: token.access_token,
+            username: token.username,
+            display_name: token.display_name,
+            tunnel: token.tunnel,
+            tunnel_problem: token.tunnel_problem,
+        })
     }
 
     pub async fn start(&self) -> Result<Start, Error> {
@@ -603,9 +662,16 @@ fn parse<T: serde::de::DeserializeOwned>(body: &Bytes) -> Result<T, Error> {
 }
 
 fn status_error(status: StatusCode, body: &Bytes) -> Error {
+    // OAuth's errors put the message in `error_description`, and a code in
+    // `error`.
     let message = serde_json::from_slice::<Value>(body)
         .ok()
-        .and_then(|json| json["error"].as_str().map(str::to_owned))
+        .and_then(|json| {
+            json["error_description"]
+                .as_str()
+                .or_else(|| json["error"].as_str())
+                .map(str::to_owned)
+        })
         .unwrap_or_else(|| format!("the server answered {status}"));
     match status {
         StatusCode::GONE => Error::StartOver,
@@ -621,6 +687,19 @@ fn status_error(status: StatusCode, body: &Bytes) -> Error {
 
 /// Percent-encodes everything but unreserved characters, for a name or a
 /// cursor in a URL.
+/// Percent-encodes everything but letters, digits, and `-._~`, for a form.
+fn form_encode(text: &str) -> String {
+    let mut out = String::new();
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
 fn encode(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for byte in text.bytes() {

@@ -13,7 +13,7 @@ publish.workspace = true
 [dependencies]
 # The same versions and features as the gateway's end of the tunnel, so the
 # suite builds one copy.
-base64 = "0.22.1"
+base64 = "0.23.1"
 bytes = "1.12.1"
 gotatun = { version = "0.10.2", default-features = false, features = ["device", "ring"] }
 http-body-util = "0.1.5"

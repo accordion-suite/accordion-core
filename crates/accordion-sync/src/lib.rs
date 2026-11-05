@@ -4,11 +4,18 @@
 //! server, following the server's list of changes. The command-line client,
 //! the desktop app, and the phone apps all use it, and each account gets
 //! its own engine, so one device can sync several servers at once.
+//!
+//! Each account also has its own tunnel ([`tunnel`]), so it reaches its
+//! server away from home too, and the client picks the way that answers.
 
+pub mod add;
 pub mod client;
 pub mod engine;
+mod route;
 pub mod state;
+pub mod tunnel;
 
-pub use client::{Client, Error};
+pub use client::{Client, Error, Reach};
 pub use engine::{Engine, Report};
+pub use route::Via;
 pub use state::State;

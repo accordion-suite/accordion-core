@@ -1,5 +1,7 @@
 //! Talks to one Accordion server: Drive's sync addresses for what changed,
-//! and its usual addresses for downloading and saving files.
+//! and its usual addresses for downloading and saving files. Requests go
+//! straight to the server or through the account's tunnel, whichever
+//! answers ([`crate::route`]).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -9,14 +11,18 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::header::{AUTHORIZATION, CONTENT_TYPE, IF_MATCH, IF_NONE_MATCH, USER_AGENT};
 use hyper::{Method, Request, StatusCode, Uri};
-use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
+use hyper_rustls::ConfigBuilderExt;
 use hyper_util::client::legacy::Client as HttpClient;
-use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
+use rustls::ClientConfig;
+use rustls::pki_types::CertificateDer;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+use crate::route::{Connector, Route, Via};
+use crate::tunnel::TunnelSetup;
 
 /// A request that takes longer than this, between pieces of a download,
 /// has stalled.
@@ -120,21 +126,73 @@ pub struct SignedIn {
     pub token: String,
     pub username: String,
     pub display_name: String,
+    /// How the app reaches the server away from home, if it sent a key and
+    /// remote access is on.
+    #[serde(default)]
+    pub tunnel: Option<TunnelReply>,
+    /// Why it can't, if it sent a key.
+    #[serde(default)]
+    pub tunnel_problem: Option<String>,
+}
+
+/// The server's half of a tunnel's setup, from registering the app's key.
+#[derive(Clone, Debug, Deserialize)]
+pub struct TunnelReply {
+    pub server_key: String,
+    pub endpoint: String,
+    pub address: std::net::Ipv4Addr,
+    pub gateway: std::net::Ipv4Addr,
+}
+
+impl TunnelReply {
+    /// The whole setup, with the app's own private key.
+    pub fn with_key(self, private_key: String) -> TunnelSetup {
+        TunnelSetup {
+            private_key,
+            server_key: self.server_key,
+            endpoint: self.endpoint,
+            address: self.address,
+            gateway: self.gateway,
+        }
+    }
+}
+
+/// Who the session belongs to.
+#[derive(Deserialize)]
+pub struct Me {
+    pub username: String,
+}
+
+/// The ways a client may reach its server.
+#[derive(Clone, Default)]
+pub struct Reach {
+    /// The account's tunnel, for away from home.
+    pub tunnel: Option<TunnelSetup>,
+    /// Only this way, for tests and for trying the tunnel at home.
+    pub only: Option<Via>,
+    /// Certificates to trust instead of the system's, for tests.
+    pub trust: Vec<CertificateDer<'static>>,
 }
 
 #[derive(Clone)]
 pub struct Client {
-    http: HttpClient<HttpsConnector<HttpConnector>, Full<Bytes>>,
+    http: HttpClient<Connector, Full<Bytes>>,
+    route: Arc<Route>,
     /// Such as `https://ourhome.dedyn.io`, with no slash at the end.
     origin: String,
     token: Option<String>,
 }
 
 impl Client {
-    /// A client for the server at `origin`. Plain HTTP is only allowed for
-    /// a development server on this computer, since anything else would
-    /// send the session token unencrypted.
+    /// A client for the server at `origin`, reached directly. Plain HTTP is
+    /// only allowed for a development server on this computer, since
+    /// anything else would send the session token unencrypted.
     pub fn new(origin: &str, token: Option<String>) -> Result<Self, Error> {
+        Self::with_reach(origin, token, Reach::default())
+    }
+
+    /// A client for the server at `origin`, reached the ways `reach` says.
+    pub fn with_reach(origin: &str, token: Option<String>, reach: Reach) -> Result<Self, Error> {
         let origin = origin.trim().trim_end_matches('/').to_owned();
         let uri: Uri = origin
             .parse()
@@ -150,17 +208,36 @@ impl Client {
                 )));
             }
         }
-        let connector = HttpsConnectorBuilder::new()
-            .with_provider_and_platform_verifier(Arc::new(rustls::crypto::ring::default_provider()))
-            .map_err(|err| {
-                Error::Server(format!("couldn't load the system's certificates ({err})"))
-            })?
-            .https_or_http()
-            .enable_http1()
-            .enable_http2()
-            .build();
+        let builder =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .map_err(|err| Error::Server(format!("couldn't set up TLS ({err})")))?;
+        let mut tls = if reach.trust.is_empty() {
+            builder
+                .try_with_platform_verifier()
+                .map_err(|err| {
+                    Error::Server(format!("couldn't load the system's certificates ({err})"))
+                })?
+                .with_no_client_auth()
+        } else {
+            let mut roots = rustls::RootCertStore::empty();
+            for cert in reach.trust {
+                roots.add(cert).map_err(|err| {
+                    Error::Server(format!("couldn't trust a certificate ({err})"))
+                })?;
+            }
+            builder.with_root_certificates(roots).with_no_client_auth()
+        };
+        tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        let route = Arc::new(Route::new(
+            &uri,
+            Some(Arc::new(tls)),
+            reach.tunnel,
+            reach.only,
+        ));
         Ok(Self {
-            http: HttpClient::builder(TokioExecutor::new()).build(connector),
+            http: HttpClient::builder(TokioExecutor::new()).build(Connector(Arc::clone(&route))),
+            route,
             origin,
             token,
         })
@@ -170,9 +247,48 @@ impl Client {
         &self.origin
     }
 
-    /// Trades a code from **Apps and devices** for a session token.
-    pub async fn redeem(&self, code: &str, device_name: &str) -> Result<SignedIn, Error> {
-        let body = json!({ "code": code, "device_name": device_name });
+    /// The way the last connection reached the server, if one has.
+    pub fn via(&self) -> Option<Via> {
+        self.route.last()
+    }
+
+    /// Whether the client has a tunnel for away from home.
+    pub fn has_tunnel(&self) -> bool {
+        self.route.has_tunnel()
+    }
+
+    /// Who the session belongs to. It also checks the server answers.
+    pub async fn me(&self) -> Result<Me, Error> {
+        let reply: Value = parse(&self.get("/api/session").await?)?;
+        serde_json::from_value(reply["user"].clone())
+            .map_err(|err| Error::Server(format!("the server's answer didn't make sense ({err})")))
+    }
+
+    /// Registers the app's tunnel key, made on this device, for its
+    /// session, and returns the server's half of the setup.
+    pub async fn register_tunnel(&self, public_key: &str) -> Result<TunnelReply, Error> {
+        parse(
+            &self
+                .send(
+                    Method::POST,
+                    "/api/app-tunnel",
+                    &[],
+                    Some(json!({ "public_key": public_key })),
+                )
+                .await?,
+        )
+    }
+
+    /// Trades a code from **Apps and devices** for a session token. With
+    /// `tunnel_key`, the server registers that public key for the new
+    /// session too.
+    pub async fn redeem(
+        &self,
+        code: &str,
+        device_name: &str,
+        tunnel_key: Option<&str>,
+    ) -> Result<SignedIn, Error> {
+        let body = json!({ "code": code, "device_name": device_name, "tunnel_key": tunnel_key });
         match self
             .send(Method::POST, "/api/app-codes/redeem", &[], Some(body))
             .await

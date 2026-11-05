@@ -9,7 +9,7 @@ This repo is part of [Accordion](https://github.com/accordion-suite/accordion), 
 | Crate | Contents | Used by |
 |---|---|---|
 | `accordion-types` | Shared types and protocol definitions | Server, modules, and client apps |
-| `accordion-sync` | Sync engine for offline merging | Server, desktop app, and mobile apps |
+| `accordion-sync` | The sync engine, the tunnel inside the apps, and `accordion-sync`, the command-line client for Linux ([decision 23](https://github.com/accordion-suite/accordion/blob/main/docs/decisions/0023-sync.md)) | Desktop and mobile apps, and the tests of Drive and the server |
 | `accordion-core` | Services that hold state: identity, search, jobs, storage, thumbnails, and backups | Server and modules |
 | `accordion-module` | The interface between modules and the server: the `Module` trait, sign-in checks, and error responses | Server and modules |
 | `accordion-sandbox` | The sandbox for workers that read untrusted files, such as image decoders: Landlock, seccomp, and resource limits ([decision 14](https://github.com/accordion-suite/accordion/blob/main/docs/decisions/0014-thumbnails-and-sandboxed-workers.md)) | Server |

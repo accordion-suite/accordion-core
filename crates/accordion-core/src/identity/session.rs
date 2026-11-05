@@ -462,6 +462,11 @@ impl Identity {
             // Sending fails only when nobody is listening, which is fine.
             let _ = self.ended.send(id);
         }
+        // An app's tunnel key goes with its session, so the tunnel follows.
+        if !ended.is_empty() {
+            self.remote_devices_changed
+                .send_modify(|version| *version += 1);
+        }
     }
 }
 

@@ -160,9 +160,23 @@ impl Engine {
             }
             latest.insert(item.id.clone(), item);
         }
+        // Names this device never syncs, such as Windows' notes about
+        // downloaded files, stay in Accordion only. Pushing would never see
+        // them here, so downloading one would read as deleting it. One this
+        // device had under another name is gone from here, and anything
+        // inside an ignored folder waits for a folder that never comes.
+        let skipped: Vec<String> = latest
+            .values()
+            .filter(|item| ignored(&item.name))
+            .map(|item| item.id.clone())
+            .collect();
+        for id in &skipped {
+            latest.remove(id);
+        }
         let gone: Vec<String> = gone
             .into_iter()
             .filter(|id| !latest.contains_key(id))
+            .chain(skipped)
             .collect();
 
         let mut scan = self.scan()?;

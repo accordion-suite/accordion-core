@@ -12,6 +12,8 @@ ignore = []
 # Licenses that can be combined with AGPL-3.0. Check compatibility before you
 # add one.
 allow = [
+    # smoltcp and others in the sync client's tunnel, as in the gateway.
+    "0BSD",
     "AGPL-3.0-only",
     "AGPL-3.0-or-later",
     "Apache-2.0",

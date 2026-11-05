@@ -7,7 +7,13 @@
 //! app can't reach the sign-in page through the system browser.
 //!
 //! Each code works once, for 10 minutes, and only the newest one each
-//! person made. The database stores only a SHA-256 hash of it. The new
+//! person made. The database stores only a SHA-256 hash of it.
+//!
+//! On a server with remote access, a code can carry a temporary tunnel key,
+//! so an app away from home can reach the server to redeem it. The tunnel
+//! lets the key in while the code works, and for a minute after it's
+//! redeemed, so the answer gets back. The server lets it reach only the
+//! address that redeems codes. The new
 //! session counts as signed in the way the session that made the code was,
 //! and at the same time, so it isn't a fresh sign-in for sensitive actions.
 
@@ -17,6 +23,7 @@ use accordion_types::{SessionId, UserId};
 use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
 
+use super::remote_device::free_temporary_host;
 use super::session::{clean_device_name, new_token, session_columns, session_from_row};
 use super::{Error, Identity, Session, SessionToken, SignedIn, record};
 use crate::events::{Action, Actor, NewEvent, Via};
@@ -34,6 +41,11 @@ impl AppCode {
     pub fn grouped(&self) -> String {
         random::grouped(&self.0, 4)
     }
+
+    /// The code's letters, with no spaces, for a QR code or a link.
+    pub fn plain(&self) -> &str {
+        &self.0
+    }
 }
 
 impl fmt::Debug for AppCode {
@@ -42,40 +54,76 @@ impl fmt::Debug for AppCode {
     }
 }
 
+/// A code that was just made.
+#[derive(Debug)]
+pub struct MadeAppCode {
+    pub code: AppCode,
+    /// When it stops working, in ISO 8601.
+    pub expires_at: String,
+    /// The last part of its temporary key's address in the tunnel's /24,
+    /// if it carries one.
+    pub tunnel_host: Option<u8>,
+}
+
 impl Identity {
     /// Makes a code that adds an app for whoever is signed in, replacing
-    /// any code they made before. Returns it with when it stops working.
+    /// any code they made before. With `tunnel_key`, the code carries that
+    /// temporary tunnel key, which gets an address of its own.
     ///
     /// Adding a device is a sensitive action, so only allow it when the
     /// user has signed in recently, as for app passwords.
-    pub async fn make_app_code(&self, signed_in: &SignedIn) -> Result<(AppCode, String), Error> {
+    pub async fn make_app_code(
+        &self,
+        signed_in: &SignedIn,
+        tunnel_key: Option<[u8; 32]>,
+    ) -> Result<MadeAppCode, Error> {
         let code = random::letters(LEN);
         let hash = Sha256::digest(code.as_bytes()).to_vec();
         let user_id = signed_in.user.id;
         let session_id = signed_in.session.id;
-        let expires_at = self
+        let (expires_at, tunnel_host) = self
             .db
             .write(move |tx| {
-                Ok::<_, Error>(tx.query_row(
+                // The code it replaces gives up its address first.
+                tx.execute(
+                    "DELETE FROM identity_app_codes WHERE user_id = ?1",
+                    [user_id.as_uuid()],
+                )?;
+                let tunnel_host = match tunnel_key {
+                    Some(_) => Some(free_temporary_host(tx)?.ok_or(Error::NoRemoteAddressLeft)?),
+                    None => None,
+                };
+                let expires_at = tx.query_row(
                     concat!(
                         "INSERT INTO identity_app_codes (user_id, code_hash, session_id, \
-                         created_at, expires_at)
+                         created_at, expires_at, tunnel_key, tunnel_host)
                          VALUES (?1, ?2, ?3, ",
                         sql_now!(),
                         ", ",
                         sql_now!("+10 minutes"),
-                        ")
-                         ON CONFLICT (user_id) DO UPDATE SET code_hash = excluded.code_hash,
-                             session_id = excluded.session_id, created_at = excluded.created_at,
-                             expires_at = excluded.expires_at
+                        ", ?4, ?5)
                          RETURNING expires_at"
                     ),
-                    (user_id.as_uuid(), hash, session_id.as_uuid()),
+                    (
+                        user_id.as_uuid(),
+                        hash,
+                        session_id.as_uuid(),
+                        tunnel_key.map(Vec::from),
+                        tunnel_host,
+                    ),
                     |row| row.get(0),
-                )?)
+                )?;
+                Ok::<_, Error>((expires_at, tunnel_host))
             })
             .await?;
-        Ok((AppCode(code), expires_at))
+        // The tunnel lets the new key in, and the replaced one out.
+        self.remote_devices_changed
+            .send_modify(|version| *version += 1);
+        Ok(MadeAppCode {
+            code: AppCode(code),
+            expires_at,
+            tunnel_host,
+        })
     }
 
     /// Trades a code for a session for the app that typed or scanned it,
@@ -95,23 +143,44 @@ impl Identity {
         let id = SessionId::generate();
         let device_name = clean_device_name(device_name);
         let actor = self.actor;
-        self.db
+        let redeemed = self
+            .db
             .write(move |tx| {
-                // Used up whether or not it works, so nobody can try it twice.
-                let found: Option<(uuid::Uuid, uuid::Uuid, bool)> = tx
+                let found: Option<(uuid::Uuid, uuid::Uuid, bool, bool)> = tx
                     .query_row(
                         concat!(
-                            "DELETE FROM identity_app_codes WHERE code_hash = ?1
-                             RETURNING user_id, session_id, expires_at > ",
-                            sql_now!()
+                            "SELECT user_id, session_id, expires_at > ",
+                            sql_now!(),
+                            ", tunnel_key IS NOT NULL
+                             FROM identity_app_codes WHERE code_hash = ?1"
                         ),
                         [&hash],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                     )
                     .optional()?;
-                let Some((user_id, session_id, live)) = found else {
+                let Some((user_id, session_id, live, tunnel)) = found else {
                     return Ok(None);
                 };
+                // Used up whether or not it works, so nobody can try it twice.
+                if live && tunnel {
+                    // Its temporary key works a minute longer, so the answer
+                    // gets back to the app through the tunnel it came in.
+                    let mut used = [0u8; 32];
+                    getrandom::fill(&mut used).expect("the OS random number generator failed");
+                    tx.execute(
+                        concat!(
+                            "UPDATE identity_app_codes SET code_hash = ?2, expires_at = ",
+                            sql_now!("+1 minute"),
+                            " WHERE code_hash = ?1"
+                        ),
+                        (&hash, used.as_slice()),
+                    )?;
+                } else {
+                    tx.execute(
+                        "DELETE FROM identity_app_codes WHERE code_hash = ?1",
+                        [&hash],
+                    )?;
+                }
                 if !live {
                     return Ok(None);
                 }
@@ -168,9 +237,10 @@ impl Identity {
                     details["address"] = address.to_string().into();
                 }
                 record(tx, actor, NewEvent::new(Action::SignedIn).details(details))?;
-                Ok(Some((token, session)))
+                Ok::<_, Error>(Some((token, session)))
             })
-            .await
+            .await?;
+        Ok(redeemed)
     }
 }
 
@@ -215,7 +285,9 @@ mod tests {
     #[tokio::test]
     async fn a_code_adds_one_app_once() {
         let (_dir, identity, browser) = start().await;
-        let (code, expires_at) = identity.make_app_code(&browser).await.unwrap();
+        let MadeAppCode {
+            code, expires_at, ..
+        } = identity.make_app_code(&browser, None).await.unwrap();
         assert!(expires_at > browser.session.created_at);
         let typed = code.grouped().to_uppercase();
         assert_eq!(typed.len(), 14);
@@ -251,8 +323,8 @@ mod tests {
     #[tokio::test]
     async fn only_the_newest_code_works() {
         let (_dir, identity, browser) = start().await;
-        let (old, _) = identity.make_app_code(&browser).await.unwrap();
-        let (new, _) = identity.make_app_code(&browser).await.unwrap();
+        let old = identity.make_app_code(&browser, None).await.unwrap().code;
+        let new = identity.make_app_code(&browser, None).await.unwrap().code;
         assert!(
             identity
                 .redeem_app_code(&old.grouped(), "Laptop")
@@ -272,7 +344,7 @@ mod tests {
     #[tokio::test]
     async fn expired_or_orphaned_codes_dont_work() {
         let (_dir, identity, browser) = start().await;
-        let (code, _) = identity.make_app_code(&browser).await.unwrap();
+        let code = identity.make_app_code(&browser, None).await.unwrap().code;
         identity
             .db
             .write(|tx| {
@@ -292,7 +364,7 @@ mod tests {
         );
 
         // Signing out the browser that made a code stops it working.
-        let (code, _) = identity.make_app_code(&browser).await.unwrap();
+        let code = identity.make_app_code(&browser, None).await.unwrap().code;
         identity
             .end_session(browser.user.id, browser.session.id)
             .await

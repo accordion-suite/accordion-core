@@ -11,11 +11,13 @@ pub mod password;
 mod remote_device;
 mod session;
 
-pub use app_code::AppCode;
+pub use app_code::{AppCode, MadeAppCode};
 pub use app_password::{AppPassword, AppPasswordSecret, AppPasswordUse, UsingAppPassword};
 pub use limits::SignInFrom;
 pub use members::{AppPasswords, LinkPurpose, LinkToken, Member, PasswordLink};
-pub use remote_device::{MAX_PER_PERSON as MAX_REMOTE_DEVICES, NewRemoteDevice, RemoteDevice};
+pub use remote_device::{
+    MAX_PER_PERSON as MAX_REMOTE_DEVICES, NewRemoteDevice, RemoteDevice, TunnelPeer,
+};
 pub use session::{AuthMethod, Client, Session, SessionToken, SignedIn};
 
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -156,6 +158,27 @@ static MIGRATIONS: &[Migration] = &[
             created_at TEXT NOT NULL,
             expires_at TEXT NOT NULL
         ) STRICT, WITHOUT ROWID;
+    ",
+    },
+    Migration {
+        version: 7,
+        name: "Add tunnels for Accordion's apps",
+        sql: "
+        -- An Accordion app's own tunnel key, which works only while the
+        -- app's session does (decision 23). Devices set up for the
+        -- WireGuard apps have none.
+        ALTER TABLE identity_remote_devices
+            ADD COLUMN session_id BLOB REFERENCES identity_sessions (id) ON DELETE CASCADE;
+        CREATE UNIQUE INDEX identity_remote_devices_session
+            ON identity_remote_devices (session_id);
+
+        -- The temporary tunnel key a code carries, so an app away from home
+        -- can reach the address that redeems it, and its address in the
+        -- tunnel's /24.
+        ALTER TABLE identity_app_codes ADD COLUMN tunnel_key BLOB
+            CHECK (tunnel_key IS NULL OR length(tunnel_key) = 32);
+        ALTER TABLE identity_app_codes ADD COLUMN tunnel_host INTEGER
+            CHECK (tunnel_host IS NULL OR tunnel_host BETWEEN 2 AND 254);
     ",
     },
 ];

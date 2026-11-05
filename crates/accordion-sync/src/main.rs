@@ -3,7 +3,7 @@
 //! sync at once.
 //!
 //! ```text
-//! accordion-sync add <server> <folder> [--name <name>] [--device <device>]
+//! accordion-sync add [<server>] <folder> [--name <name>] [--device <device>]
 //! accordion-sync run [--once] [--allow-deletes] [--bring-back]
 //! accordion-sync list
 //! accordion-sync remove <name>
@@ -13,6 +13,11 @@
 //! only by you, since each one holds a session token. What each folder
 //! last agreed with its server is in `~/.local/share/accordion-sync`.
 //! `ACCORDION_SYNC_HOME` puts both in one folder instead, such as for tests.
+//!
+//! Each account reaches its server directly, or through its own tunnel when
+//! the server has remote access on, whichever answers (decision 23).
+//! `ACCORDION_SYNC_VIA=tunnel` uses only the tunnel, to try it at home, and
+//! `ACCORDION_SYNC_VIA=direct` never uses it.
 
 use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
@@ -21,17 +26,20 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use accordion_sync::{Client, Engine, Error, State};
+use accordion_sync::add::add as add_account;
+use accordion_sync::tunnel::{self, TunnelSetup};
+use accordion_sync::{Client, Engine, Error, Reach, State, Via};
 use http_body_util::BodyExt;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 
 const USAGE: &str = "\
 Usage:
-  accordion-sync add <server> <folder> [--name <name>] [--device <device>]
+  accordion-sync add [<server>] <folder> [--name <name>] [--device <device>]
       Adds an account. Make a code in Accordion's Settings, under Apps and
-      devices, and enter it when asked. <server> is its address, such as
-      https://ourhome.dedyn.io.
+      devices, and enter it when asked. Away from home, copy the whole
+      setup under the QR code instead. <server> is its address, such as
+      https://ourhome.dedyn.io, and isn't needed with the whole setup.
   accordion-sync run [--once] [--allow-deletes] [--bring-back]
       Keeps every account in sync until you stop it with Ctrl+C. --once
       syncs once and stops. If you delete many files at once, Accordion
@@ -56,6 +64,9 @@ struct Account {
     device: String,
     username: String,
     token: String,
+    /// The account's own tunnel, once the server has remote access on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tunnel: Option<TunnelSetup>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -96,17 +107,12 @@ async fn add(args: &[String]) -> Result<(), String> {
             _ => positional.push(arg.clone()),
         }
     }
-    let [server, folder] = positional.as_slice() else {
-        return Err(USAGE.to_owned());
+    let (server, folder) = match positional.as_slice() {
+        [server, folder] => (Some(server.as_str()), folder),
+        [folder] => (None, folder),
+        _ => return Err(USAGE.to_owned()),
     };
-    let client = Client::new(server, None).map_err(|err| err.to_string())?;
-    let name = name.unwrap_or_else(|| host_of(client.origin()));
     let mut accounts = load()?;
-    if accounts.accounts.iter().any(|account| account.name == name) {
-        return Err(format!(
-            "There's already an account named {name}. Choose another with --name."
-        ));
-    }
     let folder = absolute(Path::new(folder))?;
     if accounts
         .accounts
@@ -132,28 +138,89 @@ async fn add(args: &[String]) -> Result<(), String> {
             line
         }
     };
-    let signed_in = client
-        .redeem(code.trim(), &device)
-        .await
-        .map_err(|err| err.to_string())?;
+    let added = add_account(
+        code.trim(),
+        server,
+        &device,
+        Reach {
+            only: only_via()?,
+            ..Reach::default()
+        },
+    )
+    .await
+    .map_err(|err| err.to_string())?;
+    let name = name.unwrap_or_else(|| host_of(&added.server));
+    if accounts.accounts.iter().any(|account| account.name == name) {
+        return Err(format!(
+            "There's already an account named {name}. Choose another with --name, then add it \
+             again with a new code."
+        ));
+    }
     std::fs::create_dir_all(&folder)
         .map_err(|err| format!("Couldn't make {}: {err}", folder.display()))?;
+    let away = if added.tunnel.is_some() {
+        " It reaches the server away from home too."
+    } else {
+        ""
+    };
+    if let Some(problem) = &added.signed_in.tunnel_problem {
+        println!("This computer can sync at home, but not away from home yet: {problem}");
+    }
     accounts.accounts.push(Account {
         name: name.clone(),
-        server: client.origin().to_owned(),
+        server: added.server.clone(),
         folder: folder.clone(),
         device,
-        username: signed_in.username,
-        token: signed_in.token,
+        username: added.signed_in.username,
+        token: added.signed_in.token,
+        tunnel: added.tunnel,
     });
     save(&accounts)?;
     println!(
-        "Added {name}: {} as {}, in {}. Run `accordion-sync run` to start syncing.",
-        client.origin(),
-        signed_in.display_name,
+        "Added {name}: {} as {}, in {}.{away} Run `accordion-sync run` to start syncing.",
+        added.server,
+        added.signed_in.display_name,
         folder.display()
     );
     Ok(())
+}
+
+/// The way `ACCORDION_SYNC_VIA` asks for, if it's set.
+fn only_via() -> Result<Option<Via>, String> {
+    match std::env::var("ACCORDION_SYNC_VIA").as_deref() {
+        Err(_) | Ok("") => Ok(None),
+        Ok("tunnel") => Ok(Some(Via::Tunnel)),
+        Ok("direct") => Ok(Some(Via::Direct)),
+        Ok(other) => Err(format!(
+            "ACCORDION_SYNC_VIA is \"{other}\". Set it to tunnel or direct, or leave it unset."
+        )),
+    }
+}
+
+/// Registers the account's tunnel key again, so its setup follows the
+/// server's address and port, or registers a new key if remote access was
+/// turned on since. Returns the account's tunnel, which is unchanged if the
+/// server can't be reached or remote access is off.
+async fn refresh_tunnel(account: &Account, only: Option<Via>) -> Option<TunnelSetup> {
+    let client = Client::with_reach(
+        &account.server,
+        Some(account.token.clone()),
+        Reach {
+            tunnel: account.tunnel.clone(),
+            only,
+            ..Reach::default()
+        },
+    )
+    .ok()?;
+    let private_key = account
+        .tunnel
+        .as_ref()
+        .map_or_else(|| tunnel::new_key().0, |tunnel| tunnel.private_key.clone());
+    let public_key = tunnel::public_key(&private_key)?;
+    match client.register_tunnel(&public_key).await {
+        Ok(reply) => Some(reply.with_key(private_key)),
+        Err(_) => account.tunnel.clone(),
+    }
 }
 
 fn list() -> Result<(), String> {
@@ -200,10 +267,33 @@ async fn run(args: &[String]) -> Result<(), String> {
     if accounts.is_empty() {
         return Err("No accounts yet. Add one with `accordion-sync add`.".into());
     }
+    let only = only_via()?;
+    // Each account's tunnel follows the server's setup, as of now.
+    let mut refreshed = Vec::new();
+    let mut changed = false;
+    for mut account in accounts {
+        let tunnel = refresh_tunnel(&account, only).await;
+        changed |= tunnel != account.tunnel;
+        account.tunnel = tunnel;
+        refreshed.push(account);
+    }
+    if changed {
+        save(&Accounts {
+            accounts: refreshed.clone(),
+        })?;
+    }
     let mut tasks = tokio::task::JoinSet::new();
-    for account in accounts {
-        let client = Client::new(&account.server, Some(account.token.clone()))
-            .map_err(|err| err.to_string())?;
+    for account in refreshed {
+        let client = Client::with_reach(
+            &account.server,
+            Some(account.token.clone()),
+            Reach {
+                tunnel: account.tunnel.clone(),
+                only,
+                ..Reach::default()
+            },
+        )
+        .map_err(|err| err.to_string())?;
         let state = State::open(&state_path(&account.name)?)
             .map_err(|err| format!("Couldn't open the sync state for {}: {err}", account.name))?;
         let mut engine = Engine::new(
@@ -235,16 +325,29 @@ async fn run(args: &[String]) -> Result<(), String> {
 async fn keep_in_sync(name: String, mut engine: Engine, client: Client, once: bool) {
     let changed = Arc::new(Notify::new());
     if !once {
-        tokio::spawn(listen(client, Arc::clone(&changed)));
+        tokio::spawn(listen(client.clone(), Arc::clone(&changed)));
     }
     let mut shown: HashSet<String> = HashSet::new();
     let mut unreachable = false;
+    let mut via = None;
     loop {
         match engine.sync().await {
             Ok(report) => {
                 if unreachable {
                     println!("{name}: connected again.");
                     unreachable = false;
+                }
+                if client.via() != via {
+                    via = client.via();
+                    match via {
+                        Some(Via::Tunnel) => {
+                            println!("{name}: reaching the server through its tunnel.")
+                        }
+                        Some(Via::Direct) if client.has_tunnel() => {
+                            println!("{name}: reaching the server directly.");
+                        }
+                        _ => {}
+                    }
                 }
                 for line in &report.done {
                     println!("{name}: {line}");
@@ -276,7 +379,13 @@ async fn keep_in_sync(name: String, mut engine: Engine, client: Client, once: bo
             }
             Err(err) if err.is_temporary() => {
                 if !unreachable {
-                    println!("{name}: {err} Accordion tries again every 30 seconds.");
+                    let away = if client.has_tunnel() {
+                        " If you're away from home, the network you're on may be blocking \
+                         Accordion's tunnel."
+                    } else {
+                        ""
+                    };
+                    println!("{name}: {err}{away} Accordion tries again every 30 seconds.");
                     unreachable = true;
                 }
                 if once {

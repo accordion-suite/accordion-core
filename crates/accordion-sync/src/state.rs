@@ -115,6 +115,26 @@ impl State {
             .optional()
     }
 
+    /// The items whose folder on the server is `parent`.
+    pub fn children(&self, parent: &str) -> rusqlite::Result<Vec<Known>> {
+        self.conn()
+            .prepare(&format!("{SELECT} WHERE parent = ?1"))?
+            .query_map([parent], from_row)?
+            .collect()
+    }
+
+    /// The item at `path`, or one whose path differs only in case, as
+    /// Windows and macOS see them. SQLite folds only ASCII letters.
+    pub fn at_path_any_case(&self, path: &str) -> rusqlite::Result<Option<Known>> {
+        self.conn()
+            .query_row(
+                &format!("{SELECT} WHERE path = ?1 COLLATE NOCASE"),
+                [path],
+                from_row,
+            )
+            .optional()
+    }
+
     pub fn all(&self) -> rusqlite::Result<Vec<Known>> {
         self.conn()
             .prepare(&format!("{SELECT} ORDER BY path"))?

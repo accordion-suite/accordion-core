@@ -15,17 +15,22 @@
 //!
 //! The folder holds `My Drive`, the person's own files, and `Shared with
 //! me`, with each item shared with them.
+//!
+//! With an [`OnDemand`], files arrive as placeholders, and download when
+//! something opens them, as on Windows. Without one, they all download.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 
 use crate::client::{Client, Error, RemoteChange, RemoteItem, hex};
+use crate::on_demand::{OnDemand, Status};
 use crate::state::{Known, State};
 
 pub const MY_DRIVE: &str = "My Drive";
@@ -67,6 +72,8 @@ pub struct Engine {
     /// Set when something in the folder was renamed, so a pull scans it
     /// again before it looks for anything else.
     renamed: AtomicBool,
+    /// Places files on demand, instead of downloading them.
+    on_demand: Option<Arc<dyn OnDemand>>,
 }
 
 /// Whether a server change was applied, or waits for the next pass.
@@ -100,7 +107,15 @@ impl Engine {
             device,
             allow_deletes: false,
             renamed: AtomicBool::new(false),
+            on_demand: None,
         }
+    }
+
+    /// Places files on demand with `on_demand`, instead of downloading
+    /// them.
+    pub fn with_on_demand(mut self, on_demand: Arc<dyn OnDemand>) -> Self {
+        self.on_demand = Some(on_demand);
+        self
     }
 
     /// One pass: pull, then push. A problem with one item is a notice, and
@@ -332,8 +347,9 @@ impl Engine {
     fn target(&self, item: &RemoteItem) -> Result<String, Error> {
         match &item.parent {
             Some(parent) => {
+                let name = self.local_name_in(&item.id, &item.name, parent)?;
                 let parent = self.state.get(parent).map_err(db)?.ok_or(Error::NotFound)?;
-                Ok(format!("{}/{}", parent.path, local_name(&item.name)))
+                Ok(format!("{}/{name}", parent.path))
             }
             // A root that's yours is your top folder. Anyone else's was
             // shared with you on its own.
@@ -430,7 +446,9 @@ impl Engine {
                 }
             }
             if fetch {
-                self.download(item, &content, report).await?;
+                self.fetch(item, &content, report).await?;
+            } else {
+                self.mark_synced(item, &content, report);
             }
             record.sha256 = item.sha256.clone();
             if let Some(local) = stat(&self.root.join(&content))? {
@@ -479,14 +497,25 @@ impl Engine {
             if at.exists() && !at.is_dir() {
                 self.conflict_copy(target, report)?;
             }
-            fs::create_dir_all(&at)?;
+            match &self.on_demand {
+                Some(on_demand) if !at.exists() => {
+                    if let Some(dir) = at.parent() {
+                        fs::create_dir_all(dir)?;
+                    }
+                    on_demand.place(item, &at)?;
+                }
+                Some(on_demand) => on_demand.synced(item, &at)?,
+                None => fs::create_dir_all(&at)?,
+            }
         } else {
             let mut fetch = true;
             if at.is_dir() {
                 self.make_room(target, &item.id, report)?;
-            } else if at.exists() {
+            } else if at.exists() && self.status(&at) != Status::NotHere {
                 // A file here already, such as when a new device starts in
-                // a folder that has files in it.
+                // a folder that has files in it. A placeholder whose
+                // contents aren't here has nothing to keep, so it's brought
+                // up to date.
                 if Some(hash_file(&at)?) == item.sha256 {
                     fetch = false;
                 } else {
@@ -498,7 +527,9 @@ impl Engine {
                 }
             }
             if fetch {
-                self.download(item, target, report).await?;
+                self.fetch(item, target, report).await?;
+            } else {
+                self.mark_synced(item, target, report);
             }
             read_only(&at, item.access == "viewer");
         }
@@ -568,6 +599,45 @@ impl Engine {
             report.done.push(format!("Removed {path}"));
         }
         Ok(())
+    }
+
+    /// Brings the server's contents of a file to `path`: a placeholder
+    /// when files are on demand, and the whole file otherwise.
+    async fn fetch(&self, item: &RemoteItem, path: &str, report: &mut Report) -> Result<(), Error> {
+        let Some(on_demand) = &self.on_demand else {
+            return self.download(item, path, report).await;
+        };
+        let at = self.root.join(path);
+        let dir = at.parent().expect("paths are inside the root");
+        fs::create_dir_all(dir)?;
+        let existed = at.exists();
+        read_only(&at, false);
+        on_demand.place(item, &at)?;
+        report.done.push(if existed {
+            format!("Updated {path}")
+        } else {
+            format!("Added {path}")
+        });
+        Ok(())
+    }
+
+    /// Tells the system the file or folder at `path` matches the server,
+    /// when files are on demand, so File Explorer shows it as synced.
+    fn mark_synced(&self, item: &RemoteItem, path: &str, report: &mut Report) {
+        if let Some(on_demand) = &self.on_demand
+            && let Err(err) = on_demand.synced(item, &self.root.join(path))
+        {
+            report
+                .notices
+                .push(format!("Couldn't mark {path} as synced: {err}"));
+        }
+    }
+
+    /// What the system knows about the file at `at`, without reading it.
+    fn status(&self, at: &Path) -> Status {
+        self.on_demand
+            .as_ref()
+            .map_or(Status::Ordinary, |on_demand| on_demand.status(at))
     }
 
     async fn download(
@@ -664,6 +734,7 @@ impl Engine {
             };
             match self.client.create_folder(&parent, name).await {
                 Ok(made) => {
+                    self.mark_synced(&made, path, report);
                     self.record_new(&made, path, local)?;
                     claimed.insert((*path).clone());
                     report.done.push(format!("Added {path}"));
@@ -693,7 +764,9 @@ impl Engine {
                 && current.path == to
                 && self.parent_of(&to)?.is_some_and(|(parent, name)| {
                     current.parent.as_deref() == Some(parent.as_str())
-                        && local_name(&current.name) == name
+                        && self
+                            .local_name_in(&current.id, &current.name, &parent)
+                            .is_ok_and(|local| local == name)
                 })
             {
                 continue;
@@ -772,6 +845,7 @@ impl Engine {
                 .await
             {
                 Ok(saved) => {
+                    self.mark_synced(&saved, &item.path, report);
                     let mut record = item.clone();
                     record.sha256 = saved.sha256;
                     record.inode = local.inode;
@@ -824,6 +898,7 @@ impl Engine {
             let at = self.root.join(path);
             match self.client.upload_new(&parent, name, &at).await {
                 Ok(saved) => {
+                    self.mark_synced(&saved, path, report);
                     let local = stat(&at)?.unwrap_or_else(|| local.clone());
                     self.record_new(&saved, path, &local)?;
                     claimed.insert(path.clone());
@@ -925,6 +1000,33 @@ impl Engine {
         Ok(Some(at))
     }
 
+    /// The local name for item `id`, called `name` on the server, in the
+    /// server folder `parent` (decision 23). Windows and macOS see
+    /// `Report.pdf` and `report.pdf` as one name, so when items in a folder
+    /// clash, the one with the lowest ID keeps the name and the others get
+    /// a number, such as `report (2).pdf`. Every device picks the same.
+    fn local_name_in(&self, id: &str, name: &str, parent: &str) -> Result<String, Error> {
+        let wanted = local_name(name);
+        if !cfg!(any(windows, target_os = "macos")) {
+            return Ok(wanted);
+        }
+        let key = wanted.to_lowercase();
+        let before = self
+            .state
+            .children(parent)
+            .map_err(db)?
+            .iter()
+            .filter(|other| other.id.as_str() < id && local_name(&other.name).to_lowercase() == key)
+            .count();
+        Ok(match before {
+            0 => wanted,
+            n => {
+                let (stem, extension) = split_extension(&wanted);
+                format!("{stem} ({}){extension}", n + 1)
+            }
+        })
+    }
+
     /// The server folder a path is in, and its name there. `None` if it
     /// isn't inside a synced folder, such as straight inside `Shared with
     /// me`.
@@ -958,6 +1060,11 @@ impl Engine {
     /// Whether a local file still has the contents it had at the last sync.
     fn unchanged(&self, known: &Known, local: &Local, at: &Path) -> Result<bool, Error> {
         if local.inode == known.inode && local.mtime == known.mtime && local.size == known.size {
+            return Ok(true);
+        }
+        // Reading a placeholder whose contents aren't here would download
+        // it, and the system already knows whether it changed.
+        if matches!(self.status(at), Status::InSync | Status::NotHere) {
             return Ok(true);
         }
         Ok(known.sha256.as_deref() == Some(hash_file(at)?.as_str()))
@@ -1035,7 +1142,13 @@ impl Engine {
     /// something else has it here or in the state.
     fn free_path(&self, wanted: &str, mine: Option<&str>) -> Result<String, Error> {
         let taken = |path: &str| -> Result<bool, Error> {
-            let known = self.state.at_path(path).map_err(db)?;
+            // Windows and macOS see `Report.pdf` and `report.pdf` as one
+            // name.
+            let known = if cfg!(any(windows, target_os = "macos")) {
+                self.state.at_path_any_case(path).map_err(db)?
+            } else {
+                self.state.at_path(path).map_err(db)?
+            };
             let theirs = known.is_some_and(|known| Some(known.id.as_str()) != mine);
             Ok(theirs || (mine.is_none() && self.root.join(path).exists()))
         };
@@ -1093,7 +1206,11 @@ fn walk(dir: &Path, prefix: &str, scan: &mut Scan) -> Result<(), Error> {
         let Some(local) = scan_entry(&entry.path())? else {
             continue;
         };
-        scan.by_inode.insert(local.inode, path.clone());
+        // An inode of 0 means the system didn't say, so it can't find a
+        // moved file.
+        if local.inode != 0 {
+            scan.by_inode.insert(local.inode, path.clone());
+        }
         let folder = local.folder;
         scan.entries.insert(path.clone(), local);
         if folder {
@@ -1113,7 +1230,7 @@ fn scan_entry(at: &Path) -> Result<Option<Local>, Error> {
     if !metadata.is_file() && !metadata.is_dir() {
         return Ok(None);
     }
-    Ok(Some(local_from(&metadata)))
+    Ok(Some(local_from(at, &metadata)))
 }
 
 fn stat(at: &Path) -> Result<Option<Local>, Error> {
@@ -1121,7 +1238,7 @@ fn stat(at: &Path) -> Result<Option<Local>, Error> {
 }
 
 #[cfg(unix)]
-fn local_from(metadata: &fs::Metadata) -> Local {
+fn local_from(_at: &Path, metadata: &fs::Metadata) -> Local {
     use std::os::unix::fs::MetadataExt;
     Local {
         folder: metadata.is_dir(),
@@ -1132,7 +1249,7 @@ fn local_from(metadata: &fs::Metadata) -> Local {
 }
 
 #[cfg(not(unix))]
-fn local_from(metadata: &fs::Metadata) -> Local {
+fn local_from(at: &Path, metadata: &fs::Metadata) -> Local {
     let mtime = metadata
         .modified()
         .ok()
@@ -1140,10 +1257,47 @@ fn local_from(metadata: &fs::Metadata) -> Local {
         .map_or(0, |time| i64::try_from(time.as_nanos()).unwrap_or(i64::MAX));
     Local {
         folder: metadata.is_dir(),
-        inode: 0,
+        inode: file_id(at),
         mtime,
         size: if metadata.is_dir() { 0 } else { metadata.len() },
     }
+}
+
+/// NTFS's file ID, which stays the same when a file is renamed or moved
+/// within the volume, as an inode does. 0 if Windows didn't say.
+#[cfg(windows)]
+fn file_id(at: &Path) -> u64 {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::AsRawHandle;
+
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
+    };
+
+    // Only the attributes, which never downloads a placeholder. Folders
+    // need backup semantics to open.
+    let Ok(file) = fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(at)
+    else {
+        return 0;
+    };
+    // SAFETY: the handle is open, and the structure is plain data.
+    unsafe {
+        let mut info: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
+        if GetFileInformationByHandle(file.as_raw_handle(), &mut info) == 0 {
+            return 0;
+        }
+        (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow)
+    }
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn file_id(_at: &Path) -> u64 {
+    0
 }
 
 fn recent(local: &Local, now: SystemTime) -> bool {
@@ -1188,10 +1342,47 @@ fn ancestors(path: &str) -> impl Iterator<Item = &str> {
     })
 }
 
-/// A server name as a local name. Linux takes every name the server does.
-/// Windows and macOS will map the ones they can't hold (decision 23).
+/// A server name as a local name (decision 23). Linux takes every name the
+/// server does. Windows can't hold some, so they get a local name, and the
+/// name on the server stays.
 fn local_name(name: &str) -> String {
-    name.to_owned()
+    if cfg!(windows) {
+        windows_name(name)
+    } else {
+        name.to_owned()
+    }
+}
+
+/// A name Windows can hold: `_` for each character it doesn't allow, and
+/// for a dot or space at the end, which it drops, and `_` after a device
+/// name such as `CON` or `com1.txt`.
+fn windows_name(name: &str) -> String {
+    let mut out: String = name
+        .chars()
+        .map(|c| match c {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            c if u32::from(c) < 32 => '_',
+            c => c,
+        })
+        .collect();
+    if out.ends_with(['.', ' ']) {
+        out.pop();
+        out.push('_');
+    }
+    let stem = out.split('.').next().unwrap_or_default().trim_end();
+    let device = matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || (stem.len() == 4
+        && ["COM", "LPT"]
+            .iter()
+            .any(|prefix| stem[..3].eq_ignore_ascii_case(prefix))
+        && stem.as_bytes()[3].is_ascii_digit()
+        && stem.as_bytes()[3] != b'0');
+    if device {
+        out.insert(stem.len(), '_');
+    }
+    out
 }
 
 fn split_extension(name: &str) -> (&str, &str) {
@@ -1296,6 +1487,21 @@ mod tests {
         assert_eq!(split_extension("Budget.xlsx"), ("Budget", ".xlsx"));
         assert_eq!(split_extension(".bashrc"), (".bashrc", ""));
         assert_eq!(split_extension("notes"), ("notes", ""));
+    }
+
+    #[test]
+    fn gives_windows_names_it_can_hold() {
+        assert_eq!(windows_name("What next?.txt"), "What next_.txt");
+        assert_eq!(windows_name("a<b>c:d\"e|f*g"), "a_b_c_d_e_f_g");
+        assert_eq!(windows_name("notes."), "notes_");
+        assert_eq!(windows_name("notes "), "notes_");
+        assert_eq!(windows_name("CON"), "CON_");
+        assert_eq!(windows_name("con.txt"), "con_.txt");
+        assert_eq!(windows_name("COM1.log"), "COM1_.log");
+        assert_eq!(windows_name("COM0.log"), "COM0.log");
+        assert_eq!(windows_name("Console.txt"), "Console.txt");
+        assert_eq!(windows_name("Budget.xlsx"), "Budget.xlsx");
+        assert_eq!(windows_name("tab\there"), "tab_here");
     }
 
     #[test]

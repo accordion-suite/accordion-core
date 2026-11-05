@@ -12,11 +12,13 @@ pub mod add;
 pub mod client;
 pub mod engine;
 pub mod oauth;
+pub mod on_demand;
 mod route;
 pub mod state;
 pub mod tunnel;
 
-pub use client::{Client, Error, Reach};
+pub use client::{Client, Contents, Error, Reach, RemoteItem};
 pub use engine::{Engine, Report};
+pub use on_demand::{OnDemand, Status};
 pub use route::Via;
 pub use state::State;

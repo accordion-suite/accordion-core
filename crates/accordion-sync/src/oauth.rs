@@ -24,12 +24,16 @@ use crate::tunnel;
 /// The command-line client's ID, as the server knows it.
 pub const CLIENT_ID: &str = "accordion-sync";
 
+/// The desktop app's ID, as the server knows it.
+pub const DESKTOP_CLIENT_ID: &str = "accordion-desktop";
+
 /// How long to wait for the person to sign in.
 const WAIT: Duration = Duration::from_secs(10 * 60);
 
 /// A sign-in that's waiting for the browser.
 pub struct Pending {
     client: Client,
+    client_id: &'static str,
     listener: TcpListener,
     redirect_uri: String,
     verifier: String,
@@ -89,6 +93,17 @@ impl Pending {
     /// Starts signing in to the server at `server`, as `device_name`, with
     /// a listener on this computer for the browser to come back to.
     pub async fn start(server: &str, device_name: &str, reach: Reach) -> Result<Self, Error> {
+        Self::start_as(CLIENT_ID, server, device_name, reach).await
+    }
+
+    /// The same, for the app with `client_id`, such as
+    /// [`DESKTOP_CLIENT_ID`].
+    pub async fn start_as(
+        client_id: &'static str,
+        server: &str,
+        device_name: &str,
+        reach: Reach,
+    ) -> Result<Self, Error> {
         let client = Client::with_reach(server, None, reach)?;
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let redirect_uri = format!(
@@ -99,7 +114,7 @@ impl Pending {
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
         let state = random();
         let url = format!(
-            "{}/oauth/authorize?response_type=code&client_id={CLIENT_ID}&redirect_uri={}\
+            "{}/oauth/authorize?response_type=code&client_id={client_id}&redirect_uri={}\
              &code_challenge={challenge}&code_challenge_method=S256&state={state}\
              &device_name={}",
             client.origin(),
@@ -108,6 +123,7 @@ impl Pending {
         );
         Ok(Self {
             client,
+            client_id,
             listener,
             redirect_uri,
             verifier,
@@ -131,7 +147,7 @@ impl Pending {
         let exchanged = self
             .client
             .exchange_code(
-                CLIENT_ID,
+                self.client_id,
                 &code,
                 &self.redirect_uri,
                 &self.verifier,

@@ -38,5 +38,10 @@ tokio = { version = "1.53.3", features = ["fs", "io-util", "macros", "net", "rt-
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring"] }
 tower-service = "0.3.3"
 
+[target.'cfg(windows)'.dependencies]
+# For NTFS file IDs, which find a moved file as inodes do elsewhere. The
+# same version as tokio's.
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 tempfile = "3.27.0"

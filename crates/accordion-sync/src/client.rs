@@ -9,7 +9,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
-use hyper::header::{AUTHORIZATION, CONTENT_TYPE, IF_MATCH, IF_NONE_MATCH, USER_AGENT};
+use hyper::header::{
+    AUTHORIZATION, CONTENT_TYPE, ETAG, IF_MATCH, IF_NONE_MATCH, IF_RANGE, RANGE, USER_AGENT,
+};
 use hyper::{Method, Request, StatusCode, Uri};
 use hyper_rustls::ConfigBuilderExt;
 use hyper_util::client::legacy::Client as HttpClient;
@@ -415,6 +417,13 @@ impl Client {
         Ok(())
     }
 
+    /// Signs this device out, such as when its account is removed, so its
+    /// session token stops working.
+    pub async fn sign_out(&self) -> Result<(), Error> {
+        self.send(Method::DELETE, "/api/session", &[], None).await?;
+        Ok(())
+    }
+
     /// Uploads `file` as a new file `name` in `parent`, refusing the name if
     /// a file already has it.
     pub async fn upload_new(
@@ -556,6 +565,49 @@ impl Client {
         Ok(hex(&hash.finalize()))
     }
 
+    /// Opens a file's contents from byte `from`, for a placeholder made for
+    /// the version with `sha256`, when something opens it on a device with
+    /// files on demand. If the file changed since, it's
+    /// [`Error::Changed`], and the next pull brings the placeholder up to
+    /// date.
+    pub async fn contents(&self, id: &str, from: u64, sha256: &str) -> Result<Contents, Error> {
+        let range = format!("bytes={from}-");
+        let version = format!("\"{sha256}\"");
+        let request = self
+            .request(
+                Method::GET,
+                &format!("/api/drive/items/{id}/content"),
+                &[(RANGE.as_str(), &range), (IF_RANGE.as_str(), &version)],
+            )?
+            .body(Full::new(Bytes::new()))
+            .expect("the request is well formed");
+        let response = tokio::time::timeout(TIMEOUT, self.http.request(request))
+            .await
+            .map_err(|_| self.unreachable())?
+            .map_err(|_| self.unreachable())?;
+        let status = response.status();
+        let same = response
+            .headers()
+            .get(ETAG)
+            .is_some_and(|etag| etag.as_bytes() == version.as_bytes());
+        match status {
+            StatusCode::PARTIAL_CONTENT if same => {}
+            // The whole file, which is what was asked for from the start.
+            StatusCode::OK if same && from == 0 => {}
+            StatusCode::OK | StatusCode::PARTIAL_CONTENT | StatusCode::RANGE_NOT_SATISFIABLE => {
+                return Err(Error::Changed);
+            }
+            _ => {
+                let body = response.into_body().collect().await.map(|b| b.to_bytes());
+                return Err(status_error(status, &body.unwrap_or_default()));
+            }
+        }
+        Ok(Contents {
+            body: response.into_body(),
+            origin: self.origin.clone(),
+        })
+    }
+
     /// Opens the live updates stream (decision 19), for the engine to sync
     /// as soon as something changes.
     pub async fn live(&self) -> Result<hyper::body::Incoming, Error> {
@@ -653,6 +705,30 @@ impl Client {
 
     fn unreachable(&self) -> Error {
         Error::Unreachable(self.origin.clone())
+    }
+}
+
+/// A file's contents as they arrive, from [`Client::contents`].
+pub struct Contents {
+    body: hyper::body::Incoming,
+    origin: String,
+}
+
+impl Contents {
+    /// The next part, or `None` at the end.
+    pub async fn next(&mut self) -> Result<Option<Bytes>, Error> {
+        loop {
+            let frame = tokio::time::timeout(TIMEOUT, self.body.frame())
+                .await
+                .map_err(|_| Error::Unreachable(self.origin.clone()))?;
+            let Some(frame) = frame else {
+                return Ok(None);
+            };
+            let frame = frame.map_err(|_| Error::Unreachable(self.origin.clone()))?;
+            if let Ok(data) = frame.into_data() {
+                return Ok(Some(data));
+            }
+        }
     }
 }
 

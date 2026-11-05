@@ -3,17 +3,6 @@
 
 [graph]
 all-features = true
-# Core runs in the server, and the sync client runs only on Linux so far.
-# Checking only these targets skips crates used on other platforms, such as
-# the bundled root certificates (webpki-root-certs, CDLA-Permissive-2.0) that
-# rustls-platform-verifier uses on Windows, macOS, and mobile. Decide on that
-# license before the Windows or macOS app is built.
-targets = [
-    "x86_64-unknown-linux-gnu",
-    "aarch64-unknown-linux-gnu",
-    "x86_64-unknown-linux-musl",
-    "aarch64-unknown-linux-musl",
-]
 
 [advisories]
 # To accept a specific advisory, add its ID here with a comment explaining why.
@@ -29,6 +18,10 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    # Mozilla's root certificates in webpki-root-certs, which the sync client
+    # uses on Windows, macOS, and phones. It's a license for data and asks
+    # only that the license comes with the data (decision 23).
+    "CDLA-Permissive-2.0",
     "ISC",
     "MIT",
     "MPL-2.0",

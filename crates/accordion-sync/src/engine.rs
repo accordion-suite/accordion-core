@@ -69,6 +69,12 @@ pub struct Engine {
     renamed: AtomicBool,
 }
 
+/// Whether a server change was applied, or waits for the next pass.
+enum Applied {
+    Done,
+    Later,
+}
+
 /// An entry in the synced folder.
 #[derive(Clone, Debug)]
 struct Local {
@@ -114,7 +120,7 @@ impl Engine {
         let scan = self.scan()?;
         let mut missing = 0;
         for item in self.state.all().map_err(db)? {
-            if item.parent.is_some() && locate(&item, &scan).is_none() {
+            if item.parent.is_some() && self.locate(&item, &scan)?.is_none() {
                 self.state.forget(&item.id).map_err(db)?;
                 missing += 1;
             }
@@ -183,14 +189,19 @@ impl Engine {
                 if self.renamed.swap(false, Ordering::Relaxed) {
                     scan = self.scan()?;
                 }
-                if let Err(err) = self.apply(&item, &scan, report).await {
-                    if !matches!(err, Error::Refused(_) | Error::NotFound | Error::Local(_)) {
-                        return Err(err);
+                match self.apply(&item, &scan, report).await {
+                    Ok(Applied::Done) => {}
+                    // Comes again next pass, after this one's push.
+                    Ok(Applied::Later) => failed = true,
+                    Err(err) => {
+                        if !matches!(err, Error::Refused(_) | Error::NotFound | Error::Local(_)) {
+                            return Err(err);
+                        }
+                        failed = true;
+                        report
+                            .notices
+                            .push(format!("Couldn't sync {}: {err}", item.name));
                     }
-                    failed = true;
-                    report
-                        .notices
-                        .push(format!("Couldn't sync {}: {err}", item.name));
                 }
             }
             waiting = later;
@@ -333,7 +344,7 @@ impl Engine {
         item: &RemoteItem,
         scan: &Scan,
         report: &mut Report,
-    ) -> Result<(), Error> {
+    ) -> Result<Applied, Error> {
         let target = self.target(item)?;
         let known = self.state.get(&item.id).map_err(db)?;
         let Some(known) = known else {
@@ -342,7 +353,7 @@ impl Engine {
 
         // Where it is here now: where it was, somewhere else if it moved
         // here, or nowhere if it was deleted here.
-        let here = locate(&known, scan);
+        let here = self.locate(&known, scan)?;
         let mut path = known.path.clone();
         let mut record = known.clone();
         if known.path != target {
@@ -362,8 +373,15 @@ impl Engine {
                 // the last one the server gets wins.
                 Some(_) => {}
                 // Deleted here. Pushing sends that, unless the contents
-                // changed on the server, which brings it back below.
-                None => path = target.clone(),
+                // changed on the server, which brings it back below. What
+                // was inside goes with it, so a file brought back lands in
+                // the folder's new place.
+                None => {
+                    if known.folder {
+                        self.state.move_inside(&known.path, &target).map_err(db)?;
+                    }
+                    path = target.clone();
+                }
             }
         }
         record.path = path.clone();
@@ -411,7 +429,7 @@ impl Engine {
         if !item.is_folder() {
             read_only(&self.root.join(&path), item.access == "viewer");
         }
-        Ok(())
+        Ok(Applied::Done)
     }
 
     /// An item this device hasn't had before.
@@ -420,8 +438,29 @@ impl Engine {
         item: &RemoteItem,
         target: &str,
         report: &mut Report,
-    ) -> Result<(), Error> {
+    ) -> Result<Applied, Error> {
         let at = self.root.join(target);
+        // Its folder was deleted or moved here, and pushing hasn't sent that
+        // yet. Making the folder again would undo what the person did, so
+        // the item waits for the next pass, which finds it in the folder's
+        // new place, or gone with the folder.
+        if let Some(parent) = at.parent()
+            && item.parent.is_some()
+            && !parent.is_dir()
+        {
+            return Ok(Applied::Later);
+        }
+        // Another item has this place, such as a folder deleted in
+        // Accordion and a new one of the same name, and finds its own place
+        // later in the pass. Without this, the two would become one here.
+        if self
+            .state
+            .at_path(target)
+            .map_err(db)?
+            .is_some_and(|other| other.id != item.id)
+        {
+            self.make_room(target, &item.id, report)?;
+        }
         if item.is_folder() {
             if at.exists() && !at.is_dir() {
                 self.conflict_copy(target, report)?;
@@ -464,7 +503,7 @@ impl Engine {
                 size: local.size,
             })
             .map_err(db)?;
-        Ok(())
+        Ok(Applied::Done)
     }
 
     /// An item that's gone from the server, or out of reach. What changed
@@ -473,7 +512,9 @@ impl Engine {
         let Some(known) = self.state.get(id).map_err(db)? else {
             return Ok(());
         };
-        let path = locate(&known, scan).unwrap_or_else(|| known.path.clone());
+        let path = self
+            .locate(&known, scan)?
+            .unwrap_or_else(|| known.path.clone());
         let mut kept = 0;
         if known.folder {
             for inside in self.state.inside(&known.path).map_err(db)? {
@@ -567,11 +608,26 @@ impl Engine {
         let scan = self.scan()?;
         let now = SystemTime::now();
 
+        // A folder made again here, such as around a file brought back into
+        // a folder deleted here, has a new inode. Moves find folders by
+        // inode, so the record takes the new one.
+        let mut known = known;
+        for item in &mut known {
+            if let Some(local) = scan.entries.get(&item.path)
+                && item.folder
+                && local.folder
+                && local.inode != item.inode
+            {
+                item.inode = local.inode;
+                self.state.put(item).map_err(db)?;
+            }
+        }
+
         // Where each known item is now.
         let mut placed: HashMap<String, Option<String>> = HashMap::new();
         let mut claimed: HashSet<String> = HashSet::new();
         for item in &known {
-            let at = locate(item, &scan);
+            let at = self.locate(item, &scan)?;
             if let Some(at) = &at {
                 claimed.insert(at.clone());
             }
@@ -615,9 +671,17 @@ impl Engine {
             .collect();
         moved.sort_by_key(|(item, _)| item.path.matches('/').count());
         for (item, to) in moved {
-            // Already moved with a folder above it.
+            // Already moved with a folder above it, unless the server had
+            // moved it out of that folder first, so its folder or name there
+            // aren't the ones here.
             let current = self.state.get(&item.id).map_err(db)?;
-            if current.as_ref().is_some_and(|current| current.path == to) {
+            if let Some(current) = &current
+                && current.path == to
+                && self.parent_of(&to)?.is_some_and(|(parent, name)| {
+                    current.parent.as_deref() == Some(parent.as_str())
+                        && local_name(&current.name) == name
+                })
+            {
                 continue;
             }
             let from = current.map_or_else(|| item.path.clone(), |current| current.path);
@@ -646,6 +710,9 @@ impl Engine {
                     if item.folder {
                         self.state.move_inside(&from, &to).map_err(db)?;
                     }
+                    // Moved with its folder here, from somewhere else in
+                    // Accordion, so its old path here is the new one.
+                    let from = if from == to { item.name.clone() } else { from };
                     report.done.push(format!("Moved {from} to {to}"));
                 }
                 Err(err) if !is_fatal(&err) => {
@@ -721,13 +788,12 @@ impl Engine {
 
         // 4. New files.
         let scan = self.scan()?;
-        let mut claimed: HashSet<String> = self
-            .state
-            .all()
-            .map_err(db)?
-            .into_iter()
-            .filter_map(|item| locate(&item, &scan))
-            .collect();
+        let mut claimed: HashSet<String> = HashSet::new();
+        for item in self.state.all().map_err(db)? {
+            if let Some(at) = self.locate(&item, &scan)? {
+                claimed.insert(at);
+            }
+        }
         let mut paths: Vec<&String> = scan.entries.keys().collect();
         paths.sort();
         for path in paths {
@@ -762,10 +828,12 @@ impl Engine {
 
         // 5. Deletes made here: each outermost missing item, once.
         let known = self.state.all().map_err(db)?;
-        let missing: Vec<&Known> = known
-            .iter()
-            .filter(|item| item.parent.is_some() && locate(item, &scan).is_none())
-            .collect();
+        let mut missing: Vec<&Known> = Vec::new();
+        for item in &known {
+            if item.parent.is_some() && self.locate(item, &scan)?.is_none() {
+                missing.push(item);
+            }
+        }
         let missing_paths: HashSet<&str> = missing.iter().map(|item| item.path.as_str()).collect();
         let outermost: Vec<&Known> = missing
             .iter()
@@ -822,6 +890,25 @@ impl Engine {
                 size: local.size,
             })
             .map_err(db)
+    }
+
+    /// Where a known item is in the scan, as [`locate`] finds it, except
+    /// that a path another known item is still at stays that item's. The
+    /// system reuses a deleted file's inode for a new one, which could
+    /// otherwise make two items claim the same place, and each pass move
+    /// them back and forth.
+    fn locate(&self, known: &Known, scan: &Scan) -> Result<Option<String>, Error> {
+        let Some(at) = locate(known, scan) else {
+            return Ok(None);
+        };
+        if at != known.path
+            && let Some(other) = self.state.at_path(&at).map_err(db)?
+            && other.id != known.id
+            && scan.entries[&at].folder == other.folder
+        {
+            return Ok(None);
+        }
+        Ok(Some(at))
     }
 
     /// The server folder a path is in, and its name there. `None` if it
@@ -898,16 +985,19 @@ impl Engine {
 
     /// Moves whatever's at `path` out of the way, if it isn't `id` itself.
     fn make_room(&self, path: &str, id: &str, report: &mut Report) -> Result<(), Error> {
-        if !self.root.join(path).exists() {
-            return Ok(());
-        }
+        let here = self.root.join(path).exists();
         match self.state.at_path(path).map_err(db)? {
             Some(other) if other.id == id => Ok(()),
             // Another item that's moving too, such as two files swapping
-            // names. It finds its own place later in the pass.
+            // names. It finds its own place later in the pass. Its record
+            // moves aside even when it isn't here, such as when it moved
+            // or was deleted here, so its contents' records don't end up
+            // inside the item taking its place.
             Some(other) => {
                 let aside = self.free_path(path, None)?;
-                self.rename(path, &aside)?;
+                if here {
+                    self.rename(path, &aside)?;
+                }
                 let mut record = other;
                 record.path = aside.clone();
                 if record.folder {
@@ -916,6 +1006,7 @@ impl Engine {
                 self.state.put(&record).map_err(db)?;
                 Ok(())
             }
+            None if !here => Ok(()),
             None => {
                 let copy = self.conflict_copy(path, report)?;
                 report.notices.push(format!(

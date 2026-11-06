@@ -541,3 +541,35 @@ async fn upkeep_rebuilds_the_view_when_it_starts() {
     assert_eq!(std::fs::read_to_string(&shown).unwrap(), "keep");
     assert_eq!(*status.borrow(), StorageStatus::default());
 }
+
+#[tokio::test]
+async fn keeps_the_admins_choice_of_retention() {
+    let server = start().await;
+    let storage = &server.storage;
+    assert_eq!(storage.retention().await.unwrap(), Retention::default());
+
+    let chosen = Retention {
+        trash_days: 7,
+        version_days: 365,
+    };
+    assert!(storage.set_retention(chosen).await.unwrap());
+    assert!(!storage.set_retention(chosen).await.unwrap());
+    assert_eq!(storage.retention().await.unwrap(), chosen);
+
+    for wrong in [
+        Retention {
+            trash_days: 0,
+            version_days: 30,
+        },
+        Retention {
+            trash_days: 30,
+            version_days: 31,
+        },
+    ] {
+        assert!(matches!(
+            storage.set_retention(wrong).await,
+            Err(Error::InvalidRetention)
+        ));
+    }
+    assert_eq!(storage.retention().await.unwrap(), chosen);
+}

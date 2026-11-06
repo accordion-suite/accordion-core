@@ -55,6 +55,11 @@ impl Default for Retention {
     }
 }
 
+/// The days an admin can choose for [`Retention::trash_days`] and
+/// [`Retention::version_days`]. There's no "forever", so a busy server's
+/// disk can't fill with old versions without anyone noticing.
+pub const RETENTION_CHOICES: [u32; 4] = [7, 30, 90, 365];
+
 /// What [`Storage::purge`] deleted for good.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Purged {
@@ -143,12 +148,54 @@ impl Storage {
                 tracing::info!(strays, "removed stored contents with no record");
             }
         }
-        let purged = self.purge(Retention::default()).await?;
+        let retention = self.retention().await?;
+        let purged = self.purge(retention).await?;
         let pruned = self.prune_changes().await?;
         let cleaned = self.clean_up().await?;
         let checked = self.check_stored(CHECK_PER_ROUND).await?;
         tracing::debug!(?purged, pruned, ?cleaned, ?checked, "storage upkeep done");
         Ok(())
+    }
+
+    /// How long the admin chose to keep trash and older versions.
+    pub async fn retention(&self) -> Result<Retention, Error> {
+        self.inner
+            .db
+            .read(|conn| {
+                Ok(conn.query_row(
+                    "SELECT trash_days, version_days FROM storage_settings",
+                    [],
+                    |row| {
+                        Ok(Retention {
+                            trash_days: row.get(0)?,
+                            version_days: row.get(1)?,
+                        })
+                    },
+                )?)
+            })
+            .await
+    }
+
+    /// Sets how long trash and older versions are kept, each one of
+    /// [`RETENTION_CHOICES`]. Returns whether anything changed. What's now
+    /// too old goes in the next round of upkeep, within the hour.
+    pub async fn set_retention(&self, retention: Retention) -> Result<bool, Error> {
+        if !RETENTION_CHOICES.contains(&retention.trash_days)
+            || !RETENTION_CHOICES.contains(&retention.version_days)
+        {
+            return Err(Error::InvalidRetention);
+        }
+        self.inner
+            .db
+            .write(move |tx| {
+                let changed = tx.execute(
+                    "UPDATE storage_settings SET trash_days = ?1, version_days = ?2
+                     WHERE trash_days IS NOT ?1 OR version_days IS NOT ?2",
+                    (retention.trash_days, retention.version_days),
+                )?;
+                Ok(changed > 0)
+            })
+            .await
     }
 
     /// Deletes for good what's been in the trash, and older versions that

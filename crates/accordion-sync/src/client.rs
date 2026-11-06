@@ -410,7 +410,8 @@ impl Client {
         parse(&reply)
     }
 
-    /// Moves an item to the trash, where it stays for 30 days.
+    /// Moves an item to the trash, where it stays as long as the admin chose
+    /// (30 days unless they changed it).
     pub async fn trash(&self, id: &str) -> Result<(), Error> {
         self.send(Method::DELETE, &format!("/api/drive/items/{id}"), &[], None)
             .await?;

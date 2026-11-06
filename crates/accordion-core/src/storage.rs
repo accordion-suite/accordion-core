@@ -31,7 +31,7 @@ pub(crate) use changes::forget_cursors;
 pub use changes::{Changes, PAGE as SYNC_PAGE, SyncChange, SyncItem, SyncPage, SyncStart};
 pub use shares::{Access, Share, ShareEvent, ShareLevel, Shared, SharedOut};
 pub(crate) use shares::{access, people_with_access};
-pub use upkeep::{Checked, Cleaned, Damage, Purged, Retention, StorageStatus};
+pub use upkeep::{Checked, Cleaned, Damage, Purged, RETENTION_CHOICES, Retention, StorageStatus};
 pub use uploads::Upload;
 
 use std::collections::{HashMap, HashSet};
@@ -232,6 +232,18 @@ static MIGRATIONS: &[Migration] = &[
         INSERT INTO storage_sync VALUES (1, randomblob(16), 0, 0);
     ",
     },
+    Migration {
+        version: 6,
+        name: "Add the admin's choice of how long trash and versions are kept",
+        sql: "
+        CREATE TABLE storage_settings (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            trash_days INTEGER NOT NULL CHECK (trash_days > 0),
+            version_days INTEGER NOT NULL CHECK (version_days > 0)
+        ) STRICT;
+        INSERT INTO storage_settings VALUES (1, 30, 30);
+    ",
+    },
 ];
 
 /// The longest name, in bytes of UTF-8. Most file systems allow 255, so the
@@ -305,6 +317,9 @@ pub enum Error {
 
     #[error("A whole Drive can't be shared. Share a folder inside it instead.")]
     ShareTopFolder,
+
+    #[error("Trash and versions can be kept for 7, 30, 90, or 365 days. Choose one of those.")]
+    InvalidRetention,
 
     #[error(
         "That upload doesn't exist. It may have finished, been canceled, or been removed after \

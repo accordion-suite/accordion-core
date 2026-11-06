@@ -788,7 +788,7 @@ impl Engine {
                 continue;
             };
             match self.client.move_item(&item.id, &parent, name).await {
-                Ok(_) => {
+                Ok(moved) => {
                     let mut record = item.clone();
                     record.path = to.clone();
                     record.parent = Some(parent);
@@ -801,6 +801,10 @@ impl Engine {
                     // Accordion, so its old path here is the new one.
                     let from = if from == to { item.name.clone() } else { from };
                     report.done.push(format!("Moved {from} to {to}"));
+                    // Windows marks a cloud file as changed when it's moved
+                    // or renamed here, so it shows as waiting to sync until
+                    // it's marked again.
+                    self.mark_synced(&moved, &to, report);
                 }
                 Err(err) if !is_fatal(&err) => {
                     // Such as moving someone else's file out of their folder.

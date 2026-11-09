@@ -87,7 +87,7 @@ static MIGRATIONS: &[Migration] = &[
 
 /// The version of what makes thumbnails. Raise it when it can make
 /// thumbnails of files it couldn't before, so they get another try.
-pub const WORKER: u32 = 7;
+pub const WORKER: u32 = 8;
 
 /// The longer side of a thumbnail, in pixels.
 const SIZE: u32 = 480;
@@ -130,7 +130,11 @@ const PREVIEW: Output = Output {
 const MAX_FILE: u64 = 200 * 1024 * 1024;
 
 /// HEIC and AVIF files are decoded whole, so larger ones get no thumbnail.
-const MAX_HEIF_PIXELS: u64 = 24_000_000;
+/// A 51-megapixel HEIC takes about 540 MB, within a worker's 1 GB, so
+/// HEIC goes up to 64. AVIF's decoder hasn't been measured, so it stays at
+/// 24.
+const MAX_HEIC_PIXELS: u64 = 64_000_000;
+const MAX_AVIF_PIXELS: u64 = 24_000_000;
 
 /// Larger documents get no thumbnail. LibreOffice reads the whole file.
 const MAX_DOCUMENT: u64 = 100 * 1024 * 1024;
@@ -235,6 +239,13 @@ const NO_DJVU: &str = "djvulibre isn't installed";
 /// it, or only a bitmap libvips doesn't trust.
 const NO_EMBEDDED: &str = "a camera raw photo without a JPEG preview in it";
 
+/// Why an MNG has no thumbnail when it doesn't start with a whole PNG, such
+/// as one that starts with a JPEG or a change to another picture.
+const NO_MNG_PICTURE: &str = "an MNG that doesn't start with a PNG picture";
+
+/// How every MNG file starts.
+const MNG: &[u8] = b"\x8aMNG\r\n\x1a\n";
+
 /// The fontconfig settings and cache, for an SVG's text. The fonts
 /// themselves are under `/usr`, which every worker reads.
 const FONT_READS: [&str; 2] = ["/etc/fonts", "/var/cache/fontconfig"];
@@ -322,6 +333,21 @@ impl Tools {
 pub struct Thumbnail {
     pub kind: ThumbnailKind,
     pub path: PathBuf,
+    /// When it was made. A thumbnail made again, such as by a newer worker,
+    /// has a new time, so addresses that browsers keep can include it.
+    pub made: std::time::SystemTime,
+}
+
+impl Thumbnail {
+    /// A short text that changes each time the thumbnail is made, for the
+    /// addresses browsers keep it under.
+    pub fn version(&self) -> String {
+        let made = self
+            .made
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        format!("{:x}", made.as_millis())
+    }
 }
 
 /// What a thumbnail is.
@@ -443,6 +469,11 @@ pub(crate) enum Kind {
     Svg,
     /// A DjVu book or scan, which gets a PDF preview, as a document does.
     Djvu,
+    /// An MNG animation, shown by the PNG picture it starts with.
+    Mng,
+    /// A picture only one of libvips's untrusted loaders reads, which the
+    /// worker runs on its own.
+    Loaded(Loader),
     Pdf,
     Video(Container),
     /// UTF-8 text, such as notes, Markdown, CSV, or code.
@@ -658,6 +689,18 @@ impl Still {
     }
 }
 
+/// Pictures that libvips reads only with a loader it doesn't trust with
+/// hostile files, and nothing else reads. The worker names the one loader,
+/// so the file can't reach libvips's others, and runs it in the sandbox,
+/// as it does ffmpeg's older decoders (decision 26).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Loader {
+    /// Radiance HDR pictures, `.hdr`.
+    Radiance,
+    /// FITS, the pictures telescopes and astronomers keep.
+    Fits,
+}
+
 /// What ffprobe says about a video.
 #[derive(Debug, PartialEq)]
 struct Probe {
@@ -736,11 +779,17 @@ impl Thumbnails {
     pub fn find(&self, hash: ContentHash) -> Option<Thumbnail> {
         [ThumbnailKind::Picture, ThumbnailKind::Text]
             .into_iter()
-            .map(|kind| Thumbnail {
-                kind,
-                path: self.path(hash, kind),
+            .find_map(|kind| {
+                let path = self.path(hash, kind);
+                let found = std::fs::metadata(&path)
+                    .ok()
+                    .filter(|found| found.is_file())?;
+                Some(Thumbnail {
+                    kind,
+                    made: found.modified().ok()?,
+                    path,
+                })
             })
-            .find(|thumbnail| thumbnail.path.is_file())
     }
 
     /// The preview of the document with `hash`, if there is one yet.
@@ -1215,8 +1264,8 @@ impl Thumbnails {
                 }
             }
             Kind::Heif => match self.pixels(&file).await {
-                Ok(pixels) if pixels > MAX_HEIF_PIXELS => {
-                    return Outcome::None("a HEIC or AVIF over 24 megapixels");
+                Ok(pixels) if pixels > heif_limit(&head).0 => {
+                    return Outcome::None(heif_limit(&head).1);
                 }
                 Ok(_) => self.thumbnail(std::fs::File::open(&file)).await,
                 Err(problem) => Err(problem),
@@ -1231,6 +1280,15 @@ impl Thumbnails {
             Kind::Svg => self.drawing(&file, THUMBNAIL).await,
             Kind::Djvu if !self.inner.tools.has_djvu() => return Outcome::None(NO_DJVU),
             Kind::Djvu => self.djvu(hash, &file).await,
+            Kind::Mng => match mng_picture(&file) {
+                Ok(Some(png)) => {
+                    self.thumbnail(self.scratch(&png).map_err(io::Error::other))
+                        .await
+                }
+                Ok(None) => return Outcome::None(NO_MNG_PICTURE),
+                Err(problem) => Err(problem),
+            },
+            Kind::Loaded(loader) => self.loaded(&file, loader, THUMBNAIL).await,
             Kind::Pdf => self.pdf(&file).await,
             Kind::Video(_) if !self.inner.tools.has_ffmpeg() => return Outcome::None(NO_FFMPEG),
             Kind::Video(container) => match self.video(&file, container).await {
@@ -1260,14 +1318,11 @@ impl Thumbnails {
             Err(problem) => return Outcome::Failed(problem),
         };
         let tiff = tiff(&head);
-        let avif = head
-            .get(8..12)
-            .is_some_and(|brand| brand == b"avif" || brand == b"avis");
         let made = match kind {
             Some(Kind::Image) if tiff => self.shrink(std::fs::File::open(&file), PREVIEW).await,
-            Some(Kind::Heif) if !avif => match self.pixels(&file).await {
-                Ok(pixels) if pixels > MAX_HEIF_PIXELS => {
-                    return Outcome::None("a HEIC over 24 megapixels");
+            Some(Kind::Heif) if !avif(&head) => match self.pixels(&file).await {
+                Ok(pixels) if pixels > MAX_HEIC_PIXELS => {
+                    return Outcome::None(heif_limit(&head).1);
                 }
                 Ok(_) => self.shrink(std::fs::File::open(&file), PREVIEW).await,
                 Err(problem) => Err(problem),
@@ -1275,6 +1330,15 @@ impl Thumbnails {
             Some(Kind::Still(Still::Bmp | Still::Icon)) => {
                 return Outcome::None("the browser shows it");
             }
+            Some(Kind::Mng) => match mng_picture(&file) {
+                Ok(Some(png)) => {
+                    self.shrink(self.scratch(&png).map_err(io::Error::other), PREVIEW)
+                        .await
+                }
+                Ok(None) => return Outcome::None(NO_MNG_PICTURE),
+                Err(problem) => Err(problem),
+            },
+            Some(Kind::Loaded(loader)) => self.loaded(&file, loader, PREVIEW).await,
             Some(Kind::Raw) if !self.inner.tools.has_libraw() => return Outcome::None(NO_LIBRAW),
             Some(Kind::Raw) => match self.embedded(&file).await {
                 Ok(Some((jpeg, turn))) => self.shrink(Ok(jpeg), Output { turn, ..PREVIEW }).await,
@@ -1315,7 +1379,19 @@ impl Thumbnails {
 
     /// Keeps a thumbnail that's been made.
     fn done(&self, hash: ContentHash, kind: ThumbnailKind, thumbnail: &[u8]) -> Outcome {
-        match self.keep(self.path(hash, kind), thumbnail) {
+        // A thumbnail of the other kind, from before a newer worker knew
+        // better, such as text for an XPM picture, goes.
+        let other = match kind {
+            ThumbnailKind::Picture => ThumbnailKind::Text,
+            ThumbnailKind::Text => ThumbnailKind::Picture,
+        };
+        let kept = self.keep(self.path(hash, kind), thumbnail).and_then(|()| {
+            match std::fs::remove_file(self.path(hash, other)) {
+                Err(err) if err.kind() != io::ErrorKind::NotFound => Err(err),
+                _ => Ok(()),
+            }
+        });
+        match kept {
             Ok(()) => Outcome::Ready,
             Err(err) => Outcome::Failed(format!("couldn't save the thumbnail: {err}")),
         }
@@ -1617,6 +1693,53 @@ impl Thumbnails {
             .map_err(|err| err.to_string())?;
         if !png.starts_with(b"\x89PNG") {
             return Err("librsvg didn't draw a picture".into());
+        }
+        self.shrink(self.scratch(&png).map_err(io::Error::other), output)
+            .await
+    }
+
+    /// A picture read with only libvips's `loader`, as WebP that fits
+    /// `output`. That loader turns the picture into a PNG, which libvips
+    /// then shrinks with its trusted PNG reader.
+    async fn loaded(&self, file: &Path, loader: Loader, output: Output) -> Result<Vec<u8>, String> {
+        let (args, input, read) = match loader {
+            // The Radiance loader reads its input.
+            Loader::Radiance => (
+                vec!["radload_source".into(), "[descriptor=0]".into()],
+                std::fs::File::open(file),
+                vec![],
+            ),
+            // The FITS loader reads only a file it's named.
+            Loader::Fits => (
+                vec!["fitsload".into(), file.into()],
+                std::fs::File::open("/dev/null"),
+                vec![file.to_owned()],
+            ),
+        };
+        let args: Vec<OsString> = args.into_iter().chain([".png".into()]).collect();
+        let input = input.map_err(|err| format!("couldn't open the file: {err}"))?;
+        // No VIPS_BLOCK_UNTRUSTED, since the loader is one it blocks. The
+        // worker names it, so the file reaches no other.
+        let env = [("VIPS_CONCURRENCY", "2"), ("MALLOC_ARENA_MAX", "2")];
+        let png = self
+            .inner
+            .sandbox
+            .run(Job {
+                program: &self.inner.tools.vips,
+                args: &args,
+                env: &env,
+                input,
+                read: &read,
+                write: &[],
+                sockets: None,
+                // A whole picture as a PNG is larger than a thumbnail's
+                // output limit.
+                limits: PREVIEW_LIMITS,
+            })
+            .await
+            .map_err(|err| err.to_string())?;
+        if !png.starts_with(b"\x89PNG") {
+            return Err("libvips didn't make a PNG".into());
         }
         self.shrink(self.scratch(&png).map_err(io::Error::other), output)
             .await
@@ -2135,6 +2258,17 @@ fn kind(head: &[u8], whole: bool) -> Option<Kind> {
     if djvu(head) {
         return Some(Kind::Djvu);
     }
+    if starts(MNG) {
+        return Some(Kind::Mng);
+    }
+    if starts(b"#?RADIANCE\n") || starts(b"#?RGBE\n") {
+        return Some(Kind::Loaded(Loader::Radiance));
+    }
+    // The first of the header's 80-character lines says it's a standard
+    // FITS file.
+    if starts(b"SIMPLE  =") && head.get(29) == Some(&b'T') {
+        return Some(Kind::Loaded(Loader::Fits));
+    }
     if let Some(container) = container(head) {
         return Some(Kind::Video(container));
     }
@@ -2329,6 +2463,65 @@ fn turns(header: &str) -> bool {
     let tall =
         matches!((field("width"), field("height")), (Some(width), Some(height)) if height > width);
     !(sideways && tall)
+}
+
+/// The PNG picture an MNG animation starts with, as a PNG file, or `None`
+/// if it starts some other way. MNG keeps PNG's chunks as they are, from
+/// IHDR to IEND, so this only finds where they are. libvips decodes them,
+/// in the sandbox.
+fn mng_picture(file: &Path) -> Result<Option<Vec<u8>>, String> {
+    let read = std::fs::File::open(file)
+        .and_then(|opened| {
+            let mut read = Vec::new();
+            opened.take(MAX_FILE).read_to_end(&mut read)?;
+            Ok(read)
+        })
+        .map_err(|err| format!("couldn't read the file: {err}"))?;
+    Ok(first_png(&read))
+}
+
+/// The first PNG picture in the MNG `mng`, as a PNG file.
+fn first_png(mng: &[u8]) -> Option<Vec<u8>> {
+    let mut at = mng.strip_prefix(MNG).map(|_| MNG.len())?;
+    let mut start = None;
+    while let Some(header) = mng.get(at..at + 8) {
+        let length = u32::from_be_bytes(header[..4].try_into().ok()?) as usize;
+        let name = &header[4..8];
+        // The length, the name, the data, and a checksum.
+        let end = at.checked_add(12)?.checked_add(length)?;
+        if end > mng.len() {
+            return None;
+        }
+        match name {
+            b"IHDR" => start = Some(at),
+            b"IEND" => {
+                let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+                png.extend_from_slice(&mng[start?..end]);
+                return Some(png);
+            }
+            // A JPEG or a change to a picture, which aren't PNG.
+            b"JHDR" | b"DHDR" | b"BASI" | b"MEND" if start.is_none() => return None,
+            _ => {}
+        }
+        at = end;
+    }
+    None
+}
+
+/// Whether a HEIF file is an AVIF rather than a HEIC, by its brand.
+fn avif(head: &[u8]) -> bool {
+    head.get(8..12)
+        .is_some_and(|brand| brand == b"avif" || brand == b"avis")
+}
+
+/// The most pixels a HEIC or AVIF may have, and why a larger one has no
+/// thumbnail.
+fn heif_limit(head: &[u8]) -> (u64, &'static str) {
+    if avif(head) {
+        (MAX_AVIF_PIXELS, "an AVIF over 24 megapixels")
+    } else {
+        (MAX_HEIC_PIXELS, "a HEIC over 64 megapixels")
+    }
 }
 
 /// Whether `head` starts as a TIFF does, in either byte order.
@@ -2680,6 +2873,67 @@ mod tests {
         // Compressed SVG is known by its name.
         assert_eq!(named("map.svgz", b"\x1f\x8b\x08\0", None), Some(Kind::Svg));
         assert_eq!(named("map.gz", b"\x1f\x8b\x08\0", None), None);
+    }
+
+    #[test]
+    fn knows_pictures_only_one_libvips_loader_reads() {
+        assert_eq!(
+            kind(b"#?RADIANCE\nFORMAT=32-bit_rle_rgbe\n", false),
+            Some(Kind::Loaded(Loader::Radiance))
+        );
+        assert_eq!(
+            kind(b"#?RGBE\nGAMMA=0.45\n", false),
+            Some(Kind::Loaded(Loader::Radiance))
+        );
+        let fits = b"SIMPLE  =                    T / conforms to FITS standard";
+        assert_eq!(kind(fits, false), Some(Kind::Loaded(Loader::Fits)));
+        // A line of text that starts the same way stays text.
+        assert_eq!(kind(b"SIMPLE  = not a picture", true), Some(Kind::Text));
+    }
+
+    #[test]
+    fn finds_the_png_an_mng_starts_with() {
+        let chunk = |name: &[u8; 4], data: &[u8]| {
+            let mut chunk = (data.len() as u32).to_be_bytes().to_vec();
+            chunk.extend_from_slice(name);
+            chunk.extend_from_slice(data);
+            chunk.extend_from_slice(&[0; 4]);
+            chunk
+        };
+        let picture = [
+            chunk(b"IHDR", &[0; 13]),
+            chunk(b"IDAT", b"pixels"),
+            chunk(b"IEND", b""),
+        ]
+        .concat();
+        let mng = [
+            MNG,
+            &chunk(b"MHDR", &[0; 28]),
+            &picture,
+            &chunk(b"MEND", b""),
+        ]
+        .concat();
+        assert_eq!(kind(&mng, false), Some(Kind::Mng));
+        assert_eq!(
+            first_png(&mng),
+            Some([b"\x89PNG\r\n\x1a\n".as_slice(), &picture].concat())
+        );
+        // One that starts with a JPEG, or is cut off, has none.
+        let jpeg = [MNG, &chunk(b"MHDR", &[0; 28]), &chunk(b"JHDR", &[0; 16])].concat();
+        assert_eq!(first_png(&jpeg), None);
+        assert_eq!(first_png(&mng[..mng.len() - 30]), None);
+        // A length that runs past the end.
+        let mut long = mng.clone();
+        long[8..12].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert_eq!(first_png(&long), None);
+    }
+
+    #[test]
+    fn decodes_larger_heic_than_avif() {
+        let heic = b"\0\0\0\x18ftypheic\0\0\0\0";
+        let avif = b"\0\0\0\x18ftypavif\0\0\0\0";
+        assert_eq!(heif_limit(heic).0, 64_000_000);
+        assert_eq!(heif_limit(avif).0, 24_000_000);
     }
 
     #[test]

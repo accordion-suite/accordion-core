@@ -1138,3 +1138,60 @@ async fn shows_raw_photos_drawings_and_books_once_their_programs_are_installed()
     stop.send(()).unwrap();
     worker.await.unwrap();
 }
+
+/// An MNG animation that starts with `png`, as some programs save a still
+/// picture: its header, the PNG's chunks as they are, and its end.
+fn mng(png: &[u8]) -> Vec<u8> {
+    let chunk = |name: &[u8; 4], data: &[u8]| {
+        let mut chunk = (data.len() as u32).to_be_bytes().to_vec();
+        chunk.extend_from_slice(name);
+        chunk.extend_from_slice(data);
+        // The checksum, which MNG readers check but the worker doesn't.
+        chunk.extend_from_slice(&[0; 4]);
+        chunk
+    };
+    let mut file = b"\x8aMNG\r\n\x1a\n".to_vec();
+    file.extend(chunk(b"MHDR", &[0; 28]));
+    file.extend_from_slice(&png[8..]);
+    file.extend(chunk(b"MEND", b""));
+    file
+}
+
+#[tokio::test]
+async fn shows_hdr_fits_and_mng_pictures() {
+    let server = start().await;
+    // Radiance pictures are color, so this one has three bands.
+    let path = server.dir.path().join("sky.hdr");
+    let made = Command::new("vips")
+        .args([
+            "black",
+            path.to_str().unwrap(),
+            "3000",
+            "2000",
+            "--bands",
+            "3",
+        ])
+        .status()
+        .unwrap();
+    assert!(made.success(), "libvips couldn't make sky.hdr");
+    let hdr = server.save("sky.hdr", &std::fs::read(path).unwrap()).await;
+    let fits = server
+        .save("m31.fits", &server.image("m31.fits", 3000, 2000))
+        .await;
+    let animation = mng(&server.image("frame.png", 3000, 2000));
+    let animation = server.save("logo.mng", &animation).await;
+    for hash in [hdr, fits, animation] {
+        assert!(server.thumbnails.make_now(hash).await.unwrap());
+        let (width, height, _) = describe(&thumbnail(&server, hash));
+        assert_eq!((width, height), (480, 320));
+    }
+
+    let (stop, worker) = start_worker(&server.thumbnails);
+    wait_for_pictures(&server.thumbnails, &[hdr, fits, animation]).await;
+    for hash in [hdr, fits, animation] {
+        let (width, height, _) = describe(&server.thumbnails.picture(hash).unwrap());
+        assert_eq!((width, height), (2560, 1707));
+    }
+    stop.send(()).unwrap();
+    worker.await.unwrap();
+}

@@ -46,10 +46,11 @@ use crate::storage::{ContentHash, Storage, blobs};
 
 const OWNER: &str = "thumbnails";
 
-static MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "Create thumbnails",
-    sql: "
+static MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "Create thumbnails",
+        sql: "
     -- What happened to each stored file's contents. A file whose contents
     -- have no row is waiting for its thumbnail.
     CREATE TABLE thumbnails (
@@ -67,7 +68,22 @@ static MIGRATIONS: &[Migration] = &[Migration {
 
     CREATE INDEX thumbnails_failed ON thumbnails (state) WHERE state = 'failed';
 ",
-}];
+    },
+    Migration {
+        version: 2,
+        name: "Add picture previews",
+        sql: "
+    -- A large picture for the viewer, made after the thumbnail, of
+    -- pictures the browser can't show (decision 26). NULL: not decided
+    -- yet. picture: in cache/previews. none: not needed, or can't be
+    -- made. failed: the worker couldn't make one.
+    ALTER TABLE thumbnails ADD COLUMN preview TEXT
+        CHECK (preview IN ('picture', 'none', 'failed'));
+    -- Why there's none, or what went wrong.
+    ALTER TABLE thumbnails ADD COLUMN preview_reason TEXT;
+",
+    },
+];
 
 /// The version of what makes thumbnails. Raise it when it can make
 /// thumbnails of files it couldn't before, so they get another try.
@@ -75,6 +91,36 @@ pub const WORKER: u32 = 6;
 
 /// The longer side of a thumbnail, in pixels.
 const SIZE: u32 = 480;
+
+/// The longer side of a picture's preview, in pixels.
+const PREVIEW_SIZE: u32 = 2560;
+
+/// What a worker may use for each picture preview. A 2560-pixel PNG on
+/// its way to libvips is larger than a thumbnail's output limit.
+const PREVIEW_LIMITS: Limits = Limits {
+    memory: 1024 * 1024 * 1024,
+    cpu: Duration::from_secs(30),
+    time: Duration::from_secs(45),
+    output: 64 * 1024 * 1024,
+};
+
+/// How large a worker's picture is, and what the worker may use.
+#[derive(Clone, Copy)]
+struct Output {
+    /// The longer side, in pixels.
+    longest: u32,
+    limits: Limits,
+}
+
+const THUMBNAIL: Output = Output {
+    longest: SIZE,
+    limits: LIMITS,
+};
+
+const PREVIEW: Output = Output {
+    longest: PREVIEW_SIZE,
+    limits: PREVIEW_LIMITS,
+};
 
 /// Larger files get no thumbnail.
 const MAX_FILE: u64 = 200 * 1024 * 1024;
@@ -306,6 +352,8 @@ struct Inner {
     db: Database,
     storage: Storage,
     dir: PathBuf,
+    /// `cache/previews/`, for pictures' previews.
+    previews: PathBuf,
     tools: Tools,
     sandbox: Sandbox,
     status: watch::Sender<ThumbnailStatus>,
@@ -514,6 +562,9 @@ pub(crate) enum Still {
     Wbmp,
     /// Macintosh PICT, known by its name.
     Pict,
+    /// X pixmap and X bitmap, pictures written as C source.
+    Xpm,
+    Xbm,
 }
 
 impl Still {
@@ -534,6 +585,8 @@ impl Still {
             Self::Pfm => (&["-f", "pfm_pipe"], "pfm"),
             Self::Icon => (&["-f", "ico"], "bmp,png"),
             Self::Pict => (&["-f", "qdraw_pipe"], "qdraw"),
+            Self::Xpm => (&["-f", "xpm_pipe"], "xpm"),
+            Self::Xbm => (&["-f", "xbm_pipe"], "xbm"),
             // ffmpeg reads these as one picture, by the decoder it's told,
             // and never treats the name as a pattern for other files.
             Self::Targa => (
@@ -571,6 +624,8 @@ impl Thumbnails {
         db.migrate(OWNER, MIGRATIONS).await?;
         let dir = data_dir.join("cache").join("thumbnails");
         std::fs::create_dir_all(dir.join("partial"))?;
+        let previews = data_dir.join("cache").join("previews");
+        std::fs::create_dir_all(&previews)?;
         // Thumbnails and scratch folders from a run that stopped partway.
         for entry in std::fs::read_dir(dir.join("partial"))? {
             let entry = entry?;
@@ -599,6 +654,7 @@ impl Thumbnails {
                 db,
                 storage,
                 dir,
+                previews,
                 sandbox: Sandbox::new(&tools.launcher),
                 tools,
                 status: watch::Sender::new(ThumbnailStatus {
@@ -637,6 +693,19 @@ impl Thumbnails {
                 partial,
             })
             .find(|preview| preview.path.is_file())
+    }
+
+    /// The large picture the viewer shows of the contents with `hash`, for a
+    /// picture the browser can't show itself, if there is one yet.
+    pub fn picture(&self, hash: ContentHash) -> Option<PathBuf> {
+        Some(self.picture_path(hash)).filter(|path| path.is_file())
+    }
+
+    fn picture_path(&self, hash: ContentHash) -> PathBuf {
+        self.inner
+            .previews
+            .join(blobs::shard(hash))
+            .with_extension("webp")
     }
 
     fn path(&self, hash: ContentHash, kind: ThumbnailKind) -> PathBuf {
@@ -688,9 +757,30 @@ impl Thumbnails {
                 let result = self.record(*hash, outcome).await;
                 self.note(result.err());
             }
+            // Previews come after every waiting thumbnail, since a grid
+            // needs those first.
+            let previews = if waiting.is_empty() {
+                match self.previews_waiting(BATCH).await {
+                    Ok(previews) => previews,
+                    Err(err) => {
+                        self.note(Some(err));
+                        Vec::new()
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            for hash in &previews {
+                let outcome = tokio::select! {
+                    () = &mut stopped => return,
+                    outcome = self.make_preview(*hash) => outcome,
+                };
+                let result = self.record_preview(*hash, outcome).await;
+                self.note(result.err());
+            }
             let result = self.count().await;
             self.note(result.err());
-            if waiting.is_empty() {
+            if waiting.is_empty() && previews.is_empty() {
                 tokio::select! {
                     () = &mut stopped => return,
                     _ = saved.changed() => {}
@@ -720,6 +810,52 @@ impl Thumbnails {
             status.last_error = last_error;
             changed
         });
+    }
+
+    /// Records whether the contents with `hash` have a picture preview.
+    async fn record_preview(&self, hash: ContentHash, outcome: Outcome) -> Result<(), Error> {
+        let (state, reason) = match outcome {
+            Outcome::Ready => ("picture", None),
+            Outcome::None(reason) => ("none", Some(reason.to_owned())),
+            Outcome::Failed(problem) => {
+                tracing::info!(contents = %hash, %problem, "couldn't make a preview");
+                ("failed", Some(problem))
+            }
+        };
+        self.inner
+            .db
+            .write(move |tx| {
+                tx.execute(
+                    "UPDATE thumbnails SET preview = ?2, preview_reason = ?3 WHERE hash = ?1",
+                    (&hash.0[..], state, reason),
+                )?;
+                // Open lists load the items again, which now have a preview.
+                if state == "picture" {
+                    hint_folders(tx, hash)?;
+                }
+                Ok::<_, rusqlite::Error>(())
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Contents with a thumbnail whose preview isn't decided yet, newest
+    /// first.
+    async fn previews_waiting(&self, limit: usize) -> Result<Vec<ContentHash>, Error> {
+        self.inner
+            .db
+            .read(move |conn| {
+                conn.prepare(
+                    "SELECT t.hash FROM thumbnails t
+                     WHERE t.state = 'ready' AND t.preview IS NULL
+                     ORDER BY t.made_at DESC
+                     LIMIT ?1",
+                )?
+                .query_map([limit as i64], |row| hash(row, 0))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(Error::from)
+            })
+            .await
     }
 
     /// The newest stored contents that a file uses and that have no
@@ -798,7 +934,8 @@ impl Thumbnails {
                         sql_now!(),
                         ") ON CONFLICT (hash) DO UPDATE SET
                              state = excluded.state, worker = excluded.worker,
-                             reason = excluded.reason, made_at = excluded.made_at"
+                             reason = excluded.reason, made_at = excluded.made_at,
+                             preview = NULL, preview_reason = NULL"
                     ),
                     (&hash.0[..], state, WORKER, reason),
                 )?;
@@ -885,6 +1022,35 @@ impl Thumbnails {
                 .await?;
         }
 
+        // Previews the cache lost are made again.
+        let pictures = self
+            .inner
+            .db
+            .read(|conn| {
+                conn.prepare("SELECT hash FROM thumbnails WHERE preview = 'picture'")?
+                    .query_map([], |row| hash(row, 0))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(Error::from)
+            })
+            .await?;
+        let lost: Vec<ContentHash> = pictures
+            .into_iter()
+            .filter(|hash| self.picture(*hash).is_none())
+            .collect();
+        if !lost.is_empty() {
+            self.inner
+                .db
+                .write(move |tx| {
+                    let mut reset =
+                        tx.prepare("UPDATE thumbnails SET preview = NULL WHERE hash = ?1")?;
+                    for hash in &lost {
+                        reset.execute([&hash.0[..]])?;
+                    }
+                    Ok::<_, rusqlite::Error>(())
+                })
+                .await?;
+        }
+
         let gone = self
             .inner
             .db
@@ -904,6 +1070,7 @@ impl Thumbnails {
                 self.path(hash, ThumbnailKind::Text),
                 self.preview_path(hash, false),
                 self.preview_path(hash, true),
+                self.picture_path(hash),
             ];
             for path in paths {
                 match std::fs::remove_file(path) {
@@ -915,40 +1082,48 @@ impl Thumbnails {
         Ok(())
     }
 
-    async fn make(&self, hash: ContentHash) -> Outcome {
-        let file = self.inner.storage.contents_file(hash);
-        let (kind, size, head) = match sniff(&file) {
-            Ok(sniffed) => sniffed,
-            Err(err) => return Outcome::Failed(format!("couldn't read the file: {err}")),
-        };
+    /// What kind of file the contents with `hash` are, by their first
+    /// bytes and, for documents and pictures without a signature, their
+    /// name. Also their size and first bytes.
+    async fn identify(
+        &self,
+        file: &Path,
+        hash: ContentHash,
+    ) -> Result<(Option<Kind>, u64, Vec<u8>), String> {
+        let (kind, size, head) =
+            sniff(file).map_err(|err| format!("couldn't read the file: {err}"))?;
         // A document is known by its name as well as its first bytes.
         let kind = if FORMATS
             .iter()
             .any(|format| head.starts_with(format.signature))
         {
-            match self.name(hash).await {
-                Ok(name) => name
-                    .and_then(|name| format(&name, &head))
-                    .map(Kind::Document)
-                    .or(kind),
-                Err(err) => {
-                    return Outcome::Failed(format!("couldn't read the file's name: {err}"));
-                }
-            }
+            self.name(hash)
+                .await
+                .map_err(|err| format!("couldn't read the file's name: {err}"))?
+                .and_then(|name| format(&name, &head))
+                .map(Kind::Document)
+                .or(kind)
         } else {
             kind
         };
         // Pictures without a signature are known by their name as well.
         let kind = match kind {
-            None => match self.name(hash).await {
-                Ok(name) => name
-                    .and_then(|name| unsigned_still(&name, &head))
-                    .map(Kind::Still),
-                Err(err) => {
-                    return Outcome::Failed(format!("couldn't read the file's name: {err}"));
-                }
-            },
+            None => self
+                .name(hash)
+                .await
+                .map_err(|err| format!("couldn't read the file's name: {err}"))?
+                .and_then(|name| unsigned_still(&name, &head))
+                .map(Kind::Still),
             kind => kind,
+        };
+        Ok((kind, size, head))
+    }
+
+    async fn make(&self, hash: ContentHash) -> Outcome {
+        let file = self.inner.storage.contents_file(hash);
+        let (kind, size, head) = match self.identify(&file, hash).await {
+            Ok(identified) => identified,
+            Err(problem) => return Outcome::Failed(problem),
         };
         let kind = match kind {
             // Only the first lines are kept, so text files of any size have one.
@@ -970,7 +1145,10 @@ impl Thumbnails {
             Kind::Still(_) if !self.inner.tools.has_ffmpeg() => return Outcome::None(NO_FFMPEG),
             Kind::Still(still) => {
                 let (reader, decoders) = still.reader();
-                match self.frame(&file, reader, decoders, 0.0, false).await {
+                match self
+                    .frame(&file, reader, decoders, 0.0, false, THUMBNAIL)
+                    .await
+                {
                     Ok(png) if !png.is_empty() => {
                         self.thumbnail(self.scratch(&png).map_err(io::Error::other))
                             .await
@@ -1006,6 +1184,58 @@ impl Thumbnails {
         }
     }
 
+    /// Makes the large picture the viewer shows of a picture the browser
+    /// can't show itself, such as a TIFF, a HEIC, or a Photoshop file.
+    async fn make_preview(&self, hash: ContentHash) -> Outcome {
+        let file = self.inner.storage.contents_file(hash);
+        let (kind, _, head) = match self.identify(&file, hash).await {
+            Ok(identified) => identified,
+            Err(problem) => return Outcome::Failed(problem),
+        };
+        let tiff = head.starts_with(b"II*\0") || head.starts_with(b"MM\0*");
+        let avif = head
+            .get(8..12)
+            .is_some_and(|brand| brand == b"avif" || brand == b"avis");
+        let made = match kind {
+            Some(Kind::Image) if tiff => self.shrink(std::fs::File::open(&file), PREVIEW).await,
+            Some(Kind::Heif) if !avif => match self.pixels(&file).await {
+                Ok(pixels) if pixels > MAX_HEIF_PIXELS => {
+                    return Outcome::None("a HEIC over 24 megapixels");
+                }
+                Ok(_) => self.shrink(std::fs::File::open(&file), PREVIEW).await,
+                Err(problem) => Err(problem),
+            },
+            Some(Kind::Still(Still::Bmp | Still::Icon)) => {
+                return Outcome::None("the browser shows it");
+            }
+            Some(Kind::Still(_)) if !self.inner.tools.has_ffmpeg() => {
+                return Outcome::None(NO_FFMPEG);
+            }
+            Some(Kind::Still(still)) => {
+                let (reader, decoders) = still.reader();
+                match self
+                    .frame(&file, reader, decoders, 0.0, false, PREVIEW)
+                    .await
+                {
+                    Ok(png) if !png.is_empty() => {
+                        self.shrink(self.scratch(&png).map_err(io::Error::other), PREVIEW)
+                            .await
+                    }
+                    Ok(_) => Err("ffmpeg found no picture in the file".into()),
+                    Err(problem) => Err(problem),
+                }
+            }
+            _ => return Outcome::None("the browser shows it, or it isn't a picture"),
+        };
+        match made {
+            Ok(webp) => match self.keep(self.picture_path(hash), &webp) {
+                Ok(()) => Outcome::Ready,
+                Err(err) => Outcome::Failed(format!("couldn't save the preview: {err}")),
+            },
+            Err(problem) => Outcome::Failed(problem),
+        }
+    }
+
     /// Keeps a thumbnail that's been made.
     fn done(&self, hash: ContentHash, kind: ThumbnailKind, thumbnail: &[u8]) -> Outcome {
         match self.keep(self.path(hash, kind), thumbnail) {
@@ -1030,6 +1260,18 @@ impl Thumbnails {
         input: std::fs::File,
         read: &[PathBuf],
     ) -> Result<Vec<u8>, String> {
+        self.work_within(program, args, input, read, LIMITS).await
+    }
+
+    /// The same, with `limits` instead of a thumbnail's.
+    async fn work_within(
+        &self,
+        program: &Path,
+        args: &[OsString],
+        input: std::fs::File,
+        read: &[PathBuf],
+        limits: Limits,
+    ) -> Result<Vec<u8>, String> {
         let env = [
             // Only the decoders libvips trusts with hostile files.
             ("VIPS_BLOCK_UNTRUSTED", "1"),
@@ -1047,7 +1289,7 @@ impl Thumbnails {
                 read,
                 write: &[],
                 sockets: None,
-                limits: LIMITS,
+                limits,
             })
             .await
             .map_err(|err| err.to_string())
@@ -1055,8 +1297,18 @@ impl Thumbnails {
 
     /// Shrinks the image on `input` to a thumbnail, as WebP.
     async fn thumbnail(&self, input: io::Result<std::fs::File>) -> Result<Vec<u8>, String> {
+        self.shrink(input, THUMBNAIL).await
+    }
+
+    /// Shrinks the image on `input` to at most `longest` pixels on its
+    /// longer side, as WebP.
+    async fn shrink(
+        &self,
+        input: io::Result<std::fs::File>,
+        output: Output,
+    ) -> Result<Vec<u8>, String> {
         let input = input.map_err(|err| format!("couldn't open the file: {err}"))?;
-        let size = SIZE.to_string();
+        let size = output.longest.to_string();
         let args = [
             "thumbnail_source",
             "[descriptor=0]",
@@ -1070,7 +1322,9 @@ impl Thumbnails {
             "down",
         ]
         .map(OsString::from);
-        let webp = self.work(&self.inner.tools.vips, &args, input, &[]).await?;
+        let webp = self
+            .work_within(&self.inner.tools.vips, &args, input, &[], output.limits)
+            .await?;
         if !webp.starts_with(b"RIFF") {
             return Err("libvips didn't make a WebP".into());
         }
@@ -1302,11 +1556,13 @@ impl Thumbnails {
         };
         let reader = ["-f", container.format()];
         let mut png = self
-            .frame(file, &reader, VIDEO_DECODERS, start, hdr)
+            .frame(file, &reader, VIDEO_DECODERS, start, hdr, THUMBNAIL)
             .await?;
         if png.is_empty() && start > 0.0 {
             // The video is shorter than it says.
-            png = self.frame(file, &reader, VIDEO_DECODERS, 0.0, hdr).await?;
+            png = self
+                .frame(file, &reader, VIDEO_DECODERS, 0.0, hdr, THUMBNAIL)
+                .await?;
         }
         if png.is_empty() {
             return Err("ffmpeg found no frame in the video".into());
@@ -1356,10 +1612,12 @@ impl Thumbnails {
         decoders: &str,
         start: f64,
         hdr: bool,
+        output: Output,
     ) -> Result<Vec<u8>, String> {
+        let longest = output.longest;
         // A video already smaller stays its size, as a picture does.
         let shrink = format!(
-            "scale=w='min({SIZE},iw)':h='min({SIZE},ih)':force_original_aspect_ratio=decrease"
+            "scale=w='min({longest},iw)':h='min({longest},ih)':force_original_aspect_ratio=decrease"
         );
         let filters = if hdr {
             format!("{shrink},{TONE_MAP}")
@@ -1412,8 +1670,14 @@ impl Thumbnails {
             .chain(after)
             .collect();
         let input = std::fs::File::open("/dev/null").map_err(|err| err.to_string())?;
-        self.work(&self.inner.tools.ffmpeg, &args, input, &[file.to_owned()])
-            .await
+        self.work_within(
+            &self.inner.tools.ffmpeg,
+            &args,
+            input,
+            &[file.to_owned()],
+            output.limits,
+        )
+        .await
     }
 
     /// Keeps a worker's picture in a temporary file, for libvips to read.
@@ -1684,6 +1948,13 @@ fn still(head: &[u8]) -> Option<Still> {
     if bitmap(head) {
         return Some(Still::Bmp);
     }
+    // These are text, so they're checked before text is.
+    if starts(b"/* XPM */") {
+        return Some(Still::Xpm);
+    }
+    if starts(b"#define ") && head.windows(7).any(|window| window == b"_width ") {
+        return Some(Still::Xbm);
+    }
     if starts(b"8BPS") && matches!(at(4..6), Some([0, 1 | 2])) {
         return Some(Still::Psd);
     }
@@ -1927,6 +2198,19 @@ mod tests {
         assert_eq!(still(b"P1\n# made by hand\n"), Some(Still::Netpbm));
         assert_eq!(still(b"P7\nWIDTH 640\n"), Some(Still::Netpbm));
         assert_eq!(still(b"PF\n640 426\n-1.0\n"), Some(Still::Pfm));
+        assert_eq!(
+            still(b"/* XPM */\nstatic char *logo[] = {"),
+            Some(Still::Xpm)
+        );
+        assert_eq!(
+            still(b"#define logo_width 16\n#define logo_height 16\n"),
+            Some(Still::Xbm)
+        );
+        // C source that defines other things is still text.
+        assert_eq!(
+            kind(b"#define MAX 10\nint main() {}\n", false),
+            Some(Kind::Text)
+        );
         let mut photo_cd = vec![0u8; 2100];
         photo_cd[2048..2055].copy_from_slice(b"PCD_IPI");
         assert_eq!(still(&photo_cd), Some(Still::PhotoCd));

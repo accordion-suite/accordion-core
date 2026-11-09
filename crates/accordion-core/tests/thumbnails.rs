@@ -836,3 +836,45 @@ async fn tries_failed_documents_again_when_the_server_starts() {
     stop.send(()).unwrap();
     worker.await.unwrap();
 }
+
+#[tokio::test]
+async fn makes_a_large_preview_of_pictures_the_browser_cant_show() {
+    let server = start().await;
+    let tiff = server
+        .save("scan.tif", &server.image("scan.tif", 4000, 3000))
+        .await;
+    // Netpbm goes through ffmpeg, as Photoshop and Targa files do.
+    let netpbm = server
+        .save("frame.ppm", &server.image("frame.ppm", 3000, 2000))
+        .await;
+    let small = server
+        .save("small.ppm", &server.image("small.ppm", 800, 600))
+        .await;
+    let png = server
+        .save("photo.png", &server.image("photo.png", 4000, 3000))
+        .await;
+    let (stop, worker) = start_worker(&server.thumbnails);
+
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while [tiff, netpbm, small]
+            .iter()
+            .any(|hash| server.thumbnails.picture(*hash).is_none())
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the worker should make each preview");
+    let (width, height, _) = describe(&server.thumbnails.picture(tiff).unwrap());
+    assert_eq!((width, height), (2560, 1920));
+    let (width, height, _) = describe(&server.thumbnails.picture(netpbm).unwrap());
+    assert_eq!((width, height), (2560, 1707));
+    // A picture already smaller keeps its size.
+    let (width, height, _) = describe(&server.thumbnails.picture(small).unwrap());
+    assert_eq!((width, height), (800, 600));
+    // The browser shows a PNG itself.
+    assert!(server.thumbnails.picture(png).is_none());
+
+    stop.send(()).unwrap();
+    worker.await.unwrap();
+}

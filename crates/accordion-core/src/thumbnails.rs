@@ -71,7 +71,7 @@ static MIGRATIONS: &[Migration] = &[Migration {
 
 /// The version of what makes thumbnails. Raise it when it can make
 /// thumbnails of files it couldn't before, so they get another try.
-pub const WORKER: u32 = 5;
+pub const WORKER: u32 = 6;
 
 /// The longer side of a thumbnail, in pixels.
 const SIZE: u32 = 480;
@@ -332,9 +332,10 @@ enum Outcome {
 pub(crate) enum Kind {
     /// JPEG, PNG, GIF, WebP, or TIFF.
     Image,
-    /// A BMP, which ffmpeg decodes, because libvips reads them only with
-    /// ImageMagick, which it doesn't trust with hostile files.
-    Bitmap,
+    /// A picture ffmpeg decodes, such as a BMP or a Photoshop file, because
+    /// libvips reads them only with decoders it doesn't trust with hostile
+    /// files.
+    Still(Still),
     /// HEIC or AVIF, which are decoded whole.
     Heif,
     Pdf,
@@ -477,6 +478,72 @@ impl Container {
             Self::Asf => "asf",
             Self::Flv => "flv",
             Self::Ogg => "ogg",
+        }
+    }
+}
+
+/// The pictures ffmpeg decodes, each with only the one reader and decoder
+/// it needs (decision 26).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Still {
+    Bmp,
+    /// Photoshop's flattened picture, which every PSD keeps.
+    Psd,
+    /// JPEG 2000, in a JP2 file or a bare codestream.
+    Jpeg2000,
+    /// DirectDraw Surface, the textures games use.
+    Dds,
+    /// OpenEXR, the HDR pictures film and 3D work use.
+    Exr,
+    SunRaster,
+    /// A Kodak Photo CD scan.
+    PhotoCd,
+    Sgi,
+    /// An X Window dump.
+    Xwd,
+    Pcx,
+    /// PBM, PGM, PPM, and PAM.
+    Netpbm,
+    /// Portable FloatMap, an HDR picture.
+    Pfm,
+    /// Windows icons and cursors, which hold BMP or PNG pictures.
+    Icon,
+    /// Targa, which has no signature, so it's known by its name.
+    Targa,
+    /// Wireless bitmap, known by its name for the same reason.
+    Wbmp,
+    /// Macintosh PICT, known by its name.
+    Pict,
+}
+
+impl Still {
+    /// ffmpeg's arguments that pick the reader, and the decoders it may use.
+    fn reader(self) -> (&'static [&'static str], &'static str) {
+        match self {
+            Self::Bmp => (&["-f", "bmp_pipe"], "bmp"),
+            Self::Psd => (&["-f", "psd_pipe"], "psd"),
+            Self::Jpeg2000 => (&["-f", "j2k_pipe"], "jpeg2000"),
+            Self::Dds => (&["-f", "dds_pipe"], "dds"),
+            Self::Exr => (&["-f", "exr_pipe"], "exr"),
+            Self::SunRaster => (&["-f", "sunrast_pipe"], "sunrast"),
+            Self::PhotoCd => (&["-f", "photocd_pipe"], "photocd"),
+            Self::Sgi => (&["-f", "sgi_pipe"], "sgi"),
+            Self::Xwd => (&["-f", "xwd_pipe"], "xwd"),
+            Self::Pcx => (&["-f", "pcx_pipe"], "pcx"),
+            Self::Netpbm => (&["-f", "ppm_pipe"], "pbm,pgm,ppm,pam"),
+            Self::Pfm => (&["-f", "pfm_pipe"], "pfm"),
+            Self::Icon => (&["-f", "ico"], "bmp,png"),
+            Self::Pict => (&["-f", "qdraw_pipe"], "qdraw"),
+            // ffmpeg reads these as one picture, by the decoder it's told,
+            // and never treats the name as a pattern for other files.
+            Self::Targa => (
+                &["-f", "image2", "-pattern_type", "none", "-c:v", "targa"],
+                "targa",
+            ),
+            Self::Wbmp => (
+                &["-f", "image2", "-pattern_type", "none", "-c:v", "wbmp"],
+                "wbmp",
+            ),
         }
     }
 }
@@ -871,6 +938,18 @@ impl Thumbnails {
         } else {
             kind
         };
+        // Pictures without a signature are known by their name as well.
+        let kind = match kind {
+            None => match self.name(hash).await {
+                Ok(name) => name
+                    .and_then(|name| unsigned_still(&name, &head))
+                    .map(Kind::Still),
+                Err(err) => {
+                    return Outcome::Failed(format!("couldn't read the file's name: {err}"));
+                }
+            },
+            kind => kind,
+        };
         let kind = match kind {
             // Only the first lines are kept, so text files of any size have one.
             Some(Kind::Text) => return self.done(hash, ThumbnailKind::Text, &text(&head)),
@@ -888,15 +967,18 @@ impl Thumbnails {
         };
         let made = match kind {
             Kind::Image => self.thumbnail(std::fs::File::open(&file)).await,
-            Kind::Bitmap if !self.inner.tools.has_ffmpeg() => return Outcome::None(NO_FFMPEG),
-            Kind::Bitmap => match self.frame(&file, "bmp_pipe", "bmp", 0.0, false).await {
-                Ok(png) if !png.is_empty() => {
-                    self.thumbnail(self.scratch(&png).map_err(io::Error::other))
-                        .await
+            Kind::Still(_) if !self.inner.tools.has_ffmpeg() => return Outcome::None(NO_FFMPEG),
+            Kind::Still(still) => {
+                let (reader, decoders) = still.reader();
+                match self.frame(&file, reader, decoders, 0.0, false).await {
+                    Ok(png) if !png.is_empty() => {
+                        self.thumbnail(self.scratch(&png).map_err(io::Error::other))
+                            .await
+                    }
+                    Ok(_) => Err("ffmpeg found no picture in the file".into()),
+                    Err(problem) => Err(problem),
                 }
-                Ok(_) => Err("ffmpeg found no picture in the BMP".into()),
-                Err(problem) => Err(problem),
-            },
+            }
             Kind::Heif => match self.pixels(&file).await {
                 Ok(pixels) if pixels > MAX_HEIF_PIXELS => {
                     return Outcome::None("a HEIC or AVIF over 24 megapixels");
@@ -1218,11 +1300,13 @@ impl Thumbnails {
                 (0.0, false)
             }
         };
-        let (format, decoders) = (container.format(), VIDEO_DECODERS);
-        let mut png = self.frame(file, format, decoders, start, hdr).await?;
+        let reader = ["-f", container.format()];
+        let mut png = self
+            .frame(file, &reader, VIDEO_DECODERS, start, hdr)
+            .await?;
         if png.is_empty() && start > 0.0 {
             // The video is shorter than it says.
-            png = self.frame(file, format, decoders, 0.0, hdr).await?;
+            png = self.frame(file, &reader, VIDEO_DECODERS, 0.0, hdr).await?;
         }
         if png.is_empty() {
             return Err("ffmpeg found no frame in the video".into());
@@ -1262,13 +1346,13 @@ impl Thumbnails {
         probe(&output)
     }
 
-    /// One frame from `start` seconds into a video, or a BMP's picture,
-    /// shrunk, as a PNG. ffmpeg reads it with only the demuxer `format` and
-    /// the `decoders`. Empty if there's no frame there.
+    /// One frame from `start` seconds into a video, or a picture's, shrunk,
+    /// as a PNG. ffmpeg reads it with only the reader `reader` picks and the
+    /// `decoders`. Empty if there's no frame there.
     async fn frame(
         &self,
         file: &Path,
-        format: &str,
+        reader: &[&str],
         decoders: &str,
         start: f64,
         hdr: bool,
@@ -1292,14 +1376,18 @@ impl Thumbnails {
             "2",
             "-protocol_whitelist",
             "file",
-            "-f",
-            format,
-            "-codec_whitelist",
-            decoders,
-            "-ss",
-            &start,
-            "-i",
         ]
+        .into_iter()
+        .chain(reader.iter().copied())
+        .chain(["-codec_whitelist", decoders])
+        // Seeking to the start does nothing for a video, and makes the
+        // icon reader find no picture.
+        .chain(if start == "0.000" {
+            vec![]
+        } else {
+            vec!["-ss", &start]
+        })
+        .chain(["-i"])
         .map(OsString::from);
         let after = [
             "-map",
@@ -1511,8 +1599,8 @@ fn kind(head: &[u8], whole: bool) -> Option<Kind> {
     {
         return Some(Kind::Image);
     }
-    if bitmap(head) {
-        return Some(Kind::Bitmap);
+    if let Some(still) = still(head) {
+        return Some(Kind::Still(still));
     }
     if head.get(4..8) == Some(b"ftyp")
         && head
@@ -1584,6 +1672,103 @@ const ASF: &[u8] = b"\x30\x26\xb2\x75\x8e\x66\xcf\x11\xa6\xd9\x00\xaa\x00\x62\xc
 /// Whether an Ogg file's first page has a Theora track's header.
 fn theora(page: &[u8]) -> bool {
     page.windows(7).any(|window| window == b"\x80theora")
+}
+
+/// The picture ffmpeg decodes that starts with `head`, if it's one with a
+/// signature. Short signatures are checked with the fields after them, so
+/// text that happens to start the same way stays text.
+fn still(head: &[u8]) -> Option<Still> {
+    let starts = |magic: &[u8]| head.starts_with(magic);
+    let at = |range: std::ops::Range<usize>| head.get(range);
+    let byte = |index: usize| head.get(index).copied();
+    if bitmap(head) {
+        return Some(Still::Bmp);
+    }
+    if starts(b"8BPS") && matches!(at(4..6), Some([0, 1 | 2])) {
+        return Some(Still::Psd);
+    }
+    if starts(b"\0\0\0\x0cjP  \r\n\x87\n") || starts(b"\xff\x4f\xff\x51") {
+        return Some(Still::Jpeg2000);
+    }
+    if starts(b"DDS ") && at(4..8) == Some(&[124, 0, 0, 0]) {
+        return Some(Still::Dds);
+    }
+    if starts(b"\x76\x2f\x31\x01") {
+        return Some(Still::Exr);
+    }
+    if starts(b"\x59\xa6\x6a\x95") {
+        return Some(Still::SunRaster);
+    }
+    if at(2048..2055) == Some(b"PCD_IPI") {
+        return Some(Still::PhotoCd);
+    }
+    if starts(b"\x01\xda")
+        && matches!(byte(2), Some(0 | 1))
+        && matches!(byte(3), Some(1 | 2))
+        && matches!(at(4..6), Some([0, 1..=3]))
+    {
+        return Some(Still::Sgi);
+    }
+    let big = |offset: usize| {
+        at(offset..offset + 4)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u32::from_be_bytes)
+    };
+    if big(4) == Some(7) && big(0).is_some_and(|size| (100..4096).contains(&size)) {
+        return Some(Still::Xwd);
+    }
+    if byte(0) == Some(0x0a)
+        && matches!(byte(1), Some(0 | 2 | 3 | 4 | 5))
+        && byte(2) == Some(1)
+        && matches!(byte(3), Some(1 | 2 | 4 | 8))
+    {
+        return Some(Still::Pcx);
+    }
+    // "P1" to "P7", then a space and a number or a comment, or for PAM a
+    // new line and its first field.
+    if byte(0) == Some(b'P') {
+        let space = matches!(byte(2), Some(b' ' | b'\t' | b'\r' | b'\n'));
+        let then = byte(3).is_some_and(|next| next.is_ascii_digit() || next == b'#');
+        match byte(1) {
+            Some(b'1'..=b'6') if space && then => return Some(Still::Netpbm),
+            Some(b'7') if byte(2) == Some(b'\n') => return Some(Still::Netpbm),
+            Some(b'F' | b'f') if space && then => return Some(Still::Pfm),
+            _ => {}
+        }
+    }
+    // Icons and cursors: a count, then a directory entry whose reserved
+    // byte is zero and whose picture starts after the directory.
+    if matches!(at(0..4), Some([0, 0, 1 | 2, 0])) {
+        let count = at(4..6).map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]));
+        let offset =
+            at(18..22).map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]));
+        if let (Some(count @ 1..=64), Some(offset)) = (count, offset)
+            && byte(9) == Some(0)
+            && offset >= 6 + 16 * u32::from(count)
+        {
+            return Some(Still::Icon);
+        }
+    }
+    None
+}
+
+/// A picture without a signature, known by its name, if its first bytes
+/// fit the format.
+fn unsigned_still(name: &str, head: &[u8]) -> Option<Still> {
+    let (_, extension) = name.rsplit_once('.')?;
+    match extension.to_ascii_lowercase().as_str() {
+        // A color map type of 0 or 1, and one of the picture types.
+        "tga"
+            if matches!(head.get(1), Some(0 | 1))
+                && matches!(head.get(2), Some(1 | 2 | 3 | 9 | 10 | 11)) =>
+        {
+            Some(Still::Targa)
+        }
+        // Type 0, the only one, and a header byte of 0.
+        "wbmp" if head.starts_with(&[0, 0]) => Some(Still::Wbmp),
+        "pict" | "pct" => Some(Still::Pict),
+        _ => None,
+    }
 }
 
 /// Whether `head` is a BMP: "BM", then the reserved bytes, which are zero,
@@ -1713,9 +1898,64 @@ mod tests {
         assert_eq!(kind(b"Pick up the bread.\n"), Some(Kind::Text));
         let mut bmp = b"BM\x8a\x7b\x0c\0\0\0\0\0\x8a\0\0\0\x7c\0\0\0".to_vec();
         bmp.resize(64, 0);
-        assert_eq!(kind(&bmp), Some(Kind::Bitmap));
+        assert_eq!(kind(&bmp), Some(Kind::Still(Still::Bmp)));
         // A note that starts with "BM" is still text.
         assert_eq!(kind(b"BMW service on Friday\n"), Some(Kind::Text));
+    }
+
+    #[test]
+    fn knows_pictures_ffmpeg_decodes_by_their_first_bytes() {
+        let padded = |start: &[u8]| {
+            let mut head = start.to_vec();
+            head.resize(64, 0);
+            head
+        };
+        let still = |head: &[u8]| still(head);
+        assert_eq!(still(&padded(b"8BPS\0\x01")), Some(Still::Psd));
+        assert_eq!(
+            still(&padded(b"\0\0\0\x0cjP  \r\n\x87\n")),
+            Some(Still::Jpeg2000)
+        );
+        assert_eq!(still(&padded(b"\xff\x4f\xff\x51")), Some(Still::Jpeg2000));
+        assert_eq!(still(&padded(b"DDS \x7c\0\0\0")), Some(Still::Dds));
+        assert_eq!(still(&padded(b"\x76\x2f\x31\x01")), Some(Still::Exr));
+        assert_eq!(still(&padded(b"\x59\xa6\x6a\x95")), Some(Still::SunRaster));
+        assert_eq!(still(&padded(b"\x01\xda\x01\x01\0\x03")), Some(Still::Sgi));
+        assert_eq!(still(&padded(b"\0\0\0\x64\0\0\0\x07")), Some(Still::Xwd));
+        assert_eq!(still(&padded(b"\x0a\x05\x01\x08")), Some(Still::Pcx));
+        assert_eq!(still(b"P6\n640 426\n255\n"), Some(Still::Netpbm));
+        assert_eq!(still(b"P1\n# made by hand\n"), Some(Still::Netpbm));
+        assert_eq!(still(b"P7\nWIDTH 640\n"), Some(Still::Netpbm));
+        assert_eq!(still(b"PF\n640 426\n-1.0\n"), Some(Still::Pfm));
+        let mut photo_cd = vec![0u8; 2100];
+        photo_cd[2048..2055].copy_from_slice(b"PCD_IPI");
+        assert_eq!(still(&photo_cd), Some(Still::PhotoCd));
+        let mut icon = padded(b"\0\0\x01\0\x01\0\x20\x20\0\0");
+        icon[18] = 22;
+        assert_eq!(still(&icon), Some(Still::Icon));
+        icon[2] = 2;
+        assert_eq!(still(&icon), Some(Still::Icon));
+
+        // Text that starts the same way stays text.
+        assert_eq!(kind(b"P1 is the first priority\n", false), Some(Kind::Text));
+        assert_eq!(kind(b"PF Chang's on Friday\n", false), Some(Kind::Text));
+        assert_eq!(still(b"8BPS is not a picture"), None);
+        // An icon whose picture would start inside its own directory.
+        let mut broken = padded(b"\0\0\x01\0\x02\0");
+        broken[18] = 22;
+        assert_eq!(still(&broken), None);
+    }
+
+    #[test]
+    fn knows_pictures_without_a_signature_by_name() {
+        assert_eq!(
+            unsigned_still("Logo.TGA", b"\0\0\x02\0\0"),
+            Some(Still::Targa)
+        );
+        assert_eq!(unsigned_still("Logo.tga", b"\0\0\x07"), None);
+        assert_eq!(unsigned_still("Old.wbmp", b"\0\0\x80"), Some(Still::Wbmp));
+        assert_eq!(unsigned_still("Scan.pct", b"\0\0"), Some(Still::Pict));
+        assert_eq!(unsigned_still("Notes.txt", b"\0\0"), None);
     }
 
     #[test]

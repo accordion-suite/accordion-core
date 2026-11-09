@@ -71,7 +71,7 @@ static MIGRATIONS: &[Migration] = &[Migration {
 
 /// The version of what makes thumbnails. Raise it when it can make
 /// thumbnails of files it couldn't before, so they get another try.
-pub const WORKER: u32 = 4;
+pub const WORKER: u32 = 5;
 
 /// The longer side of a thumbnail, in pixels.
 const SIZE: u32 = 480;
@@ -144,15 +144,18 @@ const DOCUMENT_SETTINGS: &str = r#"<item oor:path="/org.openoffice.Office.Common
 <item oor:path="/org.openoffice.Office.Calc/Content/Update"><prop oor:name="Link" oor:op="fuse"><value>1</value></prop></item>
 "#;
 
-/// The decoders ffmpeg may use for video: the codecs families' videos have.
-const VIDEO_DECODERS: &str = "h264,hevc,vp8,vp9,av1,libdav1d,mpeg4,mpeg2video,mjpeg,prores";
+/// The decoders ffmpeg may use for video: the codecs families' videos have,
+/// including older ones from DVDs, Windows Media, and Flash.
+const VIDEO_DECODERS: &str = "h264,hevc,vp8,vp9,av1,libdav1d,mpeg4,mpeg1video,mpeg2video,mjpeg,\
+                              prores,msmpeg4v1,msmpeg4v2,msmpeg4,wmv1,wmv2,wmv3,vc1,flv,\
+                              vp6f,theora";
 
 /// ffprobe opens a decoder for every track, and stops at one it may not use,
 /// so it may also use the decoders for the audio in those videos. ffmpeg
 /// skips the audio.
 const AUDIO_DECODERS: &str = "aac,mp3float,mp3,opus,libopus,vorbis,libvorbis,ac3,eac3,\
                               flac,alac,pcm_s16le,pcm_s16be,pcm_s24le,pcm_s24be,pcm_s32le,\
-                              pcm_f32le,pcm_bluray";
+                              pcm_f32le,pcm_bluray,mp2,mp2float,wmav1,wmav2";
 
 /// Turns an HDR frame's colors into ordinary ones. It runs after the frame
 /// is shrunk, since a whole 4K frame takes more memory than the limit.
@@ -329,6 +332,9 @@ enum Outcome {
 pub(crate) enum Kind {
     /// JPEG, PNG, GIF, WebP, or TIFF.
     Image,
+    /// A BMP, which ffmpeg decodes, because libvips reads them only with
+    /// ImageMagick, which it doesn't trust with hostile files.
+    Bitmap,
     /// HEIC or AVIF, which are decoded whole.
     Heif,
     Pdf,
@@ -357,7 +363,7 @@ const COMPOUND: &[u8] = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1";
 
 /// The Office formats families have. Apple's are left out, since
 /// LibreOffice reads only some of them.
-pub(crate) static FORMATS: [Format; 10] = [
+pub(crate) static FORMATS: [Format; 11] = [
     Format {
         extension: "docx",
         signature: ZIP,
@@ -374,6 +380,12 @@ pub(crate) static FORMATS: [Format; 10] = [
         extension: "odt",
         signature: ZIP,
         filter: "writer8",
+        export: "writer_pdf_Export",
+    },
+    Format {
+        extension: "ott",
+        signature: ZIP,
+        filter: "writer8_template",
         export: "writer_pdf_Export",
     },
     Format {
@@ -440,6 +452,17 @@ pub(crate) enum Container {
     Avi,
     /// MPEG transport streams, such as a camcorder's `.mts` files.
     MpegTs,
+    /// MPEG program streams: `.mpg`, `.mpeg`, and a DVD's `.vob` files.
+    MpegPs,
+    /// MPEG video on its own, without a container, as some `.mpg` and
+    /// `.m2v` files are.
+    MpegVideo,
+    /// Windows Media: `.wmv` and `.asf`.
+    Asf,
+    /// Flash video: `.flv`.
+    Flv,
+    /// Ogg with Theora video: `.ogv`.
+    Ogg,
 }
 
 impl Container {
@@ -449,6 +472,11 @@ impl Container {
             Self::Matroska => "matroska",
             Self::Avi => "avi",
             Self::MpegTs => "mpegts",
+            Self::MpegPs => "mpeg",
+            Self::MpegVideo => "mpegvideo",
+            Self::Asf => "asf",
+            Self::Flv => "flv",
+            Self::Ogg => "ogg",
         }
     }
 }
@@ -860,6 +888,15 @@ impl Thumbnails {
         };
         let made = match kind {
             Kind::Image => self.thumbnail(std::fs::File::open(&file)).await,
+            Kind::Bitmap if !self.inner.tools.has_ffmpeg() => return Outcome::None(NO_FFMPEG),
+            Kind::Bitmap => match self.frame(&file, "bmp_pipe", "bmp", 0.0, false).await {
+                Ok(png) if !png.is_empty() => {
+                    self.thumbnail(self.scratch(&png).map_err(io::Error::other))
+                        .await
+                }
+                Ok(_) => Err("ffmpeg found no picture in the BMP".into()),
+                Err(problem) => Err(problem),
+            },
             Kind::Heif => match self.pixels(&file).await {
                 Ok(pixels) if pixels > MAX_HEIF_PIXELS => {
                     return Outcome::None("a HEIC or AVIF over 24 megapixels");
@@ -1181,10 +1218,11 @@ impl Thumbnails {
                 (0.0, false)
             }
         };
-        let mut png = self.frame(file, container, start, hdr).await?;
+        let (format, decoders) = (container.format(), VIDEO_DECODERS);
+        let mut png = self.frame(file, format, decoders, start, hdr).await?;
         if png.is_empty() && start > 0.0 {
             // The video is shorter than it says.
-            png = self.frame(file, container, 0.0, hdr).await?;
+            png = self.frame(file, format, decoders, 0.0, hdr).await?;
         }
         if png.is_empty() {
             return Err("ffmpeg found no frame in the video".into());
@@ -1224,12 +1262,14 @@ impl Thumbnails {
         probe(&output)
     }
 
-    /// One frame from `start` seconds into a video, shrunk, as a PNG. Empty
-    /// if there's no frame there.
+    /// One frame from `start` seconds into a video, or a BMP's picture,
+    /// shrunk, as a PNG. ffmpeg reads it with only the demuxer `format` and
+    /// the `decoders`. Empty if there's no frame there.
     async fn frame(
         &self,
         file: &Path,
-        container: Container,
+        format: &str,
+        decoders: &str,
         start: f64,
         hdr: bool,
     ) -> Result<Vec<u8>, String> {
@@ -1253,9 +1293,9 @@ impl Thumbnails {
             "-protocol_whitelist",
             "file",
             "-f",
-            container.format(),
+            format,
             "-codec_whitelist",
-            VIDEO_DECODERS,
+            decoders,
             "-ss",
             &start,
             "-i",
@@ -1471,6 +1511,9 @@ fn kind(head: &[u8], whole: bool) -> Option<Kind> {
     {
         return Some(Kind::Image);
     }
+    if bitmap(head) {
+        return Some(Kind::Bitmap);
+    }
     if head.get(4..8) == Some(b"ftyp")
         && head
             .get(8..12)
@@ -1511,11 +1554,49 @@ fn container(head: &[u8]) -> Option<Container> {
     if head.starts_with(b"RIFF") && at(8..12) == Some(b"AVI ") {
         return Some(Container::Avi);
     }
+    if head.starts_with(b"\0\0\x01\xba") {
+        return Some(Container::MpegPs);
+    }
+    if head.starts_with(b"\0\0\x01\xb3") {
+        return Some(Container::MpegVideo);
+    }
+    if head.starts_with(ASF) {
+        return Some(Container::Asf);
+    }
+    if head.starts_with(b"FLV\x01") {
+        return Some(Container::Flv);
+    }
+    // Ogg is mostly songs, so only a file whose first track is Theora,
+    // which names itself in the first page, is a video.
+    if head.starts_with(b"OggS") && at(0..head.len().min(128)).is_some_and(theora) {
+        return Some(Container::Ogg);
+    }
     // Transport stream packets start with 0x47 every 188 bytes, or every
     // 192 after a timestamp, as camcorders write them.
     let packets =
         |first: usize, size: usize| (0..3).all(|n| head.get(first + n * size) == Some(&0x47));
     (packets(0, 188) || packets(4, 192)).then_some(Container::MpegTs)
+}
+
+/// How every ASF file starts: the GUID of its header.
+const ASF: &[u8] = b"\x30\x26\xb2\x75\x8e\x66\xcf\x11\xa6\xd9\x00\xaa\x00\x62\xce\x6c";
+
+/// Whether an Ogg file's first page has a Theora track's header.
+fn theora(page: &[u8]) -> bool {
+    page.windows(7).any(|window| window == b"\x80theora")
+}
+
+/// Whether `head` is a BMP: "BM", then the reserved bytes, which are zero,
+/// and a header size one of the BMP versions has. "BM" alone could start
+/// a line of text.
+fn bitmap(head: &[u8]) -> bool {
+    const HEADERS: [u32; 6] = [12, 40, 52, 56, 108, 124];
+    head.starts_with(b"BM")
+        && head.get(6..10) == Some(&[0, 0, 0, 0])
+        && head
+            .get(14..18)
+            .and_then(|size| size.try_into().ok())
+            .is_some_and(|size| HEADERS.contains(&u32::from_le_bytes(size)))
 }
 
 /// Whether `head` is UTF-8 text with something to show. When it isn't the
@@ -1630,6 +1711,11 @@ mod tests {
         assert_eq!(kind(b"PK\x03\x04"), None);
         assert_eq!(kind(b""), None);
         assert_eq!(kind(b"Pick up the bread.\n"), Some(Kind::Text));
+        let mut bmp = b"BM\x8a\x7b\x0c\0\0\0\0\0\x8a\0\0\0\x7c\0\0\0".to_vec();
+        bmp.resize(64, 0);
+        assert_eq!(kind(&bmp), Some(Kind::Bitmap));
+        // A note that starts with "BM" is still text.
+        assert_eq!(kind(b"BMW service on Friday\n"), Some(Kind::Text));
     }
 
     #[test]
@@ -1655,6 +1741,22 @@ mod tests {
             camcorder[4 + n * 192] = 0x47;
         }
         assert_eq!(video(&camcorder), Some(Container::MpegTs));
+
+        assert_eq!(video(b"\0\0\x01\xba\x44\0\x04\0"), Some(Container::MpegPs));
+        assert_eq!(
+            video(b"\0\0\x01\xb3\x50\x02\xd0\x31"),
+            Some(Container::MpegVideo)
+        );
+        assert_eq!(video(&[ASF, b"\0\0"].concat()), Some(Container::Asf));
+        assert_eq!(video(b"FLV\x01\x05\0\0\0\x09"), Some(Container::Flv));
+        let mut ogv = b"OggS\0\x02".to_vec();
+        ogv.resize(28, 0);
+        ogv.extend_from_slice(b"\x80theora\x03\x02");
+        assert_eq!(video(&ogv), Some(Container::Ogg));
+        let mut song = b"OggS\0\x02".to_vec();
+        song.resize(28, 0);
+        song.extend_from_slice(b"\x01vorbis\0\0");
+        assert_eq!(video(&song), None);
 
         assert_eq!(video(b"\0\0\0\x1cftypM4A \0\0\0\0"), None);
         assert_eq!(video(b"\0\0\0\x18ftypcrx \0\0\0\0"), None);

@@ -1,7 +1,8 @@
 //! Makes thumbnails with the real programs in the sandbox. The tests need
 //! libvips (libvips-tools, with libheif's AV1 encoder for test images),
-//! poppler-utils, ffmpeg, LibreOffice's Writer, Calc, and Impress, and a
-//! kernel with Landlock, as CI has.
+//! poppler-utils, ffmpeg, LibreOffice's Writer, Calc, and Impress,
+//! libraw-bin, librsvg2-bin, djvulibre-bin, and a kernel with Landlock, as
+//! CI has.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -875,6 +876,265 @@ async fn makes_a_large_preview_of_pictures_the_browser_cant_show() {
     // The browser shows a PNG itself.
     assert!(server.thumbnails.picture(png).is_none());
 
+    stop.send(()).unwrap();
+    worker.await.unwrap();
+}
+
+/// A JPEG with no metadata, as cameras keep in their raw photos, made with
+/// libvips outside the sandbox.
+fn plain_jpeg(server: &Server, name: &str, width: u32, height: u32) -> Vec<u8> {
+    let path = server.dir.path().join(name);
+    let made = Command::new("vips")
+        .args(["xyz", &format!("{}[strip]", path.display())])
+        .args([width.to_string(), height.to_string()])
+        .status()
+        .unwrap();
+    assert!(made.success(), "libvips couldn't make {name}");
+    std::fs::read(path).unwrap()
+}
+
+/// A camera raw photo LibRaw reads: a DNG with `jpeg`, `width` by `height`,
+/// as the preview the camera keeps, the photo's `orientation`, and a
+/// 64-pixel raw picture of nothing. Every value fits in its directory
+/// entry, so the file is the header, two directories, the raw picture, and
+/// the JPEG.
+fn dng(jpeg: &[u8], width: u32, height: u32, orientation: u16) -> Vec<u8> {
+    const SIDE: u32 = 64;
+    const BYTE: u16 = 1;
+    const ASCII: u16 = 2;
+    const SHORT: u16 = 3;
+    const LONG: u16 = 4;
+    let ascii = |text: &[u8; 4]| u32::from_le_bytes(*text);
+    let raw = vec![0; (SIDE * SIDE * 2) as usize];
+    let size = |entries: u32| 2 + 12 * entries + 4;
+    let first = 8;
+    let second = first + size(15);
+    let raw_at = second + size(12);
+    let jpeg_at = raw_at + raw.len() as u32;
+    let preview: [(u16, u16, u32, u32); 15] = [
+        // A preview, as JPEG in YCbCr.
+        (254, LONG, 1, 1),
+        (256, LONG, 1, width),
+        (257, LONG, 1, height),
+        (258, SHORT, 1, 8),
+        (259, SHORT, 1, 7),
+        (262, SHORT, 1, 6),
+        (271, ASCII, 4, ascii(b"Test")),
+        (272, ASCII, 4, ascii(b"Cam\0")),
+        (273, LONG, 1, jpeg_at),
+        (274, SHORT, 1, u32::from(orientation)),
+        (277, SHORT, 1, 3),
+        (279, LONG, 1, jpeg.len() as u32),
+        (330, LONG, 1, second),
+        // DNG 1.4, and the camera's name.
+        (50706, BYTE, 4, u32::from_le_bytes([1, 4, 0, 0])),
+        (50708, ASCII, 4, ascii(b"Cam\0")),
+    ];
+    let sensor: [(u16, u16, u32, u32); 12] = [
+        // The full picture, 16 bits a pixel, through a 2×2 color filter.
+        (254, LONG, 1, 0),
+        (256, LONG, 1, SIDE),
+        (257, LONG, 1, SIDE),
+        (258, SHORT, 1, 16),
+        (259, SHORT, 1, 1),
+        (262, SHORT, 1, 32803),
+        (273, LONG, 1, raw_at),
+        (277, SHORT, 1, 1),
+        (278, LONG, 1, SIDE),
+        (279, LONG, 1, raw.len() as u32),
+        (33421, SHORT, 2, 2 | (2 << 16)),
+        (33422, BYTE, 4, u32::from_le_bytes([0, 1, 1, 2])),
+    ];
+    let mut file = b"II*\0".to_vec();
+    file.extend(first.to_le_bytes());
+    for directory in [&preview[..], &sensor[..]] {
+        file.extend((directory.len() as u16).to_le_bytes());
+        for (tag, kind, count, value) in directory {
+            file.extend(tag.to_le_bytes());
+            file.extend(kind.to_le_bytes());
+            file.extend(count.to_le_bytes());
+            file.extend(value.to_le_bytes());
+        }
+        file.extend(0u32.to_le_bytes());
+    }
+    file.extend(raw);
+    file.extend(jpeg);
+    file
+}
+
+/// Waits for the worker to make a preview of each of `hashes`.
+async fn wait_for_pictures(thumbnails: &Thumbnails, hashes: &[ContentHash]) {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while hashes
+            .iter()
+            .any(|hash| thumbnails.picture(*hash).is_none())
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the worker should make each preview");
+}
+
+#[tokio::test]
+async fn shows_the_jpeg_a_camera_keeps_in_a_raw_photo() {
+    let server = start().await;
+    // Kept as the sensor saw it, on its side, for a photo taken upright.
+    let sideways = plain_jpeg(&server, "sideways.jpg", 3000, 2000);
+    let sideways = server
+        .save("DSC_0001.dng", &dng(&sideways, 3000, 2000, 6))
+        .await;
+    // Already turned by the camera, with the same orientation.
+    let turned = plain_jpeg(&server, "turned.jpg", 2000, 3000);
+    let turned = server
+        .save("DSC_0002.DNG", &dng(&turned, 2000, 3000, 6))
+        .await;
+    for hash in [sideways, turned] {
+        assert!(server.thumbnails.make_now(hash).await.unwrap());
+        let (width, height, _) = describe(&thumbnail(&server, hash));
+        assert_eq!((width, height), (320, 480));
+    }
+
+    let (stop, worker) = start_worker(&server.thumbnails);
+    wait_for_pictures(&server.thumbnails, &[sideways, turned]).await;
+    for hash in [sideways, turned] {
+        let (width, height, _) = describe(&server.thumbnails.picture(hash).unwrap());
+        assert_eq!((width, height), (1707, 2560));
+    }
+    stop.send(()).unwrap();
+    worker.await.unwrap();
+}
+
+/// A drawing with a script and a picture from another file, neither of
+/// which the worker runs or reads.
+const DRAWING: &str = r##"<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100" viewBox="0 0 200 100">
+ <script>alert("never runs")</script>
+ <rect width="200" height="100" fill="#2a6"/>
+ <image href="file:///etc/hostname" width="10" height="10"/>
+ <text x="10" y="60" font-size="30">Garden</text>
+</svg>"##;
+
+#[tokio::test]
+async fn draws_svg_drawings_as_pictures() {
+    let server = start().await;
+    let drawing = server.save("garden.svg", DRAWING.as_bytes()).await;
+    let path = server.dir.path().join("garden.svg");
+    std::fs::write(&path, DRAWING).unwrap();
+    let compressed = Command::new("gzip").arg("-c").arg(&path).output().unwrap();
+    assert!(compressed.status.success());
+    let compressed = server.save("garden.svgz", &compressed.stdout).await;
+    for hash in [drawing, compressed] {
+        assert!(server.thumbnails.make_now(hash).await.unwrap());
+        let (width, height, _) = describe(&thumbnail(&server, hash));
+        assert_eq!((width, height), (480, 240));
+    }
+
+    // Drawn at the preview's size, not enlarged from a small picture.
+    let (stop, worker) = start_worker(&server.thumbnails);
+    wait_for_pictures(&server.thumbnails, &[drawing, compressed]).await;
+    for hash in [drawing, compressed] {
+        let (width, height, _) = describe(&server.thumbnails.picture(hash).unwrap());
+        assert_eq!((width, height), (2560, 1280));
+    }
+    stop.send(()).unwrap();
+    worker.await.unwrap();
+}
+
+/// Makes a DjVu book of `pages` pages, each with a black bar, with
+/// djvulibre outside the sandbox.
+fn book(server: &Server, pages: usize) -> Vec<u8> {
+    let dir = server.dir.path().join("book");
+    std::fs::create_dir_all(&dir).unwrap();
+    let (width, height) = (850, 1100);
+    let mut bitmap = format!("P4\n{width} {height}\n").into_bytes();
+    for y in 0..height {
+        let ink = if (100..200).contains(&y) { 0xff } else { 0 };
+        bitmap.extend(std::iter::repeat_n(ink, (width as usize).div_ceil(8)));
+    }
+    let pbm = dir.join("page.pbm");
+    std::fs::write(&pbm, bitmap).unwrap();
+    let parts: Vec<PathBuf> = (0..pages)
+        .map(|page| {
+            let part = dir.join(format!("{page}.djvu"));
+            let made = Command::new("cjb2").arg(&pbm).arg(&part).status().unwrap();
+            assert!(made.success(), "djvulibre couldn't make a page");
+            part
+        })
+        .collect();
+    let path = dir.join("book.djvu");
+    let made = Command::new("djvm")
+        .arg("-c")
+        .arg(&path)
+        .args(&parts)
+        .status()
+        .unwrap();
+    assert!(made.success(), "djvulibre couldn't make the book");
+    std::fs::read(path).unwrap()
+}
+
+#[tokio::test]
+async fn shows_a_djvu_books_pages() {
+    let server = start().await;
+    let hash = server.save("Manual.djvu", &book(&server, 2)).await;
+    assert!(server.thumbnails.make_now(hash).await.unwrap());
+    let (width, height, _) = describe(&thumbnail(&server, hash));
+    assert_eq!(height, 480);
+    assert!(width < height, "{width}x{height}");
+    let preview = server.thumbnails.preview(hash).unwrap();
+    assert!(!preview.partial);
+    assert_eq!(pages(&preview.path), 2);
+}
+
+#[tokio::test]
+async fn shows_raw_photos_drawings_and_books_once_their_programs_are_installed() {
+    let server = start_with(|tools| Tools {
+        simple_dcraw: "/nonexistent/simple_dcraw".into(),
+        rsvg_convert: "/nonexistent/rsvg-convert".into(),
+        ddjvu: "/nonexistent/ddjvu".into(),
+        ..tools
+    })
+    .await;
+    let reason = server
+        .thumbnails
+        .status()
+        .borrow()
+        .pictures
+        .clone()
+        .unwrap();
+    assert!(
+        reason.contains("libraw-bin, librsvg2-bin, and djvulibre-bin"),
+        "{reason}"
+    );
+    let drawing = server.save("garden.svg", DRAWING.as_bytes()).await;
+    let manual = server.save("Manual.djvu", &book(&server, 1)).await;
+    let jpeg = plain_jpeg(&server, "photo.jpg", 300, 200);
+    let photo = server.save("DSC_0003.dng", &dng(&jpeg, 300, 200, 1)).await;
+    for hash in [drawing, manual, photo] {
+        assert!(!server.thumbnails.make_now(hash).await.unwrap());
+    }
+
+    // As if the admin installed them: the same data, with the programs.
+    let thumbnails = Thumbnails::open(
+        server.db.clone(),
+        server.storage.clone(),
+        server.dir.path(),
+        Tools::installed(env!("CARGO_BIN_EXE_accordion-core-sandbox")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(thumbnails.status().borrow().pictures, None);
+    let (stop, worker) = start_worker(&thumbnails);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while [drawing, manual, photo]
+            .iter()
+            .any(|hash| thumbnails.find(*hash).is_none())
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the worker should try each file again");
     stop.send(()).unwrap();
     worker.await.unwrap();
 }

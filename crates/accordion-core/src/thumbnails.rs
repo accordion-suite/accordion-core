@@ -87,7 +87,7 @@ static MIGRATIONS: &[Migration] = &[
 
 /// The version of what makes thumbnails. Raise it when it can make
 /// thumbnails of files it couldn't before, so they get another try.
-pub const WORKER: u32 = 6;
+pub const WORKER: u32 = 7;
 
 /// The longer side of a thumbnail, in pixels.
 const SIZE: u32 = 480;
@@ -110,16 +110,20 @@ struct Output {
     /// The longer side, in pixels.
     longest: u32,
     limits: Limits,
+    /// Whether libvips turns the picture as its orientation says.
+    turn: bool,
 }
 
 const THUMBNAIL: Output = Output {
     longest: SIZE,
     limits: LIMITS,
+    turn: true,
 };
 
 const PREVIEW: Output = Output {
     longest: PREVIEW_SIZE,
     limits: PREVIEW_LIMITS,
+    turn: true,
 };
 
 /// Larger files get no thumbnail.
@@ -220,6 +224,28 @@ const DOCUMENT_FAILED: &str = "Document: ";
 /// Documents with this reason get another try once it is.
 const NO_OFFICE: &str = "LibreOffice isn't installed";
 
+/// Why a camera raw photo, an SVG, or a DjVu book has no thumbnail when its
+/// program isn't installed. Files with these reasons get another try once
+/// it is.
+const NO_LIBRAW: &str = "LibRaw isn't installed";
+const NO_RSVG: &str = "librsvg isn't installed";
+const NO_DJVU: &str = "djvulibre isn't installed";
+
+/// Why a camera raw photo has no thumbnail when the camera kept no JPEG in
+/// it, or only a bitmap libvips doesn't trust.
+const NO_EMBEDDED: &str = "a camera raw photo without a JPEG preview in it";
+
+/// The fontconfig settings and cache, for an SVG's text. The fonts
+/// themselves are under `/usr`, which every worker reads.
+const FONT_READS: [&str; 2] = ["/etc/fonts", "/var/cache/fontconfig"];
+
+/// Camera raw formats that are TIFF files inside, known by their name since
+/// their first bytes are a TIFF's. The others have their own signatures.
+const TIFF_RAWS: [&str; 17] = [
+    "3fr", "arw", "cr2", "dcr", "dng", "erf", "fff", "iiq", "kdc", "mef", "mos", "nef", "nrw",
+    "pef", "sr2", "srf", "srw",
+];
+
 /// How many waiting files each look at the database fetches.
 const BATCH: usize = 20;
 
@@ -242,6 +268,13 @@ pub struct Tools {
     /// LibreOffice's own program, rather than the `soffice` script that
     /// starts it. Optional: without it, documents have no thumbnails.
     pub soffice: PathBuf,
+    /// LibRaw's sample program that finds the JPEG a camera keeps in a raw
+    /// photo. Optional, like the rest below.
+    pub simple_dcraw: PathBuf,
+    /// librsvg's program, for SVG drawings.
+    pub rsvg_convert: PathBuf,
+    /// djvulibre's program, for DjVu books.
+    pub ddjvu: PathBuf,
 }
 
 impl Tools {
@@ -257,6 +290,9 @@ impl Tools {
             ffmpeg: "/usr/bin/ffmpeg".into(),
             ffprobe: "/usr/bin/ffprobe".into(),
             soffice: "/usr/lib/libreoffice/program/soffice.bin".into(),
+            simple_dcraw: "/usr/bin/simple_dcraw".into(),
+            rsvg_convert: "/usr/bin/rsvg-convert".into(),
+            ddjvu: "/usr/bin/ddjvu".into(),
         }
     }
 
@@ -266,6 +302,18 @@ impl Tools {
 
     fn has_office(&self) -> bool {
         self.soffice.is_file()
+    }
+
+    fn has_libraw(&self) -> bool {
+        self.simple_dcraw.is_file()
+    }
+
+    fn has_rsvg(&self) -> bool {
+        self.rsvg_convert.is_file()
+    }
+
+    fn has_djvu(&self) -> bool {
+        self.ddjvu.is_file()
     }
 }
 
@@ -321,6 +369,9 @@ pub struct ThumbnailStatus {
     /// Why Office documents have no thumbnails, such as LibreOffice not
     /// being installed.
     pub documents: Option<String>,
+    /// A sentence saying which pictures show an icon, such as camera raw
+    /// photos, and which packages would give them thumbnails.
+    pub pictures: Option<String>,
     /// Files waiting for a thumbnail.
     pub waiting: u64,
     /// Files the worker couldn't make a thumbnail of.
@@ -386,6 +437,12 @@ pub(crate) enum Kind {
     Still(Still),
     /// HEIC or AVIF, which are decoded whole.
     Heif,
+    /// A camera's raw photo, shown by the JPEG the camera keeps in it.
+    Raw,
+    /// An SVG drawing, or a compressed one.
+    Svg,
+    /// A DjVu book or scan, which gets a PDF preview, as a document does.
+    Djvu,
     Pdf,
     Video(Container),
     /// UTF-8 text, such as notes, Markdown, CSV, or code.
@@ -646,6 +703,7 @@ impl Thumbnails {
         let unavailable = unavailable(&tools);
         let videos = videos_unavailable(&tools);
         let documents = documents_unavailable(&tools);
+        let pictures = pictures_unavailable(&tools);
         if let Some(reason) = &unavailable {
             tracing::warn!("no thumbnails: {reason}");
         }
@@ -661,6 +719,7 @@ impl Thumbnails {
                     unavailable,
                     videos,
                     documents,
+                    pictures,
                     ..ThumbnailStatus::default()
                 }),
                 office: tokio::sync::Mutex::new(None),
@@ -899,17 +958,20 @@ impl Thumbnails {
             .await?;
         let videos = videos_unavailable(&self.inner.tools);
         let documents = documents_unavailable(&self.inner.tools);
+        let pictures = pictures_unavailable(&self.inner.tools);
         self.inner.status.send_if_modified(|status| {
             let changed = (
                 status.waiting,
                 status.failed,
                 &status.videos,
                 &status.documents,
-            ) != (waiting, failed, &videos, &documents);
+                &status.pictures,
+            ) != (waiting, failed, &videos, &documents, &pictures);
             status.waiting = waiting;
             status.failed = failed;
             status.videos = videos;
             status.documents = documents;
+            status.pictures = pictures;
             changed
         });
         Ok(())
@@ -980,6 +1042,9 @@ impl Thumbnails {
         for (installed, reason) in [
             (tools.has_ffmpeg(), NO_FFMPEG),
             (tools.has_office(), NO_OFFICE),
+            (tools.has_libraw(), NO_LIBRAW),
+            (tools.has_rsvg(), NO_RSVG),
+            (tools.has_djvu(), NO_DJVU),
         ] {
             if installed {
                 self.inner
@@ -1092,29 +1157,21 @@ impl Thumbnails {
     ) -> Result<(Option<Kind>, u64, Vec<u8>), String> {
         let (kind, size, head) =
             sniff(file).map_err(|err| format!("couldn't read the file: {err}"))?;
-        // A document is known by its name as well as its first bytes.
-        let kind = if FORMATS
-            .iter()
-            .any(|format| head.starts_with(format.signature))
+        let by_name = kind.is_none()
+            || (kind == Some(Kind::Image) && tiff(&head))
+            || FORMATS
+                .iter()
+                .any(|format| head.starts_with(format.signature));
+        if !by_name {
+            return Ok((kind, size, head));
+        }
+        let kind = match self
+            .name(hash)
+            .await
+            .map_err(|err| format!("couldn't read the file's name: {err}"))?
         {
-            self.name(hash)
-                .await
-                .map_err(|err| format!("couldn't read the file's name: {err}"))?
-                .and_then(|name| format(&name, &head))
-                .map(Kind::Document)
-                .or(kind)
-        } else {
-            kind
-        };
-        // Pictures without a signature are known by their name as well.
-        let kind = match kind {
-            None => self
-                .name(hash)
-                .await
-                .map_err(|err| format!("couldn't read the file's name: {err}"))?
-                .and_then(|name| unsigned_still(&name, &head))
-                .map(Kind::Still),
-            kind => kind,
+            Some(name) => named(&name, &head, kind),
+            None => kind,
         };
         Ok((kind, size, head))
     }
@@ -1164,6 +1221,16 @@ impl Thumbnails {
                 Ok(_) => self.thumbnail(std::fs::File::open(&file)).await,
                 Err(problem) => Err(problem),
             },
+            Kind::Raw if !self.inner.tools.has_libraw() => return Outcome::None(NO_LIBRAW),
+            Kind::Raw => match self.embedded(&file).await {
+                Ok(Some((jpeg, turn))) => self.shrink(Ok(jpeg), Output { turn, ..THUMBNAIL }).await,
+                Ok(None) => return Outcome::None(NO_EMBEDDED),
+                Err(problem) => Err(problem),
+            },
+            Kind::Svg if !self.inner.tools.has_rsvg() => return Outcome::None(NO_RSVG),
+            Kind::Svg => self.drawing(&file, THUMBNAIL).await,
+            Kind::Djvu if !self.inner.tools.has_djvu() => return Outcome::None(NO_DJVU),
+            Kind::Djvu => self.djvu(hash, &file).await,
             Kind::Pdf => self.pdf(&file).await,
             Kind::Video(_) if !self.inner.tools.has_ffmpeg() => return Outcome::None(NO_FFMPEG),
             Kind::Video(container) => match self.video(&file, container).await {
@@ -1192,7 +1259,7 @@ impl Thumbnails {
             Ok(identified) => identified,
             Err(problem) => return Outcome::Failed(problem),
         };
-        let tiff = head.starts_with(b"II*\0") || head.starts_with(b"MM\0*");
+        let tiff = tiff(&head);
         let avif = head
             .get(8..12)
             .is_some_and(|brand| brand == b"avif" || brand == b"avis");
@@ -1208,6 +1275,16 @@ impl Thumbnails {
             Some(Kind::Still(Still::Bmp | Still::Icon)) => {
                 return Outcome::None("the browser shows it");
             }
+            Some(Kind::Raw) if !self.inner.tools.has_libraw() => return Outcome::None(NO_LIBRAW),
+            Some(Kind::Raw) => match self.embedded(&file).await {
+                Ok(Some((jpeg, turn))) => self.shrink(Ok(jpeg), Output { turn, ..PREVIEW }).await,
+                Ok(None) => return Outcome::None(NO_EMBEDDED),
+                Err(problem) => Err(problem),
+            },
+            Some(Kind::Svg) if !self.inner.tools.has_rsvg() => return Outcome::None(NO_RSVG),
+            // Drawn as a picture, so an SVG's scripts never reach the
+            // browser.
+            Some(Kind::Svg) => self.drawing(&file, PREVIEW).await,
             Some(Kind::Still(_)) if !self.inner.tools.has_ffmpeg() => {
                 return Outcome::None(NO_FFMPEG);
             }
@@ -1321,7 +1398,10 @@ impl Thumbnails {
             "--size",
             "down",
         ]
-        .map(OsString::from);
+        .into_iter()
+        .chain((!output.turn).then_some("--no-rotate"))
+        .map(OsString::from)
+        .collect::<Vec<_>>();
         let webp = self
             .work_within(&self.inner.tools.vips, &args, input, &[], output.limits)
             .await?;
@@ -1435,14 +1515,151 @@ impl Thumbnails {
                 "" => "LibreOffice didn't make a PDF".to_owned(),
                 said => format!("LibreOffice didn't make a PDF: {said}"),
             })?;
-        let pages = self.pages(&pdf).await?;
-        let webp = self.pdf(&pdf).await?;
+        self.keep_pdf(hash, &pdf).await
+    }
+
+    /// Keeps a worker's PDF of a file's first pages as its preview, and
+    /// returns a thumbnail of its first page.
+    async fn keep_pdf(&self, hash: ContentHash, pdf: &Path) -> Result<Vec<u8>, String> {
+        let pages = self.pages(pdf).await?;
+        let webp = self.pdf(pdf).await?;
         // Both are kept, or neither.
         let preview = self.preview_path(hash, pages >= PREVIEW_PAGES);
         std::fs::create_dir_all(preview.parent().expect("a preview is in a folder"))
-            .and_then(|()| std::fs::rename(&pdf, &preview))
+            .and_then(|()| std::fs::rename(pdf, &preview))
             .map_err(|err| format!("couldn't keep the preview: {err}"))?;
         Ok(webp)
+    }
+
+    /// The JPEG a camera keeps in its raw photo, full size on most cameras,
+    /// as LibRaw finds it, and whether to turn it as its orientation says.
+    /// `None` if there's no JPEG.
+    ///
+    /// LibRaw writes it next to the file it reads, so it reads the file
+    /// through a link in a scratch folder, the only place it can write. The
+    /// sandbox still lets it read only the file itself.
+    async fn embedded(&self, file: &Path) -> Result<Option<(std::fs::File, bool)>, String> {
+        let scratch = self.scratch_dir()?;
+        let link = scratch.path().join("photo");
+        std::os::unix::fs::symlink(file, &link)
+            .map_err(|err| format!("couldn't link to the file: {err}"))?;
+        let args = [OsString::from("-e"), link.into()];
+        let input = std::fs::File::open("/dev/null").map_err(|err| err.to_string())?;
+        self.inner
+            .sandbox
+            .run(Job {
+                program: &self.inner.tools.simple_dcraw,
+                args: &args,
+                env: &[],
+                input,
+                read: &[file.to_owned()],
+                write: &[scratch.path().to_owned()],
+                sockets: None,
+                limits: LIMITS,
+            })
+            .await
+            .map_err(|err| err.to_string())?;
+        // A bitmap preview would be a .ppm, which libvips doesn't trust.
+        // The worker could only make folders and plain files there.
+        let jpeg = scratch.path().join("photo.thumb.jpg");
+        if !jpeg.symlink_metadata().is_ok_and(|found| found.is_file()) {
+            return Ok(None);
+        }
+        let args = [OsString::from("-a"), jpeg.clone().into()];
+        let input = std::fs::File::open("/dev/null").map_err(|err| err.to_string())?;
+        let header = self
+            .work(
+                &self.inner.tools.vipsheader,
+                &args,
+                input,
+                std::slice::from_ref(&jpeg),
+            )
+            .await?;
+        // The open file outlasts the scratch folder.
+        let opened = std::fs::File::open(&jpeg)
+            .map_err(|err| format!("couldn't open LibRaw's JPEG: {err}"))?;
+        Ok(Some((opened, turns(&String::from_utf8_lossy(&header)))))
+    }
+
+    /// An SVG drawn as a picture that fits `output`, as WebP. librsvg reads
+    /// the drawing on its input, so it has no folder to load the files an
+    /// SVG names from, and it never runs an SVG's scripts.
+    async fn drawing(&self, file: &Path, output: Output) -> Result<Vec<u8>, String> {
+        let input =
+            std::fs::File::open(file).map_err(|err| format!("couldn't open the file: {err}"))?;
+        let size = output.longest.to_string();
+        let args = [
+            "--width",
+            &size,
+            "--height",
+            &size,
+            "--keep-aspect-ratio",
+            "--format",
+            "png",
+            "-",
+        ]
+        .map(OsString::from);
+        let read: Vec<PathBuf> = FONT_READS.iter().map(PathBuf::from).collect();
+        let png = self
+            .inner
+            .sandbox
+            .run(Job {
+                program: &self.inner.tools.rsvg_convert,
+                args: &args,
+                env: &[],
+                input,
+                read: &read,
+                write: &[],
+                sockets: None,
+                limits: output.limits,
+            })
+            .await
+            .map_err(|err| err.to_string())?;
+        if !png.starts_with(b"\x89PNG") {
+            return Err("librsvg didn't draw a picture".into());
+        }
+        self.shrink(self.scratch(&png).map_err(io::Error::other), output)
+            .await
+    }
+
+    /// A DjVu book's thumbnail. djvulibre turns its first pages into a PDF,
+    /// at their own resolution, which is kept as its preview, as a
+    /// document's is.
+    async fn djvu(&self, hash: ContentHash, file: &Path) -> Result<Vec<u8>, String> {
+        let scratch = self.scratch_dir()?;
+        let scratch_text = scratch
+            .path()
+            .to_str()
+            .ok_or("the data folder's name isn't UTF-8")?;
+        let pdf = scratch.path().join("book.pdf");
+        let args = [
+            OsString::from("-format=pdf"),
+            format!("-page=1-{PREVIEW_PAGES}").into(),
+            file.into(),
+            pdf.clone().into(),
+        ];
+        // djvulibre writes each page as a TIFF first, in its temporary
+        // folder.
+        let env = [("TMPDIR", scratch_text)];
+        let input = std::fs::File::open("/dev/null").map_err(|err| err.to_string())?;
+        self.inner
+            .sandbox
+            .run(Job {
+                program: &self.inner.tools.ddjvu,
+                args: &args,
+                env: &env,
+                input,
+                read: &[file.to_owned()],
+                write: &[scratch.path().to_owned()],
+                sockets: None,
+                limits: DOCUMENT_LIMITS,
+            })
+            .await
+            .map_err(|err| err.to_string())?;
+        if !pdf.symlink_metadata().is_ok_and(|found| found.is_file()) {
+            return Err("djvulibre didn't make a PDF".into());
+        }
+        self.keep_pdf(hash, &pdf).await
     }
 
     /// Makes LibreOffice's settings, once. On new settings, LibreOffice sets
@@ -1736,6 +1953,41 @@ fn documents_unavailable(tools: &Tools) -> Option<String> {
     })
 }
 
+/// Which pictures have no thumbnails here because a program isn't
+/// installed, and the packages that would give them one, as a sentence.
+fn pictures_unavailable(tools: &Tools) -> Option<String> {
+    let missing: Vec<(&str, &str)> = [
+        (tools.has_libraw(), "camera raw photos", "libraw-bin"),
+        (tools.has_rsvg(), "SVG drawings", "librsvg2-bin"),
+        (tools.has_djvu(), "DjVu books", "djvulibre-bin"),
+    ]
+    .into_iter()
+    .filter(|(installed, _, _)| !installed)
+    .map(|(_, files, package)| (files, package))
+    .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    let (files, packages): (Vec<&str>, Vec<&str>) = missing.into_iter().unzip();
+    let files = list(&files);
+    Some(format!(
+        "{}{} show an icon instead. Install {} with apt to give them thumbnails and previews.",
+        files[..1].to_uppercase(),
+        &files[1..],
+        list(&packages),
+    ))
+}
+
+/// "a", "a and b", or "a, b, and c".
+fn list(items: &[&str]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => (*one).to_owned(),
+        [first, second] => format!("{first} and {second}"),
+        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
+    }
+}
+
 /// When LibreOffice's program folder and its settings folder last changed.
 /// Installing, updating, or removing its packages adds, replaces, or removes
 /// files in them.
@@ -1853,6 +2105,10 @@ fn kind(head: &[u8], whole: bool) -> Option<Kind> {
         b"avif", b"avis",
     ];
     let starts = |magic: &[u8]| head.starts_with(magic);
+    // Before pictures, since some raw photos are TIFF files inside.
+    if raw(head) {
+        return Some(Kind::Raw);
+    }
     if starts(b"\xff\xd8\xff")
         || starts(b"\x89PNG\r\n\x1a\n")
         || starts(b"GIF87a")
@@ -1876,8 +2132,15 @@ fn kind(head: &[u8], whole: bool) -> Option<Kind> {
     if starts(b"%PDF-") {
         return Some(Kind::Pdf);
     }
+    if djvu(head) {
+        return Some(Kind::Djvu);
+    }
     if let Some(container) = container(head) {
         return Some(Kind::Video(container));
+    }
+    // SVG is text, so it's checked before text is.
+    if svg(head) {
+        return Some(Kind::Svg);
     }
     is_text(head, whole).then_some(Kind::Text)
 }
@@ -2023,6 +2286,123 @@ fn still(head: &[u8]) -> Option<Still> {
     None
 }
 
+/// What a file is by its name as well as its first bytes, for the formats
+/// whose first bytes don't say on their own: Office documents, which are
+/// ZIP or compound files inside, camera raw photos that are TIFF files
+/// inside, compressed SVG, and pictures without a signature. `kind` is what
+/// the first bytes say.
+fn named(name: &str, head: &[u8], kind: Option<Kind>) -> Option<Kind> {
+    if let Some(format) = format(name, head) {
+        return Some(Kind::Document(format));
+    }
+    let extension = name
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    match kind {
+        Some(Kind::Image) if tiff(head) && TIFF_RAWS.contains(&extension.as_str()) => {
+            Some(Kind::Raw)
+        }
+        None if extension == "svgz" && head.starts_with(b"\x1f\x8b") => Some(Kind::Svg),
+        None => unsigned_still(name, head).map(Kind::Still),
+        kind => kind,
+    }
+}
+
+/// Whether to turn a raw photo's JPEG as its orientation says, from what
+/// `vipsheader -a` says about it. LibRaw gives each JPEG the raw photo's
+/// orientation, but some cameras keep a JPEG that's already turned. A
+/// camera's sensor is wider than it's tall, so a JPEG that's taller than
+/// it's wide, with an orientation that turns it on its side, already has
+/// been.
+fn turns(header: &str) -> bool {
+    let field = |name: &str| {
+        header.lines().find_map(|line| {
+            line.strip_prefix(name)?
+                .strip_prefix(':')?
+                .trim()
+                .parse::<u32>()
+                .ok()
+        })
+    };
+    let sideways = matches!(field("orientation"), Some(5..=8));
+    let tall =
+        matches!((field("width"), field("height")), (Some(width), Some(height)) if height > width);
+    !(sideways && tall)
+}
+
+/// Whether `head` starts as a TIFF does, in either byte order.
+fn tiff(head: &[u8]) -> bool {
+    head.starts_with(b"II*\0") || head.starts_with(b"MM\0*")
+}
+
+/// Whether `head` is a camera raw photo with a signature of its own.
+/// Canon's CR2 files are TIFF files that say so after the TIFF header.
+fn raw(head: &[u8]) -> bool {
+    const SIGNATURES: [&[u8]; 9] = [
+        // Olympus ORF, in either byte order and an older kind.
+        b"IIRO",
+        b"IIRS",
+        b"MMOR",
+        // Panasonic RW2 and Leica RWL.
+        b"IIU\0",
+        b"FUJIFILMCCD-RAW",
+        // Minolta MRW.
+        b"\0MRM",
+        // Sigma X3F.
+        b"FOVb",
+        // Canon's older CRW.
+        b"II\x1a\0\0\0HEAPCCDR",
+        b"II*\0\x10\0\0\0CR",
+    ];
+    SIGNATURES.iter().any(|signature| head.starts_with(signature))
+        // Canon's CR3 is in the same format as MP4.
+        || (head.get(4..8) == Some(b"ftyp") && head.get(8..12) == Some(b"crx "))
+}
+
+/// Whether `head` is a DjVu document: one page, or several in one file.
+fn djvu(head: &[u8]) -> bool {
+    head.starts_with(b"AT&TFORM") && matches!(head.get(12..16), Some(b"DJVU" | b"DJVM"))
+}
+
+/// Whether `head` is an SVG drawing: XML whose first element is `<svg`,
+/// after any XML declaration, comments, and document type. Other XML, and
+/// web pages with drawings in them, stay text.
+fn svg(head: &[u8]) -> bool {
+    let mut rest = head.strip_prefix(b"\xef\xbb\xbf").unwrap_or(head);
+    loop {
+        rest = rest.trim_ascii_start();
+        let skip_past = |rest: &[u8], end: &[u8]| {
+            rest.windows(end.len())
+                .position(|window| window == end)
+                .map(|at| at + end.len())
+        };
+        let skipped = if rest.starts_with(b"<?") {
+            skip_past(rest, b"?>")
+        } else if rest.starts_with(b"<!--") {
+            skip_past(rest, b"-->")
+        } else if rest.len() >= 9 && rest[..9].eq_ignore_ascii_case(b"<!DOCTYPE") {
+            // A document type may have its own declarations, in brackets.
+            match (skip_past(rest, b"["), skip_past(rest, b">")) {
+                (Some(open), Some(close)) if open < close => skip_past(rest, b"]")
+                    .and_then(|end| skip_past(&rest[end..], b">").map(|after| end + after)),
+                (_, close) => close,
+            }
+        } else {
+            break;
+        };
+        match skipped {
+            Some(at) => rest = &rest[at..],
+            None => return false,
+        }
+    }
+    rest.strip_prefix(b"<svg").is_some_and(|after| {
+        after
+            .first()
+            .is_some_and(|next| next.is_ascii_whitespace() || matches!(next, b'>' | b'/'))
+    })
+}
+
 /// A picture without a signature, known by its name, if its first bytes
 /// fit the format.
 fn unsigned_still(name: &str, head: &[u8]) -> Option<Still> {
@@ -2073,11 +2453,9 @@ fn is_text(head: &[u8], whole: bool) -> bool {
     let trimmed = text.trim_start();
     !text.contains(controls)
         && !trimmed.is_empty()
-        // An SVG is a picture, and an RTF file is a formatted document, so
-        // their markup would look broken.
-        && !(trimmed.starts_with("<svg")
-            || (trimmed.starts_with("<?xml") && trimmed.contains("<svg"))
-            || trimmed.starts_with("{\\rtf"))
+        // An RTF file is a formatted document, so its markup would look
+        // broken. SVG drawings are found before text is.
+        && !trimmed.starts_with("{\\rtf")
 }
 
 /// A text thumbnail from the start of a text file: its first lines, with
@@ -2243,6 +2621,105 @@ mod tests {
     }
 
     #[test]
+    fn knows_camera_raw_photos() {
+        let raw = |head: &[u8]| kind(head, false);
+        assert_eq!(raw(b"II*\0\x10\0\0\0CR\x02\0"), Some(Kind::Raw));
+        assert_eq!(raw(b"IIRO\x08\0\0\0"), Some(Kind::Raw));
+        assert_eq!(raw(b"IIU\0\x18\0\0\0"), Some(Kind::Raw));
+        assert_eq!(raw(b"FUJIFILMCCD-RAW 0201"), Some(Kind::Raw));
+        assert_eq!(raw(b"\0\0\0\x18ftypcrx \0\0\0\x01"), Some(Kind::Raw));
+        // Nikon's, Sony's, and Adobe's are TIFF files, known by their name.
+        let tiff = b"II*\0\x08\0\0\0";
+        assert_eq!(raw(tiff), Some(Kind::Image));
+        assert_eq!(named("DSC_0001.NEF", tiff, raw(tiff)), Some(Kind::Raw));
+        assert_eq!(named("photo.dng", tiff, raw(tiff)), Some(Kind::Raw));
+        assert_eq!(named("scan.tif", tiff, raw(tiff)), Some(Kind::Image));
+        // A JPEG named like a raw photo is still a JPEG.
+        let jpeg = b"\xff\xd8\xff\xe0";
+        assert_eq!(named("photo.nef", jpeg, raw(jpeg)), Some(Kind::Image));
+    }
+
+    #[test]
+    fn turns_a_raw_photos_jpeg_only_once() {
+        // Kept as the sensor saw it: turned as the photo says.
+        assert!(turns("width: 4256\nheight: 2832\norientation: 8\n"));
+        // Already turned by the camera, which LibRaw doesn't know.
+        assert!(!turns("width: 2832\nheight: 4256\norientation: 8\n"));
+        // Upside down is turned either way.
+        assert!(turns("width: 4256\nheight: 2832\norientation: 3\n"));
+        assert!(turns("width: 4256\nheight: 2832\n"));
+    }
+
+    #[test]
+    fn knows_svg_drawings_from_other_xml() {
+        let drawing = |head: &[u8]| kind(head, true);
+        assert_eq!(
+            drawing(b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>"),
+            Some(Kind::Svg)
+        );
+        assert_eq!(
+            drawing(
+                b"\xef\xbb\xbf<?xml version=\"1.0\"?>\n<!-- Made in Inkscape -->\n\
+                  <!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" \"svg11.dtd\" [\n\
+                  <!ENTITY ns \"x\">\n] >\n<svg\n width=\"10\">"
+            ),
+            Some(Kind::Svg)
+        );
+        assert_eq!(drawing(b"<svg>"), Some(Kind::Svg));
+        // Other XML, and web pages with drawings in them, stay text.
+        assert_eq!(drawing(b"<?xml version=\"1.0\"?><svgx/>"), Some(Kind::Text));
+        assert_eq!(
+            drawing(b"<?xml version=\"1.0\"?><kml><svg/></kml>"),
+            Some(Kind::Text)
+        );
+        assert_eq!(
+            drawing(b"<!DOCTYPE html><html><svg></svg></html>"),
+            Some(Kind::Text)
+        );
+        assert_eq!(drawing(b"<!-- never ends <svg>"), Some(Kind::Text));
+        // Compressed SVG is known by its name.
+        assert_eq!(named("map.svgz", b"\x1f\x8b\x08\0", None), Some(Kind::Svg));
+        assert_eq!(named("map.gz", b"\x1f\x8b\x08\0", None), None);
+    }
+
+    #[test]
+    fn knows_djvu_books() {
+        assert_eq!(
+            kind(b"AT&TFORM\0\x02\x57\x9cDJVMDIRM", false),
+            Some(Kind::Djvu)
+        );
+        assert_eq!(kind(b"AT&TFORM\0\0\x10\0DJVUINFO", false), Some(Kind::Djvu));
+        // A shared dictionary that other files include has no pages.
+        assert_eq!(kind(b"AT&TFORM\0\0\x10\0DJVIDjbz", false), None);
+    }
+
+    #[test]
+    fn says_which_pictures_need_which_packages() {
+        let missing = Tools {
+            simple_dcraw: "/nowhere/simple_dcraw".into(),
+            rsvg_convert: "/nowhere/rsvg-convert".into(),
+            ddjvu: "/nowhere/ddjvu".into(),
+            ..Tools::installed("/nowhere/accordion")
+        };
+        assert_eq!(
+            pictures_unavailable(&missing).unwrap(),
+            "Camera raw photos, SVG drawings, and DjVu books show an icon instead. Install \
+             libraw-bin, librsvg2-bin, and djvulibre-bin with apt to give them thumbnails and \
+             previews."
+        );
+        let one = Tools {
+            simple_dcraw: "/usr/bin/true".into(),
+            rsvg_convert: "/usr/bin/true".into(),
+            ..missing
+        };
+        assert_eq!(
+            pictures_unavailable(&one).unwrap(),
+            "DjVu books show an icon instead. Install djvulibre-bin with apt to give them \
+             thumbnails and previews."
+        );
+    }
+
+    #[test]
     fn knows_the_video_formats_families_have() {
         let video = |head: &[u8]| container(head);
         assert_eq!(video(b"\0\0\0\x14ftypqt  \0\0\0\0"), Some(Container::Mov));
@@ -2329,11 +2806,11 @@ mod tests {
         assert!(!is_text(b"Latin-1 caf\xe9 isn't UTF-8", true));
         assert!(!is_text(b"\x7fELF\x02\x01\x01\0", false));
         assert!(!is_text(b"   \n\n", true));
-        assert!(!is_text(
-            b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>",
-            true
-        ));
-        assert!(!is_text(b"<?xml version=\"1.0\"?>\n<svg/>", true));
+        // SVG drawings are pictures, found before text is.
+        assert_eq!(
+            kind(b"<?xml version=\"1.0\"?>\n<svg/>", true),
+            Some(Kind::Svg)
+        );
         assert!(is_text(b"<?xml version=\"1.0\"?>\n<notes/>", true));
         assert!(!is_text(b"{\\rtf1\\ansi Hello}", true));
     }

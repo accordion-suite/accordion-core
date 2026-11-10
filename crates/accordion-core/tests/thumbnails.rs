@@ -1195,3 +1195,352 @@ async fn shows_hdr_fits_and_mng_pictures() {
     stop.send(()).unwrap();
     worker.await.unwrap();
 }
+
+impl Server {
+    /// Makes a three-second sound with ffmpeg, outside the sandbox, with
+    /// `options` for the encoder and format, and `cover` as its cover art
+    /// if there's one.
+    fn sound(&self, name: &str, options: &[&str], cover: Option<&Path>) -> Vec<u8> {
+        let path = self.dir.path().join(name);
+        let mut command = Command::new("ffmpeg");
+        command
+            .args(["-v", "error", "-y", "-f", "lavfi"])
+            .args(["-i", "sine=frequency=440:duration=3"]);
+        if let Some(cover) = cover {
+            command
+                .arg("-i")
+                .arg(cover)
+                .args(["-map", "0:a", "-map", "1:v", "-c:v", "copy"])
+                .args(["-disposition:v", "attached_pic"]);
+        }
+        let made = command.args(options).arg(&path).status().unwrap();
+        assert!(made.success(), "ffmpeg couldn't make {name}");
+        std::fs::read(path).unwrap()
+    }
+
+    /// Why the contents with `hash` have no preview.
+    async fn preview_reason(&self, hash: ContentHash) -> Option<String> {
+        self.db
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT preview_reason FROM thumbnails WHERE hash = ?1",
+                    [&hash.0[..]],
+                    |row| row.get(0),
+                )
+            })
+            .await
+            .unwrap()
+    }
+
+    /// Waits until the worker has decided every preview.
+    async fn wait_for_previews(&self) {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let waiting: i64 = self
+                    .db
+                    .read(|conn| {
+                        conn.query_row(
+                            "SELECT count(*) FROM storage_blobs b
+                             WHERE NOT EXISTS (SELECT 1 FROM thumbnails t
+                                               WHERE t.hash = b.hash AND t.preview IS NOT NULL)",
+                            [],
+                            |row| row.get(0),
+                        )
+                    })
+                    .await
+                    .unwrap();
+                if waiting == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the worker should decide each preview");
+    }
+}
+
+/// Three seconds of a tone in one of SoX's own formats, from SoX.
+fn sox(dir: &Path, format: &str) -> Vec<u8> {
+    let path = dir.join(format!("tone.{format}"));
+    let made = Command::new("sox")
+        .args(["-V1", "-n", "-c", "1"])
+        .arg(&path)
+        .args(["synth", "3", "sine", "440"])
+        .status()
+        .unwrap();
+    assert!(made.success(), "SoX couldn't make a .{format}");
+    std::fs::read(path).unwrap()
+}
+
+/// What ffprobe says about a converted sound: its codec, its channels, and
+/// how long it is, in seconds.
+fn listen(path: &Path) -> (String, u64, f64) {
+    let probed = Command::new("ffprobe")
+        .args(["-v", "error", "-select_streams", "a:0"])
+        .args([
+            "-show_entries",
+            "stream=codec_name,channels:format=duration",
+        ])
+        .args(["-of", "default=noprint_wrappers=1"])
+        .arg(path)
+        .output()
+        .unwrap();
+    let text = String::from_utf8(probed.stdout).unwrap();
+    let field = |name: &str| {
+        text.lines()
+            .find_map(|line| line.strip_prefix(&format!("{name}=")))
+            .unwrap_or_else(|| panic!("ffprobe didn't say the {name}: {text}"))
+            .to_owned()
+    };
+    (
+        field("codec_name"),
+        field("channels").parse().unwrap(),
+        field("duration").parse().unwrap(),
+    )
+}
+
+/// A tracker module: one instrument, a square wave, played once.
+fn module() -> Vec<u8> {
+    let mut module = b"tune".to_vec();
+    module.resize(20, 0);
+    for instrument in 0..31 {
+        let mut header = [0; 30];
+        if instrument == 0 {
+            header[..6].copy_from_slice(b"square");
+            // 16 words long, at full volume, looping all of it.
+            header[22..30].copy_from_slice(&[0, 16, 0, 64, 0, 0, 0, 16]);
+        } else {
+            header[29] = 1;
+        }
+        module.extend(header);
+    }
+    // One pattern in the song, then its 64 rows of four channels.
+    module.extend([1, 127]);
+    module.extend([0; 128]);
+    module.extend(b"M.K.");
+    let mut pattern = [0; 64 * 4 * 4];
+    pattern[..4].copy_from_slice(&[0x01, 0xac, 0x10, 0x00]);
+    module.extend(pattern);
+    module.extend([100; 16]);
+    module.extend([156; 16]);
+    module
+}
+
+#[tokio::test]
+async fn shows_a_songs_cover_art() {
+    let server = start().await;
+    let cover = server.dir.path().join("cover.jpg");
+    std::fs::write(&cover, server.image("cover.jpg", 600, 400)).unwrap();
+    let mp3 = server.sound("song.mp3", &["-c:a", "libmp3lame"], Some(&cover));
+    let flac = server.sound("song.flac", &["-c:a", "flac"], Some(&cover));
+    let m4a = server.sound("song.m4a", &["-c:a", "aac"], Some(&cover));
+    let plain = server.sound("plain.mp3", &["-c:a", "libmp3lame"], None);
+    for (name, contents) in [("Song.mp3", &mp3), ("Song.flac", &flac), ("Song.m4a", &m4a)] {
+        let hash = server.save(name, contents).await;
+        assert!(server.thumbnails.make_now(hash).await.unwrap(), "{name}");
+        let (width, height, _) = describe(&thumbnail(&server, hash));
+        assert_eq!((width, height), (480, 320), "{name}");
+    }
+    let plain = server.save("Plain.mp3", &plain).await;
+    assert!(!server.thumbnails.make_now(plain).await.unwrap());
+    assert_eq!(server.thumbnails.status().borrow().failed, 0);
+}
+
+#[tokio::test]
+async fn converts_sound_browsers_cant_play_to_aac() {
+    let server = start().await;
+    let cover = server.dir.path().join("cover.jpg");
+    std::fs::write(&cover, server.image("cover.jpg", 600, 400)).unwrap();
+    let converted = [
+        server
+            .save(
+                "Song.wma",
+                &server.sound("song.wma", &["-c:a", "wmav2"], None),
+            )
+            .await,
+        server
+            .save("Song.aiff", &server.sound("song.aiff", &[], None))
+            .await,
+        // Apple Lossless has the same name as AAC, but most browsers don't
+        // play it.
+        server
+            .save(
+                "Lossless.m4a",
+                &server.sound("lossless.m4a", &["-c:a", "alac"], Some(&cover)),
+            )
+            .await,
+        server
+            .save("Old.mp2", &server.sound("old.mp2", &["-c:a", "mp2"], None))
+            .await,
+        server
+            .save(
+                "Film.ac3",
+                &server.sound("film.ac3", &["-ac", "6", "-c:a", "ac3"], None),
+            )
+            .await,
+        server
+            .save(
+                "Ringtone.mka",
+                &server.sound("ringtone.mka", &["-c:a", "libvorbis"], None),
+            )
+            .await,
+        server.save("Tune.mod", &module()).await,
+        // Stereo Speex doesn't say which channel is which, which AAC needs.
+        server
+            .save(
+                "Speech.spx",
+                &server.sound(
+                    "speech.spx",
+                    &["-ac", "2", "-c:a", "libspeex", "-f", "ogg"],
+                    None,
+                ),
+            )
+            .await,
+    ];
+    let played = [
+        server
+            .save(
+                "Song.mp3",
+                &server.sound("song.mp3", &["-c:a", "libmp3lame"], None),
+            )
+            .await,
+        server
+            .save("Take.wav", &server.sound("take.wav", &[], None))
+            .await,
+    ];
+
+    let (stop, worker) = start_worker(&server.thumbnails);
+    server.wait_for_previews().await;
+    stop.send(()).unwrap();
+    worker.await.unwrap();
+    for hash in converted {
+        let Some(sound) = server.thumbnails.sound(hash) else {
+            panic!(
+                "no converted sound: {:?}",
+                server.preview_reason(hash).await
+            );
+        };
+        let (codec, channels, seconds) = listen(&sound);
+        assert_eq!(codec, "aac");
+        // Surround sound is mixed down.
+        assert!(channels <= 2, "{channels} channels");
+        assert!(seconds > 2.0, "{seconds} seconds");
+    }
+    for hash in played {
+        assert!(server.thumbnails.sound(hash).is_none());
+    }
+    // Apple Lossless keeps its cover art too.
+    assert!(server.thumbnails.find(converted[2]).is_some());
+    assert_eq!(server.thumbnails.status().borrow().failed, 0);
+}
+
+#[tokio::test]
+async fn plays_older_sound_once_sox_is_installed() {
+    let server = start_with(|tools| Tools {
+        sox: "/nonexistent/sox".into(),
+        ..tools
+    })
+    .await;
+    let reason = server
+        .thumbnails
+        .status()
+        .borrow()
+        .pictures
+        .clone()
+        .unwrap();
+    assert!(reason.contains("Install sox with apt"), "{reason}");
+    let mut sounds = Vec::new();
+    for format in [
+        "cdda", "cvsd", "cvu", "dvms", "fssd", "gsrt", "sndr", "sndt", "txw",
+    ] {
+        let tone = sox(server.dir.path(), format);
+        sounds.push((format, server.save(&format!("Tone.{format}"), &tone).await));
+    }
+    for format in [
+        "paf", "fap", "smp", "wve", "htk", "vox", "cvs", "vms", "sou",
+    ] {
+        let tone = sox(server.dir.path(), format);
+        sounds.push((format, server.save(&format!("Tone.{format}"), &tone).await));
+    }
+    // A SoundTool file as it's often named, known by its first bytes.
+    let snd = sox(server.dir.path(), "sndt");
+    sounds.push(("snd", server.save("Tone.snd", &snd).await));
+    // Sound Designer II, as it is without the resource fork a Mac keeps.
+    let sd2 = server.dir.path().join("tone.sd2");
+    let made = Command::new("sox")
+        .args([
+            "-V1",
+            "-n",
+            "-c",
+            "2",
+            "-r",
+            "44100",
+            "-t",
+            "raw",
+            "-e",
+            "signed-integer",
+        ])
+        .args(["-b", "16", "-B"])
+        .arg(&sd2)
+        .args(["synth", "3", "sine", "440"])
+        .status()
+        .unwrap();
+    assert!(made.success());
+    let sd2 = std::fs::read(sd2).unwrap();
+    sounds.push(("sd2", server.save("Take.sd2", &sd2).await));
+    let (stop, worker) = start_worker(&server.thumbnails);
+    server.wait_for_previews().await;
+    stop.send(()).unwrap();
+    worker.await.unwrap();
+    for (format, hash) in &sounds {
+        assert_eq!(
+            server.preview_reason(*hash).await.as_deref(),
+            Some("SoX isn't installed"),
+            "{format}"
+        );
+    }
+
+    // As if the admin installed it.
+    let thumbnails = Thumbnails::open(
+        server.db.clone(),
+        server.storage.clone(),
+        server.dir.path(),
+        Tools::installed(env!("CARGO_BIN_EXE_accordion-core-sandbox")),
+    )
+    .await
+    .unwrap();
+    let (stop, worker) = start_worker(&thumbnails);
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while sounds
+            .iter()
+            .any(|(_, hash)| thumbnails.sound(*hash).is_none())
+            && thumbnails.status().borrow().failed == 0
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the worker should convert each sound");
+    stop.send(()).unwrap();
+    worker.await.unwrap();
+    for (format, hash) in sounds {
+        let Some(sound) = thumbnails.sound(hash) else {
+            panic!(
+                ".{format} wasn't converted: {:?}",
+                server.preview_reason(hash).await
+            );
+        };
+        let (codec, channels, seconds) = listen(&sound);
+        assert_eq!(codec, "aac", "{format}");
+        let stereo = ["cdda", "sd2"].contains(&format);
+        assert_eq!(channels, if stereo { 2 } else { 1 }, "{format}");
+        // Formats without a header play at the rate SoX assumes, which
+        // isn't the tone's.
+        if !["cvsd", "cvs", "cvu", "fssd", "sou", "vox"].contains(&format) {
+            assert!((seconds - 3.0).abs() < 0.2, ".{format}: {seconds} seconds");
+        }
+        // They can't have cover art.
+        assert!(thumbnails.find(hash).is_none(), "{format}");
+    }
+}

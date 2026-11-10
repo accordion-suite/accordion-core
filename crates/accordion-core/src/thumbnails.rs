@@ -83,11 +83,34 @@ static MIGRATIONS: &[Migration] = &[
     ALTER TABLE thumbnails ADD COLUMN preview_reason TEXT;
 ",
     },
+    Migration {
+        version: 3,
+        name: "Add sound previews",
+        sql: "
+    -- audio: a sound the browser can't play, converted to AAC in
+    -- cache/previews (decision 26). SQLite can't change a CHECK, so the
+    -- table is made again.
+    CREATE TABLE thumbnails_new (
+        hash BLOB PRIMARY KEY CHECK (length(hash) = 32),
+        state TEXT NOT NULL CHECK (state IN ('ready', 'none', 'failed')),
+        worker INTEGER NOT NULL,
+        reason TEXT,
+        made_at TEXT NOT NULL,
+        preview TEXT CHECK (preview IN ('picture', 'audio', 'none', 'failed')),
+        preview_reason TEXT
+    ) STRICT, WITHOUT ROWID;
+    INSERT INTO thumbnails_new
+        SELECT hash, state, worker, reason, made_at, preview, preview_reason FROM thumbnails;
+    DROP TABLE thumbnails;
+    ALTER TABLE thumbnails_new RENAME TO thumbnails;
+    CREATE INDEX thumbnails_failed ON thumbnails (state) WHERE state = 'failed';
+",
+    },
 ];
 
 /// The version of what makes thumbnails. Raise it when it can make
 /// thumbnails of files it couldn't before, so they get another try.
-pub const WORKER: u32 = 8;
+pub const WORKER: u32 = 11;
 
 /// The longer side of a thumbnail, in pixels.
 const SIZE: u32 = 480;
@@ -103,6 +126,20 @@ const PREVIEW_LIMITS: Limits = Limits {
     time: Duration::from_secs(45),
     output: 64 * 1024 * 1024,
 };
+
+/// What ffmpeg may use to convert a sound the browser can't play. Three
+/// hours of sound takes about 3 minutes on a fast computer, and longer on
+/// a Raspberry Pi.
+const SOUND_LIMITS: Limits = Limits {
+    memory: 1024 * 1024 * 1024,
+    cpu: Duration::from_secs(15 * 60),
+    time: Duration::from_secs(20 * 60),
+    output: 1024 * 1024,
+};
+
+/// Longer sounds get no converted preview, so one can't keep the worker
+/// busy for long. Three hours at 128 kbit/s is about 170 MB.
+const MAX_SOUND_SECONDS: f64 = 3.0 * 60.0 * 60.0;
 
 /// How large a worker's picture is, and what the worker may use.
 #[derive(Clone, Copy)]
@@ -202,14 +239,36 @@ const DOCUMENT_SETTINGS: &str = r#"<item oor:path="/org.openoffice.Office.Common
 /// including older ones from DVDs, Windows Media, and Flash.
 const VIDEO_DECODERS: &str = "h264,hevc,vp8,vp9,av1,libdav1d,mpeg4,mpeg1video,mpeg2video,mjpeg,\
                               prores,msmpeg4v1,msmpeg4v2,msmpeg4,wmv1,wmv2,wmv3,vc1,flv,\
-                              vp6f,theora";
+                              vp6f,theora,rv10,rv20,rv30,rv40";
 
 /// ffprobe opens a decoder for every track, and stops at one it may not use,
 /// so it may also use the decoders for the audio in those videos. ffmpeg
 /// skips the audio.
 const AUDIO_DECODERS: &str = "aac,mp3float,mp3,opus,libopus,vorbis,libvorbis,ac3,eac3,\
                               flac,alac,pcm_s16le,pcm_s16be,pcm_s24le,pcm_s24be,pcm_s32le,\
-                              pcm_f32le,pcm_bluray,mp2,mp2float,wmav1,wmav2";
+                              pcm_f32le,pcm_bluray,mp2,mp2float,wmav1,wmav2,cook,sipr,\
+                              real_144,real_288,atrac3";
+
+/// The decoders ffmpeg may use for songs and other sound files: the codecs
+/// in the formats families have, from MP3 to Amiga, telephone, and Sound
+/// Blaster audio.
+const SOUND_DECODERS: &str = "mp3float,mp3,mp2float,mp2,mp1float,mp1,aac,aac_fixed,alac,flac,\
+                              vorbis,libvorbis,opus,libopus,speex,libspeex,pcm_u8,pcm_s8,\
+                              pcm_s8_planar,pcm_s16le,pcm_s16be,pcm_s16le_planar,\
+                              pcm_s16be_planar,pcm_s24le,pcm_s24be,pcm_s24le_planar,pcm_s32le,\
+                              pcm_s32be,pcm_s32le_planar,pcm_u16le,pcm_u16be,pcm_u24le,\
+                              pcm_u24be,pcm_u32le,pcm_u32be,pcm_f32le,pcm_f32be,pcm_f64le,\
+                              pcm_f64be,pcm_alaw,pcm_mulaw,pcm_bluray,pcm_dvd,adpcm_ms,\
+                              adpcm_ima_wav,adpcm_ima_qt,adpcm_yamaha,g722,g726,g726le,gsm,\
+                              libgsm,gsm_ms,libgsm_ms,mace3,mace6,qdm2,qdmc,8svx_exp,8svx_fib,\
+                              wmav1,wmav2,wmapro,wmalossless,wmavoice,ape,wavpack,tta,amrnb,\
+                              amrwb,ac3,ac3_fixed,eac3,dca,truehd,mlp,cook,ralf,sipr,real_144,\
+                              real_288,atrac3,atrac3plus,dsd_lsbf,dsd_msbf,dsd_lsbf_planar,\
+                              dsd_msbf_planar,hcom";
+
+/// The decoders for a song's cover art, which ffprobe opens with the
+/// sound.
+const COVER_DECODERS: &str = "mjpeg,png,bmp,gif,webp";
 
 /// Turns an HDR frame's colors into ordinary ones. It runs after the frame
 /// is shrunk, since a whole 4K frame takes more memory than the limit.
@@ -234,6 +293,7 @@ const NO_OFFICE: &str = "LibreOffice isn't installed";
 const NO_LIBRAW: &str = "LibRaw isn't installed";
 const NO_RSVG: &str = "librsvg isn't installed";
 const NO_DJVU: &str = "djvulibre isn't installed";
+const NO_SOX: &str = "SoX isn't installed";
 
 /// Why a camera raw photo has no thumbnail when the camera kept no JPEG in
 /// it, or only a bitmap libvips doesn't trust.
@@ -242,6 +302,9 @@ const NO_EMBEDDED: &str = "a camera raw photo without a JPEG preview in it";
 /// Why an MNG has no thumbnail when it doesn't start with a whole PNG, such
 /// as one that starts with a JPEG or a change to another picture.
 const NO_MNG_PICTURE: &str = "an MNG that doesn't start with a PNG picture";
+
+/// Why a song has no thumbnail.
+const NO_COVER: &str = "a sound without cover art";
 
 /// How every MNG file starts.
 const MNG: &[u8] = b"\x8aMNG\r\n\x1a\n";
@@ -286,6 +349,8 @@ pub struct Tools {
     pub rsvg_convert: PathBuf,
     /// djvulibre's program, for DjVu books.
     pub ddjvu: PathBuf,
+    /// SoX, for older sound formats ffmpeg can't read.
+    pub sox: PathBuf,
 }
 
 impl Tools {
@@ -304,6 +369,7 @@ impl Tools {
             simple_dcraw: "/usr/bin/simple_dcraw".into(),
             rsvg_convert: "/usr/bin/rsvg-convert".into(),
             ddjvu: "/usr/bin/ddjvu".into(),
+            sox: "/usr/bin/sox".into(),
         }
     }
 
@@ -325,6 +391,10 @@ impl Tools {
 
     fn has_djvu(&self) -> bool {
         self.ddjvu.is_file()
+    }
+
+    fn has_sox(&self) -> bool {
+        self.sox.is_file()
     }
 }
 
@@ -395,8 +465,9 @@ pub struct ThumbnailStatus {
     /// Why Office documents have no thumbnails, such as LibreOffice not
     /// being installed.
     pub documents: Option<String>,
-    /// A sentence saying which pictures show an icon, such as camera raw
-    /// photos, and which packages would give them thumbnails.
+    /// Sentences saying which pictures show an icon, such as camera raw
+    /// photos, and which older sound files can't play, and which packages
+    /// would fix that.
     pub pictures: Option<String>,
     /// Files waiting for a thumbnail.
     pub waiting: u64,
@@ -476,6 +547,10 @@ pub(crate) enum Kind {
     Loaded(Loader),
     Pdf,
     Video(Container),
+    /// A song or another sound file, shown by its cover art.
+    Audio(Sound),
+    /// An older sound format only SoX reads, which has no cover art.
+    Sox(Sox),
     /// UTF-8 text, such as notes, Markdown, CSV, or code.
     Text,
     Document(&'static Format),
@@ -600,6 +675,8 @@ pub(crate) enum Container {
     Flv,
     /// Ogg with Theora video: `.ogv`.
     Ogg,
+    /// RealMedia: `.rm`, `.rmvb`, and some `.ra` files.
+    RealMedia,
 }
 
 impl Container {
@@ -614,6 +691,174 @@ impl Container {
             Self::Asf => "asf",
             Self::Flv => "flv",
             Self::Ogg => "ogg",
+            Self::RealMedia => "rm",
+        }
+    }
+}
+
+/// The sound formats families have. ffmpeg reads each with only the one
+/// demuxer, as it does videos (decision 26).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Sound {
+    /// MP3, and the older MP2 and MP1.
+    Mpeg,
+    /// AAC on its own, as `.aac` files are.
+    Adts,
+    /// Songs, audiobooks, and ringtones in MP4: `.m4a`, `.m4b`, and `.m4r`.
+    Mp4,
+    Flac,
+    /// Vorbis, Opus, Speex, or FLAC in Ogg.
+    Ogg,
+    /// WAV, and its larger forms, RF64 and BW64.
+    Wav,
+    /// Sony's Wave64.
+    Wave64,
+    /// AIFF and AIFF-C.
+    Aiff,
+    /// Amiga's 8SVX and MAUD, and DSD in DSDIFF (`.dff`).
+    Iff,
+    /// DSD in Sony's DSF.
+    Dsf,
+    /// Monkey's Audio, `.ape`.
+    Ape,
+    WavPack,
+    /// True Audio, `.tta`.
+    Tta,
+    /// Sun and NeXT audio: `.au` and `.snd`.
+    Au,
+    /// Apple's Core Audio Format, `.caf`.
+    Caf,
+    /// Phones' voice recordings, `.amr`.
+    Amr,
+    /// RealAudio before RealMedia, `.ra`.
+    RealAudio,
+    /// Sound Blaster's `.voc`.
+    Voc,
+    /// Berkeley, IRCAM, and CARL sound, `.ircam`.
+    Ircam,
+    /// NIST SPHERE speech recordings: `.nist` and `.sph`.
+    Nist,
+    /// Atari's Audio Visual Research, `.avr`.
+    Avr,
+    /// Macintosh HCOM.
+    Hcom,
+    /// Portable Voice Format, `.pvf`.
+    Pvf,
+    /// Dolby Digital on its own, as `.ac3` files are.
+    Ac3,
+    /// Dolby Digital Plus on its own.
+    Eac3,
+    /// DTS on its own.
+    Dts,
+    /// Tracker music: `.mod`, `.xm`, `.s3m`, and `.it`, which ffmpeg plays
+    /// through libopenmpt.
+    Module,
+}
+
+impl Sound {
+    fn format(self) -> &'static str {
+        match self {
+            Self::Mpeg => "mp3",
+            Self::Adts => "aac",
+            Self::Mp4 => "mov",
+            Self::Flac => "flac",
+            Self::Ogg => "ogg",
+            Self::Wav => "wav",
+            Self::Wave64 => "w64",
+            Self::Aiff => "aiff",
+            Self::Iff => "iff",
+            Self::Dsf => "dsf",
+            Self::Ape => "ape",
+            Self::WavPack => "wv",
+            Self::Tta => "tta",
+            Self::Au => "au",
+            Self::Caf => "caf",
+            Self::Amr => "amr",
+            Self::RealAudio => "rm",
+            Self::Voc => "voc",
+            Self::Ircam => "ircam",
+            Self::Nist => "nistsphere",
+            Self::Avr => "avr",
+            Self::Hcom => "hcom",
+            Self::Pvf => "pvf",
+            Self::Ac3 => "ac3",
+            Self::Eac3 => "eac3",
+            Self::Dts => "dts",
+            Self::Module => "libopenmpt",
+        }
+    }
+}
+
+/// Older sound formats ffmpeg can't read. SoX reads each with only its own
+/// reader and turns it into WAV, which ffmpeg converts as it does other
+/// sound (decision 26). Formats without a header don't say their sample
+/// rate, so SoX plays them at the rate it assumes for the format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Sox {
+    /// An audio CD's tracks as they are on the disc.
+    Cdda,
+    /// CVSD, the voice codec of military radios and some phones, without
+    /// a header: `.cvsd` or `.cvs`, and `.cvu` for its unfiltered form.
+    Cvsd,
+    Cvu,
+    /// CVSD with a header, from voice mail: `.dvms` or `.vms`.
+    Dvms,
+    /// 8-bit sound without a header: `.fssd` or `.sou`.
+    Fssd,
+    /// Grandstream phones' ringtones.
+    Gsrt,
+    /// 8-bit sound from Sounder and SoundTool, two DOS programs.
+    Sndr,
+    Sndt,
+    /// Yamaha TX16W sampler sounds.
+    Txw,
+    /// Ensoniq PARIS recordings, `.paf` or `.fap`.
+    Paris,
+    /// Turtle Beach SampleVision samples, `.smp`.
+    SampleVision,
+    /// Psion organizers' voice notes, `.wve`.
+    Psion,
+    /// Speech recordings for the HTK speech recognition toolkit, `.htk`.
+    Htk,
+    /// Dialogic's telephone sound, as phone systems record calls, `.vox`.
+    Vox,
+    /// Sound Designer II, `.sd2`. A Mac keeps its sample rate in the
+    /// file's resource fork, which an upload leaves behind, so it's read
+    /// as what Pro Tools recorded most: 16-bit stereo at 44.1 kHz.
+    Sd2,
+}
+
+impl Sox {
+    /// What tells SoX the format, before the file.
+    fn reader(self) -> &'static [&'static str] {
+        match self {
+            Self::Cdda => &["-t", "cdda"],
+            Self::Cvsd => &["-t", "cvsd"],
+            Self::Cvu => &["-t", "cvu"],
+            Self::Dvms => &["-t", "dvms"],
+            Self::Fssd => &["-t", "u8"],
+            Self::Gsrt => &["-t", "gsrt"],
+            Self::Sndr => &["-t", "sndr"],
+            Self::Sndt => &["-t", "sndt"],
+            Self::Txw => &["-t", "txw"],
+            Self::Paris => &["-t", "paf"],
+            Self::SampleVision => &["-t", "smp"],
+            Self::Psion => &["-t", "wve"],
+            Self::Htk => &["-t", "htk"],
+            Self::Vox => &["-t", "vox"],
+            Self::Sd2 => &[
+                "-t",
+                "raw",
+                "-e",
+                "signed-integer",
+                "-b",
+                "16",
+                "-B",
+                "-c",
+                "2",
+                "-r",
+                "44100",
+            ],
         }
     }
 }
@@ -701,6 +946,27 @@ pub(crate) enum Loader {
     Fits,
 }
 
+/// What ffprobe says about a sound file's tracks, or a video's.
+#[derive(Debug, Default, PartialEq)]
+struct Tracks {
+    /// The first sound track.
+    sound: Option<Track>,
+    /// Whether there's cover art: a picture kept with the sound.
+    cover: bool,
+    /// Whether there's video, not counting cover art.
+    video: bool,
+    seconds: Option<f64>,
+}
+
+/// A sound track.
+#[derive(Debug, PartialEq)]
+struct Track {
+    codec: String,
+    /// Samples a second.
+    rate: u32,
+    channels: u32,
+}
+
 /// What ffprobe says about a video.
 #[derive(Debug, PartialEq)]
 struct Probe {
@@ -735,10 +1001,16 @@ impl Thumbnails {
                 std::fs::remove_file(entry.path())
             };
         }
-        // A newer worker may manage what an older one couldn't.
+        // A newer worker may manage what an older one couldn't, including
+        // previews of files whose thumbnail stays as it is.
         db.write(|tx| {
             tx.execute(
                 "DELETE FROM thumbnails WHERE state != 'ready' AND worker < ?1",
+                [WORKER],
+            )?;
+            tx.execute(
+                "UPDATE thumbnails SET preview = NULL, preview_reason = NULL, worker = ?1
+                 WHERE worker < ?1 AND preview IN ('none', 'failed')",
                 [WORKER],
             )
         })
@@ -814,6 +1086,19 @@ impl Thumbnails {
             .previews
             .join(blobs::shard(hash))
             .with_extension("webp")
+    }
+
+    /// The sound the viewer plays of the contents with `hash`, as AAC in
+    /// MP4, for a sound the browser can't play itself, if there is one yet.
+    pub fn sound(&self, hash: ContentHash) -> Option<PathBuf> {
+        Some(self.sound_path(hash)).filter(|path| path.is_file())
+    }
+
+    fn sound_path(&self, hash: ContentHash) -> PathBuf {
+        self.inner
+            .previews
+            .join(blobs::shard(hash))
+            .with_extension("m4a")
     }
 
     fn path(&self, hash: ContentHash, kind: ThumbnailKind) -> PathBuf {
@@ -920,9 +1205,11 @@ impl Thumbnails {
         });
     }
 
-    /// Records whether the contents with `hash` have a picture preview.
+    /// Records whether the contents with `hash` have a preview.
     async fn record_preview(&self, hash: ContentHash, outcome: Outcome) -> Result<(), Error> {
         let (state, reason) = match outcome {
+            // The worker has made it, so its file says which it is.
+            Outcome::Ready if self.sound(hash).is_some() => ("audio", None),
             Outcome::Ready => ("picture", None),
             Outcome::None(reason) => ("none", Some(reason.to_owned())),
             Outcome::Failed(problem) => {
@@ -938,7 +1225,7 @@ impl Thumbnails {
                     (&hash.0[..], state, reason),
                 )?;
                 // Open lists load the items again, which now have a preview.
-                if state == "picture" {
+                if state == "picture" || state == "audio" {
                     hint_folders(tx, hash)?;
                 }
                 Ok::<_, rusqlite::Error>(())
@@ -947,15 +1234,16 @@ impl Thumbnails {
         Ok(())
     }
 
-    /// Contents with a thumbnail whose preview isn't decided yet, newest
-    /// first.
+    /// Contents whose preview isn't decided yet, newest first: those with a
+    /// thumbnail, and those without one, since a song without cover art
+    /// may still need its sound converted.
     async fn previews_waiting(&self, limit: usize) -> Result<Vec<ContentHash>, Error> {
         self.inner
             .db
             .read(move |conn| {
                 conn.prepare(
                     "SELECT t.hash FROM thumbnails t
-                     WHERE t.state = 'ready' AND t.preview IS NULL
+                     WHERE t.state IN ('ready', 'none') AND t.preview IS NULL
                      ORDER BY t.made_at DESC
                      LIMIT ?1",
                 )?
@@ -1094,6 +1382,7 @@ impl Thumbnails {
             (tools.has_libraw(), NO_LIBRAW),
             (tools.has_rsvg(), NO_RSVG),
             (tools.has_djvu(), NO_DJVU),
+            (tools.has_sox(), NO_SOX),
         ] {
             if installed {
                 self.inner
@@ -1137,19 +1426,29 @@ impl Thumbnails {
         }
 
         // Previews the cache lost are made again.
-        let pictures = self
+        let previews = self
             .inner
             .db
             .read(|conn| {
-                conn.prepare("SELECT hash FROM thumbnails WHERE preview = 'picture'")?
-                    .query_map([], |row| hash(row, 0))?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(Error::from)
+                conn.prepare(
+                    "SELECT hash, preview = 'audio' FROM thumbnails
+                     WHERE preview IN ('picture', 'audio')",
+                )?
+                .query_map([], |row| Ok((hash(row, 0)?, row.get::<_, bool>(1)?)))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(Error::from)
             })
             .await?;
-        let lost: Vec<ContentHash> = pictures
+        let lost: Vec<ContentHash> = previews
             .into_iter()
-            .filter(|hash| self.picture(*hash).is_none())
+            .filter(|&(hash, sound)| {
+                if sound {
+                    self.sound(hash).is_none()
+                } else {
+                    self.picture(hash).is_none()
+                }
+            })
+            .map(|(hash, _)| hash)
             .collect();
         if !lost.is_empty() {
             self.inner
@@ -1185,6 +1484,7 @@ impl Thumbnails {
                 self.preview_path(hash, false),
                 self.preview_path(hash, true),
                 self.picture_path(hash),
+                self.sound_path(hash),
             ];
             for path in paths {
                 match std::fs::remove_file(path) {
@@ -1237,9 +1537,14 @@ impl Thumbnails {
             Some(Kind::Document(_)) if size > MAX_DOCUMENT => {
                 return Outcome::None("a document over 100 MB");
             }
-            // ffmpeg reads a video's index and a few frames, not all of it.
+            // ffmpeg reads a video's index and a few frames, not all of it,
+            // and only a song's tags.
             Some(kind)
-                if size > MAX_FILE && !matches!(kind, Kind::Video(_) | Kind::Document(_)) =>
+                if size > MAX_FILE
+                    && !matches!(
+                        kind,
+                        Kind::Video(_) | Kind::Audio(_) | Kind::Sox(_) | Kind::Document(_)
+                    ) =>
             {
                 return Outcome::None("over 200 MB");
             }
@@ -1293,9 +1598,23 @@ impl Thumbnails {
             Kind::Video(_) if !self.inner.tools.has_ffmpeg() => return Outcome::None(NO_FFMPEG),
             Kind::Video(container) => match self.video(&file, container).await {
                 Ok(Some(frame)) => self.thumbnail(Ok(frame)).await,
-                Ok(None) => return Outcome::None("a video file without video, such as a song"),
+                Ok(None) => return Outcome::None(NO_COVER),
                 Err(problem) => Err(problem),
             },
+            Kind::Audio(_) if !self.inner.tools.has_ffmpeg() => return Outcome::None(NO_FFMPEG),
+            Kind::Audio(sound) => match self.cover(&file, sound.format()).await {
+                Ok(Some(png)) => {
+                    self.thumbnail(self.scratch(&png).map_err(io::Error::other))
+                        .await
+                }
+                Ok(None) => return Outcome::None(NO_COVER),
+                Err(problem) => Err(problem),
+            },
+            // The reasons say what's missing, so these get another try once
+            // it's installed, and the preview with them.
+            Kind::Sox(_) if !self.inner.tools.has_sox() => return Outcome::None(NO_SOX),
+            Kind::Sox(_) if !self.inner.tools.has_ffmpeg() => return Outcome::None(NO_FFMPEG),
+            Kind::Sox(_) => return Outcome::None(NO_COVER),
             Kind::Document(_) if !self.inner.tools.has_office() => return Outcome::None(NO_OFFICE),
             Kind::Document(format) => self
                 .document(hash, &file, format)
@@ -1349,6 +1668,24 @@ impl Thumbnails {
             // Drawn as a picture, so an SVG's scripts never reach the
             // browser.
             Some(Kind::Svg) => self.drawing(&file, PREVIEW).await,
+            Some(Kind::Audio(_) | Kind::Sox(_) | Kind::Video(_))
+                if !self.inner.tools.has_ffmpeg() =>
+            {
+                return Outcome::None(NO_FFMPEG);
+            }
+            Some(Kind::Audio(sound)) => {
+                let decoders = format!("{SOUND_DECODERS},{COVER_DECODERS}");
+                return self.listen(hash, &file, sound.format(), &decoders).await;
+            }
+            Some(Kind::Sox(_)) if !self.inner.tools.has_sox() => return Outcome::None(NO_SOX),
+            Some(Kind::Sox(format)) => return self.old_sound(hash, &file, format).await,
+            // Videos with only sound, such as Windows Media songs.
+            Some(Kind::Video(container)) => {
+                let decoders = format!("{VIDEO_DECODERS},{SOUND_DECODERS},{COVER_DECODERS}");
+                return self
+                    .listen(hash, &file, container.format(), &decoders)
+                    .await;
+            }
             Some(Kind::Still(_)) if !self.inner.tools.has_ffmpeg() => {
                 return Outcome::None(NO_FFMPEG);
             }
@@ -2020,6 +2357,247 @@ impl Thumbnails {
         .await
     }
 
+    /// A song's cover art, shrunk, as a PNG, from ffmpeg reading it with only
+    /// the `demuxer`. `None` if it has none.
+    async fn cover(&self, file: &Path, demuxer: &str) -> Result<Option<Vec<u8>>, String> {
+        let decoders = format!("{SOUND_DECODERS},{COVER_DECODERS}");
+        if !self.tracks(file, demuxer, &decoders).await?.cover {
+            return Ok(None);
+        }
+        let png = self
+            .frame(file, &["-f", demuxer], &decoders, 0.0, false, THUMBNAIL)
+            .await?;
+        if png.is_empty() {
+            return Err("ffmpeg found no picture in the cover art".into());
+        }
+        Ok(Some(png))
+    }
+
+    /// A file's tracks, from ffprobe reading it with only the `demuxer` and
+    /// the `decoders`.
+    async fn tracks(&self, file: &Path, demuxer: &str, decoders: &str) -> Result<Tracks, String> {
+        let args = [
+            "-v",
+            "error",
+            "-protocol_whitelist",
+            "file",
+            "-f",
+            demuxer,
+            "-codec_whitelist",
+            decoders,
+            "-show_entries",
+            "stream=codec_type,codec_name,sample_rate,channels:\
+             stream_disposition=attached_pic:format=duration",
+            "-of",
+            "json",
+        ]
+        .map(OsString::from);
+        let args: Vec<OsString> = args.into_iter().chain([file.into()]).collect();
+        let input = std::fs::File::open("/dev/null").map_err(|err| err.to_string())?;
+        let output = self
+            .work(&self.inner.tools.ffprobe, &args, input, &[file.to_owned()])
+            .await?;
+        tracks(&output)
+    }
+
+    /// Converts a sound the browser can't play to AAC in MP4, which every
+    /// browser plays, and keeps it as its preview. ffmpeg reads the file
+    /// with only the `demuxer` and the `decoders`.
+    async fn listen(
+        &self,
+        hash: ContentHash,
+        file: &Path,
+        demuxer: &str,
+        decoders: &str,
+    ) -> Outcome {
+        let tracks = match self.tracks(file, demuxer, decoders).await {
+            Ok(tracks) => tracks,
+            Err(problem) => return Outcome::Failed(problem),
+        };
+        if tracks.video {
+            return Outcome::None("a video");
+        }
+        let Some(track) = tracks.sound else {
+            return Outcome::None("a file without sound");
+        };
+        let name = match self.name(hash).await {
+            Ok(name) => name.unwrap_or_default(),
+            Err(err) => return Outcome::Failed(format!("couldn't read the file's name: {err}")),
+        };
+        if plays(&name, &track.codec) {
+            return Outcome::None("the browser plays it");
+        }
+        self.keep_sound(hash, file, demuxer, decoders, &track, tracks.seconds)
+            .await
+    }
+
+    /// Converts a sound only SoX reads. SoX turns it into WAV in a scratch
+    /// folder, which ffmpeg converts as it does other sound. SoX stops a
+    /// second past the longest sound that gets a preview, so a longer one
+    /// takes no more room than that, and ffmpeg then finds it too long.
+    async fn old_sound(&self, hash: ContentHash, file: &Path, format: Sox) -> Outcome {
+        let scratch = match self.scratch_dir() {
+            Ok(scratch) => scratch,
+            Err(problem) => return Outcome::Failed(problem),
+        };
+        let wav = scratch.path().join("sound.wav");
+        let length = (MAX_SOUND_SECONDS + 1.0).to_string();
+        let args: Vec<OsString> = ["-V1", "--no-glob", "--single-threaded"]
+            .into_iter()
+            .chain(format.reader().iter().copied())
+            .map(OsString::from)
+            .chain([file.into()])
+            .chain(["-t", "wav", "-e", "signed-integer", "-b", "16"].map(OsString::from))
+            .chain([wav.clone().into()])
+            .chain(["trim", "0", &length].map(OsString::from))
+            .collect();
+        let input = match std::fs::File::open("/dev/null") {
+            Ok(input) => input,
+            Err(err) => return Outcome::Failed(err.to_string()),
+        };
+        let read = self
+            .inner
+            .sandbox
+            .run(Job {
+                program: &self.inner.tools.sox,
+                args: &args,
+                env: &[],
+                input,
+                read: &[file.to_owned()],
+                write: &[scratch.path().to_owned()],
+                sockets: None,
+                limits: SOUND_LIMITS,
+            })
+            .await;
+        if let Err(err) = read {
+            return Outcome::Failed(err.to_string());
+        }
+        // The worker could only make folders and plain files there.
+        if !wav
+            .symlink_metadata()
+            .is_ok_and(|found| found.is_file() && found.len() > 0)
+        {
+            return Outcome::Failed("SoX didn't read the sound".into());
+        }
+        let tracks = match self.tracks(&wav, "wav", "pcm_s16le").await {
+            Ok(tracks) => tracks,
+            Err(problem) => return Outcome::Failed(problem),
+        };
+        let Some(track) = tracks.sound else {
+            return Outcome::None("a file without sound");
+        };
+        self.keep_sound(hash, &wav, "wav", "pcm_s16le", &track, tracks.seconds)
+            .await
+    }
+
+    /// Converts the sound to AAC and keeps it as the preview, unless it's
+    /// longer than [`MAX_SOUND_SECONDS`].
+    async fn keep_sound(
+        &self,
+        hash: ContentHash,
+        file: &Path,
+        demuxer: &str,
+        decoders: &str,
+        track: &Track,
+        seconds: Option<f64>,
+    ) -> Outcome {
+        if seconds.is_some_and(|seconds| seconds > MAX_SOUND_SECONDS) {
+            return Outcome::None("a sound over 3 hours");
+        }
+        match self.convert(file, demuxer, decoders, track).await {
+            Ok(converted) => {
+                let path = self.sound_path(hash);
+                let kept =
+                    std::fs::create_dir_all(path.parent().expect("a preview is in a folder"))
+                        .and_then(|()| std::fs::rename(converted.path().join("sound.m4a"), &path));
+                match kept {
+                    Ok(()) => Outcome::Ready,
+                    Err(err) => Outcome::Failed(format!("couldn't keep the preview: {err}")),
+                }
+            }
+            Err(problem) => Outcome::Failed(problem),
+        }
+    }
+
+    /// Runs ffmpeg to convert the sound, and returns the scratch folder
+    /// with `sound.m4a` in it. MP4 keeps its index at the end unless it's
+    /// moved to the start, which needs a file, not the worker's output.
+    async fn convert(
+        &self,
+        file: &Path,
+        demuxer: &str,
+        decoders: &str,
+        track: &Track,
+    ) -> Result<tempfile::TempDir, String> {
+        let scratch = self.scratch_dir()?;
+        let sound = scratch.path().join("sound.m4a");
+        let rate = rate(track.rate).to_string();
+        let mut args: Vec<OsString> = [
+            "-nostdin",
+            "-v",
+            "error",
+            "-threads",
+            "2",
+            "-protocol_whitelist",
+            "file",
+            "-f",
+            demuxer,
+            "-codec_whitelist",
+            decoders,
+            "-i",
+        ]
+        .map(OsString::from)
+        .into_iter()
+        .chain([file.into()])
+        .chain(["-map", "0:a:0", "-vn", "-sn", "-dn", "-map_metadata", "-1"].map(OsString::from))
+        .collect();
+        // Surround sound is mixed down to stereo, which 128 kbit/s suits.
+        // The count is always given, since AAC can't take channels in an
+        // order the file doesn't say, as some Speex files have.
+        let channels = track.channels.clamp(1, 2).to_string();
+        args.extend(
+            [
+                "-ac",
+                &channels,
+                "-ar",
+                &rate,
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                "-movflags",
+                "+faststart",
+                "-f",
+                "mp4",
+            ]
+            .map(OsString::from),
+        );
+        args.push(sound.clone().into());
+        let input = std::fs::File::open("/dev/null").map_err(|err| err.to_string())?;
+        self.inner
+            .sandbox
+            .run(Job {
+                program: &self.inner.tools.ffmpeg,
+                args: &args,
+                env: &[],
+                input,
+                read: &[file.to_owned()],
+                write: &[scratch.path().to_owned()],
+                sockets: None,
+                limits: SOUND_LIMITS,
+            })
+            .await
+            .map_err(|err| err.to_string())?;
+        // The worker could only make folders and plain files there.
+        if !sound
+            .symlink_metadata()
+            .is_ok_and(|found| found.is_file() && found.len() > 0)
+        {
+            return Err("ffmpeg didn't convert the sound".into());
+        }
+        Ok(scratch)
+    }
+
     /// Keeps a worker's picture in a temporary file, for libvips to read.
     fn scratch(&self, picture: &[u8]) -> Result<std::fs::File, String> {
         tempfile::tempfile_in(self.inner.dir.join("partial"))
@@ -2077,8 +2655,21 @@ fn documents_unavailable(tools: &Tools) -> Option<String> {
 }
 
 /// Which pictures have no thumbnails here because a program isn't
-/// installed, and the packages that would give them one, as a sentence.
+/// installed, and which older sound files can't play, and the packages
+/// that would fix that, as sentences.
 fn pictures_unavailable(tools: &Tools) -> Option<String> {
+    let sounds = (!tools.has_sox()).then_some(
+        "Some older sound files, such as Yamaha TX16W samples, can't play. Install sox with apt \
+         to play them.",
+    );
+    let pictures = missing_pictures(tools);
+    match (pictures, sounds) {
+        (Some(pictures), Some(sounds)) => Some(format!("{pictures} {sounds}")),
+        (pictures, sounds) => pictures.or(sounds.map(str::to_owned)),
+    }
+}
+
+fn missing_pictures(tools: &Tools) -> Option<String> {
     let missing: Vec<(&str, &str)> = [
         (tools.has_libraw(), "camera raw photos", "libraw-bin"),
         (tools.has_rsvg(), "SVG drawings", "librsvg2-bin"),
@@ -2186,10 +2777,12 @@ fn file_url(path: &Path) -> String {
     url
 }
 
-/// Why videos have no thumbnails here, if that's the case.
+/// Why videos and songs have no thumbnails here, if that's the case.
 fn videos_unavailable(tools: &Tools) -> Option<String> {
     (!tools.has_ffmpeg()).then(|| {
-        "ffmpeg isn't installed. Install it with apt to show a frame from each video.".to_owned()
+        "ffmpeg isn't installed. Install it with apt to show a frame from each video and \
+         songs' cover art, and to play audio the browser can't."
+            .to_owned()
     })
 }
 
@@ -2207,6 +2800,82 @@ fn probe(output: &[u8]) -> Result<Probe, String> {
             .filter(|seconds| seconds.is_finite() && *seconds > 0.0),
         hdr: matches!(transfer, Some("smpte2084" | "arib-std-b67")),
     })
+}
+
+/// What ffprobe's JSON says about a file's tracks.
+fn tracks(output: &[u8]) -> Result<Tracks, String> {
+    let json: serde_json::Value = serde_json::from_slice(output)
+        .map_err(|err| format!("ffprobe's answer wasn't JSON: {err}"))?;
+    let streams = json["streams"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let video = |cover: bool| {
+        streams.iter().any(|stream| {
+            stream["codec_type"] == "video" && (stream["disposition"]["attached_pic"] == 1) == cover
+        })
+    };
+    let sound = streams
+        .iter()
+        .find(|stream| stream["codec_type"] == "audio")
+        .map(|stream| Track {
+            codec: stream["codec_name"].as_str().unwrap_or_default().to_owned(),
+            rate: stream["sample_rate"]
+                .as_str()
+                .and_then(|rate| rate.parse().ok())
+                .unwrap_or_default(),
+            channels: stream["channels"]
+                .as_u64()
+                .and_then(|channels| u32::try_from(channels).ok())
+                .unwrap_or_default(),
+        });
+    Ok(Tracks {
+        sound,
+        cover: video(true),
+        video: video(false),
+        seconds: json["format"]["duration"]
+            .as_str()
+            .and_then(|seconds| seconds.parse::<f64>().ok())
+            .filter(|seconds| seconds.is_finite() && *seconds > 0.0),
+    })
+}
+
+/// Whether the browser plays a sound file named `name`, whose sound is in
+/// `codec`, as Drive sends it: as the type its name says. These are the
+/// names Drive plays, and the codecs browsers play in each.
+fn plays(name: &str, codec: &str) -> bool {
+    let extension = name
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    match extension.as_str() {
+        "mp3" => codec == "mp3",
+        "m4a" | "m4b" | "m4r" | "aac" => codec == "aac",
+        // Drive sends these as video, which plays sound on its own too.
+        "mp4" | "m4v" | "mov" => matches!(codec, "aac" | "mp3"),
+        "webm" => matches!(codec, "opus" | "vorbis"),
+        "ogg" | "oga" | "opus" => matches!(codec, "vorbis" | "opus" | "flac"),
+        "flac" => codec == "flac",
+        "wav" => matches!(
+            codec,
+            "pcm_u8" | "pcm_s16le" | "pcm_s24le" | "pcm_s32le" | "pcm_f32le"
+        ),
+        _ => false,
+    }
+}
+
+/// The sample rate for a converted sound: the sound's own, if AAC has it
+/// and it isn't more than people hear, or else the nearest common one.
+fn rate(rate: u32) -> u32 {
+    const AAC: [u32; 12] = [
+        8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000, 64000, 88200, 96000,
+    ];
+    match rate {
+        rate if rate <= 48000 && AAC.contains(&rate) => rate,
+        // Such as DSD, at 64 times a CD's 44,100.
+        rate if rate > 0 && rate % 11025 == 0 => 44100,
+        _ => 48000,
+    }
 }
 
 /// What kind of file this is, from its first bytes, its size, and those
@@ -2272,6 +2941,30 @@ fn kind(head: &[u8], whole: bool) -> Option<Kind> {
     if let Some(container) = container(head) {
         return Some(Kind::Video(container));
     }
+    if let Some(sound) = sound(head, whole) {
+        return Some(Kind::Audio(sound));
+    }
+    // Known by their first bytes, since SoundTool files are often named
+    // `.snd` and TX16W sounds `.w01`, and other programs use `.paf`,
+    // `.smp`, and `.wve` for their own files.
+    let old = if starts(b"SOUND\x1a") {
+        Some(Sox::Sndt)
+    } else if starts(b"LM8953\0") {
+        Some(Sox::Txw)
+    } else if starts(b" paf\0") || starts(b"fap \0") {
+        Some(Sox::Paris)
+    } else if starts(b"SOUND SAMPLE DATA ") {
+        Some(Sox::SampleVision)
+    } else if starts(b"ALawSoundFile**") {
+        Some(Sox::Psion)
+    } else {
+        None
+    };
+    if let Some(old) = old
+        && !is_text(head, whole)
+    {
+        return Some(Kind::Sox(old));
+    }
     // SVG is text, so it's checked before text is.
     if svg(head) {
         return Some(Kind::Svg);
@@ -2315,6 +3008,9 @@ fn container(head: &[u8]) -> Option<Container> {
     if head.starts_with(b"FLV\x01") {
         return Some(Container::Flv);
     }
+    if head.starts_with(b".RMF\0\0\0") {
+        return Some(Container::RealMedia);
+    }
     // Ogg is mostly songs, so only a file whose first track is Theora,
     // which names itself in the first page, is a video.
     if head.starts_with(b"OggS") && at(0..head.len().min(128)).is_some_and(theora) {
@@ -2325,6 +3021,176 @@ fn container(head: &[u8]) -> Option<Container> {
     let packets =
         |first: usize, size: usize| (0..3).all(|n| head.get(first + n * size) == Some(&0x47));
     (packets(0, 188) || packets(4, 192)).then_some(Container::MpegTs)
+}
+
+/// The sound format that starts with `head`, which is `whole` if it's the
+/// entire file, if it's one with a signature. Most signatures are letters,
+/// such as "MAC ", so they only count when the file isn't text, as a sound
+/// file's header has numbers in it and is followed by its sound.
+fn sound(head: &[u8], whole: bool) -> Option<Sound> {
+    const W64: &[u8] = b"riff\x2e\x91\xcf\x11\xa5\xd6\x28\xdb\x04\xc1\x00\x00";
+    const MP4: [&[u8; 4]; 3] = [b"M4A ", b"M4B ", b"M4P "];
+    const IRCAM: [[u8; 4]; 8] = [
+        [0x64, 0xa3, 0x01, 0x00],
+        [0x64, 0xa3, 0x02, 0x00],
+        [0x64, 0xa3, 0x03, 0x00],
+        [0x64, 0xa3, 0x04, 0x00],
+        [0x00, 0x01, 0xa3, 0x64],
+        [0x00, 0x02, 0xa3, 0x64],
+        [0x00, 0x03, 0xa3, 0x64],
+        [0x00, 0x04, 0xa3, 0x64],
+    ];
+    const DTS: [[u8; 4]; 4] = [
+        [0x7f, 0xfe, 0x80, 0x01],
+        [0xfe, 0x7f, 0x01, 0x80],
+        [0x1f, 0xff, 0xe8, 0x00],
+        [0xff, 0x1f, 0x00, 0xe8],
+    ];
+    let starts = |magic: &[u8]| head.starts_with(magic);
+    let at = |range: std::ops::Range<usize>| head.get(range);
+    // ID3 tags, then a version from 2 to 4, and a size of 7-bit bytes.
+    let id3 = starts(b"ID3")
+        && matches!(head.get(3), Some(2..=4))
+        && at(6..10).is_some_and(|size| size.iter().all(|byte| *byte < 0x80));
+    let found = if id3 {
+        Sound::Mpeg
+    } else if starts(b"fLaC") {
+        Sound::Flac
+    } else if starts(b"OggS") {
+        Sound::Ogg
+    } else if (starts(b"RIFF") || starts(b"RF64") || starts(b"BW64")) && at(8..12) == Some(b"WAVE")
+    {
+        Sound::Wav
+    } else if starts(W64) {
+        Sound::Wave64
+    } else if starts(b"FORM") && matches!(at(8..12), Some(b"AIFF" | b"AIFC")) {
+        Sound::Aiff
+    } else if (starts(b"FORM") && matches!(at(8..12), Some(b"8SVX" | b"16SV" | b"MAUD")))
+        || (starts(b"FRM8") && at(12..16) == Some(b"DSD "))
+    {
+        Sound::Iff
+    } else if starts(b"DSD ") && at(4..12) == Some(&28u64.to_le_bytes()) {
+        Sound::Dsf
+    } else if starts(b"MAC ") {
+        Sound::Ape
+    } else if starts(b"wvpk") {
+        Sound::WavPack
+    } else if starts(b"TTA1") {
+        Sound::Tta
+    } else if starts(b".snd") {
+        Sound::Au
+    } else if starts(b"caff") {
+        Sound::Caf
+    } else if starts(b"#!AMR\n") || starts(b"#!AMR-WB\n") {
+        Sound::Amr
+    } else if starts(b".ra\xfd") {
+        Sound::RealAudio
+    } else if starts(b"Creative Voice File\x1a") {
+        Sound::Voc
+    } else if IRCAM.iter().any(|magic| starts(magic)) {
+        Sound::Ircam
+    } else if starts(b"NIST_1A\n") {
+        Sound::Nist
+    } else if starts(b"2BIT")
+        && matches!(at(12..14), Some([0, 0] | [0xff, 0xff]))
+        && matches!(at(14..16), Some([0, 8] | [0, 16]))
+    {
+        Sound::Avr
+    } else if at(65..69) == Some(b"FSSD") && at(128..132) == Some(b"HCOM") {
+        Sound::Hcom
+    } else if starts(b"PVF1\n") || starts(b"PVF2\n") {
+        Sound::Pvf
+    } else if DTS.iter().any(|magic| starts(magic)) {
+        Sound::Dts
+    } else if starts(b"Extended Module: ") || starts(b"IMPM") || at(44..48) == Some(b"SCRM") {
+        Sound::Module
+    } else if at(4..8) == Some(b"ftyp")
+        && at(8..12).is_some_and(|brand| MP4.iter().any(|known| brand == *known))
+    {
+        Sound::Mp4
+    } else {
+        return None;
+    };
+    (!is_text(head, whole)).then_some(found)
+}
+
+/// A sound without a signature, known by its name, if its first bytes
+/// fit the format.
+fn unsigned_sound(extension: &str, head: &[u8]) -> Option<Sound> {
+    let byte = |index: usize| head.get(index).copied().unwrap_or_default();
+    // MPEG audio frames start with 11 bits set, then a version, a layer,
+    // a bit rate, and a sample rate, each of which has a value it can't be.
+    let mpeg = byte(0) == 0xff
+        && byte(1) & 0xe0 == 0xe0
+        && (byte(1) >> 3) & 3 != 1
+        && (byte(1) >> 1) & 3 != 0
+        && byte(2) >> 4 != 0xf
+        && (byte(2) >> 2) & 3 != 3;
+    // AAC frames start the same way, with a layer of 0.
+    let adts = byte(0) == 0xff && byte(1) & 0xf6 == 0xf0;
+    let dolby = head.starts_with(&[0x0b, 0x77]);
+    // A module's four letters after its 31 instruments, such as "M.K.".
+    let module = head.get(1080..1084).is_some_and(|tag| {
+        matches!(tag, b"M.K." | b"M!K!" | b"M&K!" | b"FLT4" | b"FLT8")
+            || (tag[0].is_ascii_digit() && &tag[1..] == b"CHN")
+            || (tag[..2].iter().all(u8::is_ascii_digit) && &tag[2..] == b"CH")
+    });
+    match extension {
+        "mp3" | "mp2" | "mp1" | "mpa" | "mpga" if mpeg => Some(Sound::Mpeg),
+        "aac" if adts => Some(Sound::Adts),
+        // Dolby Digital Plus says so with a stream version over 10.
+        "ac3" | "eac3" | "ec3" if dolby && byte(5) >> 3 > 10 => Some(Sound::Eac3),
+        "ac3" if dolby => Some(Sound::Ac3),
+        "mod" if module => Some(Sound::Module),
+        _ => None,
+    }
+}
+
+/// An older sound only SoX reads that has no signature, known by its name,
+/// if its first bytes fit the format. Formats without a header can be any
+/// bytes, but aren't text, which [`kind`] has already ruled out.
+fn unsigned_sox(extension: &str, head: &[u8]) -> Option<Sox> {
+    let at = |range: std::ops::Range<usize>| head.get(range);
+    let little = |offset: usize| {
+        at(offset..offset + 2).map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+    };
+    // A DVMS header's last field is the sum of its other bytes, which SoX
+    // checks too.
+    let dvms = at(0..120).is_some_and(|header| {
+        let sum = header[..117]
+            .iter()
+            .fold(0u16, |sum, byte| sum.wrapping_add(u16::from(*byte)));
+        sum != 0 && little(118) == Some(sum)
+    });
+    // A ringtone's size in 16-bit words comes first, and its header alone
+    // is 512 bytes.
+    let gsrt = at(0..4)
+        .is_some_and(|size| u32::from_be_bytes([size[0], size[1], size[2], size[3]]) >= 256);
+    // Sounder's header is a zero, then the sample rate.
+    let sndr = little(0) == Some(0) && little(2).is_some_and(|rate| rate >= 1000);
+    // HTK's header ends with 2-byte samples and the kind of data, where
+    // sound is 0, after the time between samples in 100 ns, which is at
+    // most 10,000 for 1 kHz.
+    let big = |offset: usize| {
+        at(offset..offset + 4)
+            .map(|bytes| u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    };
+    let htk = big(4).is_some_and(|period| (1..=10_000).contains(&period))
+        && at(8..12) == Some(&[0, 2, 0, 0]);
+    match extension {
+        "cdda" => Some(Sox::Cdda),
+        "cvsd" | "cvs" => Some(Sox::Cvsd),
+        "cvu" => Some(Sox::Cvu),
+        "dvms" | "vms" if dvms => Some(Sox::Dvms),
+        "fssd" | "sou" => Some(Sox::Fssd),
+        "gsrt" if gsrt => Some(Sox::Gsrt),
+        "sndr" if sndr => Some(Sox::Sndr),
+        "htk" if htk => Some(Sox::Htk),
+        // MagicaVoxel's 3D models are `.vox` files too.
+        "vox" if !head.starts_with(b"VOX ") => Some(Sox::Vox),
+        "sd2" => Some(Sox::Sd2),
+        _ => None,
+    }
 }
 
 /// How every ASF file starts: the GUID of its header.
@@ -2438,7 +3304,10 @@ fn named(name: &str, head: &[u8], kind: Option<Kind>) -> Option<Kind> {
             Some(Kind::Raw)
         }
         None if extension == "svgz" && head.starts_with(b"\x1f\x8b") => Some(Kind::Svg),
-        None => unsigned_still(name, head).map(Kind::Still),
+        None => unsigned_still(name, head)
+            .map(Kind::Still)
+            .or_else(|| unsigned_sound(&extension, head).map(Kind::Audio))
+            .or_else(|| unsigned_sox(&extension, head).map(Kind::Sox)),
         kind => kind,
     }
 }
@@ -2734,7 +3603,7 @@ mod tests {
             kind(b"\0\0\0\x18ftypmp42\0\0\0\0"),
             Some(Kind::Video(Container::Mov))
         );
-        assert_eq!(kind(b"RIFF\0\0\0\0WAVEfmt "), None);
+        assert_eq!(kind(b"RIFF\0\0\0\0WAVEfmt "), Some(Kind::Audio(Sound::Wav)));
         assert_eq!(kind(b"PK\x03\x04"), None);
         assert_eq!(kind(b""), None);
         assert_eq!(kind(b"Pick up the bread.\n"), Some(Kind::Text));
@@ -2953,23 +3822,37 @@ mod tests {
             simple_dcraw: "/nowhere/simple_dcraw".into(),
             rsvg_convert: "/nowhere/rsvg-convert".into(),
             ddjvu: "/nowhere/ddjvu".into(),
+            sox: "/nowhere/sox".into(),
             ..Tools::installed("/nowhere/accordion")
         };
         assert_eq!(
             pictures_unavailable(&missing).unwrap(),
             "Camera raw photos, SVG drawings, and DjVu books show an icon instead. Install \
              libraw-bin, librsvg2-bin, and djvulibre-bin with apt to give them thumbnails and \
-             previews."
+             previews. Some older sound files, such as Yamaha TX16W samples, can't play. \
+             Install sox with apt to play them."
         );
         let one = Tools {
             simple_dcraw: "/usr/bin/true".into(),
             rsvg_convert: "/usr/bin/true".into(),
-            ..missing
+            sox: "/usr/bin/true".into(),
+            ..missing.clone()
         };
         assert_eq!(
             pictures_unavailable(&one).unwrap(),
             "DjVu books show an icon instead. Install djvulibre-bin with apt to give them \
              thumbnails and previews."
+        );
+        let sounds = Tools {
+            simple_dcraw: "/usr/bin/true".into(),
+            rsvg_convert: "/usr/bin/true".into(),
+            ddjvu: "/usr/bin/true".into(),
+            ..missing
+        };
+        assert_eq!(
+            pictures_unavailable(&sounds).unwrap(),
+            "Some older sound files, such as Yamaha TX16W samples, can't play. Install sox \
+             with apt to play them."
         );
     }
 
@@ -3045,6 +3928,260 @@ mod tests {
         let song = br#"{"streams": [], "format": {"duration": "2.000000"}}"#;
         assert!(!probe(song).unwrap().video);
         assert!(probe(b"not json").is_err());
+    }
+
+    #[test]
+    fn knows_sound_files_by_their_first_bytes() {
+        let sound = |head: &[u8]| match kind(head, false) {
+            Some(Kind::Audio(sound)) => Some(sound),
+            _ => None,
+        };
+        assert_eq!(sound(b"ID3\x04\0\0\0\0\0#TSSE"), Some(Sound::Mpeg));
+        assert_eq!(sound(b"fLaC\0\0\0\x22\x12\0"), Some(Sound::Flac));
+        assert_eq!(
+            sound(b"OggS\0\x02\0\0\0\0\0\0\0\0\x01\x1evorbis"),
+            Some(Sound::Ogg)
+        );
+        assert_eq!(sound(b"RIFFr\xb4\x1c\x01WAVEfmt "), Some(Sound::Wav));
+        assert_eq!(sound(b"RF64\xff\xff\xff\xffWAVEds64"), Some(Sound::Wav));
+        assert_eq!(
+            sound(b"riff\x2e\x91\xcf\x11\xa5\xd6\x28\xdb\x04\xc1\0\0\x2e\x91\x1c\x01"),
+            Some(Sound::Wave64)
+        );
+        assert_eq!(sound(b"FORM\x01\x1c\xb4ZAIFFCOMM"), Some(Sound::Aiff));
+        assert_eq!(sound(b"FORM\0\x8ek\\8SVXVHDR"), Some(Sound::Iff));
+        assert_eq!(sound(b"FORM\x01\x1c\xd6PMAUDMHDR"), Some(Sound::Iff));
+        assert_eq!(sound(b"FRM8\0\0\0\0\0\0\x10\0DSD FVER"), Some(Sound::Iff));
+        assert_eq!(sound(b"DSD \x1c\0\0\0\0\0\0\0"), Some(Sound::Dsf));
+        assert_eq!(sound(b"MAC \x96\x0f\0\0"), Some(Sound::Ape));
+        assert_eq!(sound(b"wvpk\xb4v\0\0"), Some(Sound::WavPack));
+        assert_eq!(sound(b"TTA1\x01\0\x02\0"), Some(Sound::Tta));
+        assert_eq!(sound(b".snd\0\0\0 \x01\x1c"), Some(Sound::Au));
+        assert_eq!(sound(b"caff\0\x01\0\0desc"), Some(Sound::Caf));
+        assert_eq!(sound(b"#!AMR\n\x3c\x91\x17\x16"), Some(Sound::Amr));
+        assert_eq!(sound(b".ra\xfd\0\x04\0\0"), Some(Sound::RealAudio));
+        assert_eq!(sound(b"Creative Voice File\x1a\x1a\0"), Some(Sound::Voc));
+        assert_eq!(sound(b"d\xa3\x01\0\0D,G"), Some(Sound::Ircam));
+        assert_eq!(sound(b"NIST_1A\n   1024\n\0\x01\x02"), Some(Sound::Nist));
+        assert_eq!(
+            sound(b"2BIT\0\0\0\0\0\0\0\0\xff\xff\0\x10"),
+            Some(Sound::Avr)
+        );
+        assert_eq!(sound(b"PVF1\n2 44100 16\n\x80\0\x7f"), Some(Sound::Pvf));
+        assert_eq!(sound(b"\x7f\xfe\x80\x01\xfc<\x7f\xf0"), Some(Sound::Dts));
+        assert_eq!(sound(b"Extended Module: tune\x1a"), Some(Sound::Module));
+        assert_eq!(sound(b"IMPMtune\0\0\0\0"), Some(Sound::Module));
+        assert_eq!(sound(b"\0\0\0\x18ftypM4A \0\0\0\0"), Some(Sound::Mp4));
+        let mut hcom = vec![0; 132];
+        hcom[65..69].copy_from_slice(b"FSSD");
+        hcom[128..132].copy_from_slice(b"HCOM");
+        assert_eq!(sound(&hcom), Some(Sound::Hcom));
+        let mut s3m = vec![0; 48];
+        s3m[44..48].copy_from_slice(b"SCRM");
+        assert_eq!(sound(&s3m), Some(Sound::Module));
+
+        // Ogg with Theora is a video, and RealMedia may be either.
+        assert_eq!(
+            kind(b"OggS\0\x02\0\0\0\0\0\0\0\0\x01\x1e\x80theora", false),
+            Some(Kind::Video(Container::Ogg))
+        );
+        assert_eq!(
+            kind(b".RMF\0\0\0\x12\0\0", false),
+            Some(Kind::Video(Container::RealMedia))
+        );
+        // Text that starts with the same letters stays text.
+        for text in [
+            &b"2BIT is how many bits\n"[..],
+            b"PVF1\nis the first version\n",
+            b"IMPMENTATION notes\n",
+            b"NIST_1A\nheader only\n",
+            b"#!AMR\nnot really\n",
+            b"MAC address of the router\n",
+            b"ID3 tags hold a song's name\n",
+            b"caffeine free\n",
+            b"fLaC is a typo\n",
+        ] {
+            assert_eq!(kind(text, true), Some(Kind::Text), "{text:?}");
+        }
+    }
+
+    #[test]
+    fn knows_sound_files_without_a_signature_by_name() {
+        let mp2 = b"\xff\xfd\xe0\x04\x99ffwf";
+        assert_eq!(kind(mp2, false), None);
+        assert_eq!(named("song.mp2", mp2, None), Some(Kind::Audio(Sound::Mpeg)));
+        assert_eq!(
+            named("song.mp3", b"\xff\xfb\x90\x64\0", None),
+            Some(Kind::Audio(Sound::Mpeg))
+        );
+        // A bit rate of all ones isn't one.
+        assert_eq!(named("song.mp3", b"\xff\xfb\xf0\x64\0", None), None);
+        assert_eq!(
+            named("song.aac", b"\xff\xf1P\x80\x03\xff", None),
+            Some(Kind::Audio(Sound::Adts))
+        );
+        assert_eq!(
+            named("film.ac3", b"\x0bw4\x0fT@C\xe1", None),
+            Some(Kind::Audio(Sound::Ac3))
+        );
+        assert_eq!(
+            named("film.ec3", b"\x0bw\x01\x7f\x3f\x86\xff", None),
+            Some(Kind::Audio(Sound::Eac3))
+        );
+        assert_eq!(named("notes.mp3", b"\x0bw4\x0fT@C\xe1", None), None);
+        let mut module = vec![0; 1084];
+        module[1080..].copy_from_slice(b"M.K.");
+        assert_eq!(
+            named("tune.mod", &module, None),
+            Some(Kind::Audio(Sound::Module))
+        );
+        module[1080..].copy_from_slice(b"8CHN");
+        assert_eq!(
+            named("tune.MOD", &module, None),
+            Some(Kind::Audio(Sound::Module))
+        );
+        module[1080..].copy_from_slice(b"none");
+        assert_eq!(named("tune.mod", &module, None), None);
+    }
+
+    #[test]
+    fn knows_older_sound_files_only_sox_reads() {
+        // SoX's own headers, as it writes them.
+        let sndt = b"SOUND\x1a\0\0\x805G\0\0\0\0\0\x805G\0D\xac\0\0\n\0\x04\0Processed by SoX";
+        assert_eq!(kind(sndt, false), Some(Kind::Sox(Sox::Sndt)));
+        let txw = b"LM8953\0\0\0\0\0\0\0\0\0\0\0\0\x7f\x7f\x7f\x7f\xc9\x02";
+        assert_eq!(kind(txw, false), Some(Kind::Sox(Sox::Txw)));
+        assert_eq!(kind(b"SOUND CHECK at 9", true), Some(Kind::Text));
+        for (head, format) in [
+            (&b" paf\0\0\0\0\0\0\0\0\0\0\xacD"[..], Sox::Paris),
+            (b"fap \0\0\0\0\x01\0\0\0D\xac\0\0", Sox::Paris),
+            (
+                b"SOUND SAMPLE DATA 2.1 Converted using Sox.\0\x01",
+                Sox::SampleVision,
+            ),
+            (b"ALawSoundFile**\0\x0f\x10\0\x0c", Sox::Psion),
+        ] {
+            assert_eq!(kind(head, false), Some(Kind::Sox(format)), "{format:?}");
+        }
+        // A family tree named `.paf` stays as it is.
+        assert_eq!(named("family.paf", b"\x03\x81\x02\xff", None), None);
+
+        let htk = b"\0G5\x80\0\0\0\xe3\0\x02\0\0\xff\xff\0\0";
+        assert_eq!(named("speech.htk", htk, None), Some(Kind::Sox(Sox::Htk)));
+        // Speech features, not sound.
+        let features = b"\0\0\x01\0\0\x01\x86\xa0\0\x34\0\x06";
+        assert_eq!(named("speech.htk", features, None), None);
+        assert_eq!(
+            named("call.vox", b"\x08\x08\x80\x08", None),
+            Some(Kind::Sox(Sox::Vox))
+        );
+        assert_eq!(named("castle.vox", b"VOX \x96\0\0\0MAIN", None), None);
+
+        let sndr = b"\0\0\x44\xac\x0a\0\x04\0\x80\x80\x81\x80";
+        assert_eq!(named("bell.sndr", sndr, None), Some(Kind::Sox(Sox::Sndr)));
+        assert_eq!(named("bell.sndr", b"\x80\x80\x81\x80", None), None);
+
+        let mut dvms = vec![0u8; 140];
+        dvms[..13].copy_from_slice(b"/home/vagrant");
+        dvms[38..54].copy_from_slice(b"Processed by SoX");
+        let sum = dvms[..117]
+            .iter()
+            .fold(0u16, |sum, byte| sum.wrapping_add(u16::from(*byte)));
+        dvms[118..120].copy_from_slice(&sum.to_le_bytes());
+        assert_eq!(named("call.dvms", &dvms, None), Some(Kind::Sox(Sox::Dvms)));
+        dvms[118] ^= 1;
+        assert_eq!(named("call.dvms", &dvms, None), None);
+        // A header of zeros adds up to zero, but isn't one.
+        assert_eq!(named("call.dvms", &[0; 140], None), None);
+
+        let mut ring = vec![0u8; 600];
+        ring[..4].copy_from_slice(&32768u32.to_be_bytes());
+        ring[16..24].copy_from_slice(b"ring.bin");
+        assert_eq!(named("ring.gsrt", &ring, None), Some(Kind::Sox(Sox::Gsrt)));
+        assert_eq!(named("ring.gsrt", &[0; 600], None), None);
+
+        // Formats without a header are known by their name alone.
+        let noise = b"\x58\xa6\xa5\x59\x5a\xa6\x65\x66";
+        for (name, format) in [
+            ("track.cdda", Sox::Cdda),
+            ("radio.cvsd", Sox::Cvsd),
+            ("radio.CVU", Sox::Cvu),
+            ("radio.cvs", Sox::Cvsd),
+            ("clip.fssd", Sox::Fssd),
+            ("clip.sou", Sox::Fssd),
+            ("take.sd2", Sox::Sd2),
+        ] {
+            assert_eq!(named(name, noise, None), Some(Kind::Sox(format)), "{name}");
+        }
+        // CorelDRAW's `.cdr` isn't CD audio, and `.ima` is mostly floppy
+        // disk images, though SoX reads both as sound.
+        assert_eq!(named("logo.cdr", noise, None), None);
+        assert_eq!(named("disk.ima", noise, None), None);
+    }
+
+    #[test]
+    fn reads_what_ffprobe_says_about_tracks() {
+        let song = br#"{"streams": [
+            {"codec_name": "mp3", "codec_type": "audio", "sample_rate": "44100", "channels": 2,
+             "disposition": {"attached_pic": 0}},
+            {"codec_name": "mjpeg", "codec_type": "video", "disposition": {"attached_pic": 1}}
+        ], "format": {"duration": "105.772948"}}"#;
+        assert_eq!(
+            tracks(song).unwrap(),
+            Tracks {
+                sound: Some(Track {
+                    codec: "mp3".into(),
+                    rate: 44100,
+                    channels: 2
+                }),
+                cover: true,
+                video: false,
+                seconds: Some(105.772948),
+            }
+        );
+        let film = br#"{"streams": [
+            {"codec_name": "h264", "codec_type": "video", "disposition": {"attached_pic": 0}},
+            {"codec_name": "ac3", "codec_type": "audio", "sample_rate": "48000", "channels": 6,
+             "disposition": {"attached_pic": 0}}
+        ], "format": {}}"#;
+        let film = tracks(film).unwrap();
+        assert!(film.video && !film.cover);
+        assert_eq!(film.sound.unwrap().channels, 6);
+        assert_eq!(tracks(br#"{"streams": []}"#).unwrap(), Tracks::default());
+        assert!(tracks(b"not json").is_err());
+    }
+
+    #[test]
+    fn converts_only_what_browsers_cant_play() {
+        assert!(plays("Song.MP3", "mp3"));
+        assert!(plays("Song.m4a", "aac"));
+        assert!(plays("Ringtone.m4r", "aac"));
+        assert!(plays("Song.opus", "opus"));
+        assert!(plays("Song.oga", "flac"));
+        assert!(plays("Take 1.wav", "pcm_s16le"));
+        // Apple Lossless, MP2 named as MP3, and telephone WAV files aren't
+        // what browsers play, nor any name Drive doesn't send as sound.
+        assert!(!plays("Song.m4a", "alac"));
+        assert!(!plays("Song.mp3", "mp2"));
+        assert!(!plays("Call.wav", "adpcm_ms"));
+        assert!(!plays("Speech.spx", "speex"));
+        assert!(!plays("Song.ogg", "speex"));
+        assert!(!plays("Ambisonic.amb", "pcm_s16le"));
+        assert!(!plays("Song.wma", "wmav2"));
+        assert!(!plays("Song", "mp3"));
+    }
+
+    #[test]
+    fn keeps_a_sample_rate_aac_has() {
+        assert_eq!(rate(44100), 44100);
+        assert_eq!(rate(8000), 8000);
+        assert_eq!(rate(22050), 22050);
+        // More than people hear, and DSD, at 64 times a CD's rate.
+        assert_eq!(rate(96000), 48000);
+        assert_eq!(rate(2_822_400), 44100);
+        assert_eq!(rate(352_800), 44100);
+        assert_eq!(rate(6000), 48000);
+        assert_eq!(rate(0), 48000);
     }
 
     #[test]

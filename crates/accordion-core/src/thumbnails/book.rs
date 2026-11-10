@@ -1,7 +1,7 @@
 //! Reads an e-book's cover and details: its title, authors, description,
 //! and table of contents. EPUB is a zip file of XML, FictionBook is one XML
-//! file, and Mobipocket and Kindle books are Palm databases, so this needs
-//! no e-book program. It runs in the sandbox, as
+//! file, Mobipocket and Kindle books are Palm databases, and a comic book is
+//! a zip file of pictures, so this needs no e-book program. It runs in the sandbox, as
 //! `<server> book <format> cover|details`, with the book on standard input,
 //! because the files are untrusted (decision 1).
 //!
@@ -30,6 +30,8 @@ pub(crate) enum Format {
     Mobi,
     /// FictionBook, `.fb2`.
     Fb2,
+    /// A comic book: a zip file of its pages as pictures, `.cbz`.
+    Comic,
 }
 
 impl Format {
@@ -38,11 +40,12 @@ impl Format {
             Self::Epub => "epub",
             Self::Mobi => "mobi",
             Self::Fb2 => "fb2",
+            Self::Comic => "cbz",
         }
     }
 
     fn parse(text: &str) -> Option<Self> {
-        [Self::Epub, Self::Mobi, Self::Fb2]
+        [Self::Epub, Self::Mobi, Self::Fb2, Self::Comic]
             .into_iter()
             .find(|format| format.as_str() == text)
     }
@@ -124,11 +127,11 @@ pub(crate) struct Book {
 pub fn main(mut args: impl Iterator<Item = std::ffi::OsString>) -> i32 {
     let mut next = || args.next().and_then(|arg| arg.into_string().ok());
     let (Some(format), Some(part)) = (next().as_deref().and_then(Format::parse), next()) else {
-        eprintln!("Usage: {COMMAND} epub|mobi|fb2 cover|details");
+        eprintln!("Usage: {COMMAND} epub|mobi|fb2|cbz cover|details");
         return 2;
     };
     if part != "cover" && part != "details" {
-        eprintln!("Usage: {COMMAND} epub|mobi|fb2 cover|details");
+        eprintln!("Usage: {COMMAND} epub|mobi|fb2|cbz cover|details");
         return 2;
     }
     // Standard input is the stored file itself, so it can be read in any
@@ -166,6 +169,7 @@ pub(crate) fn read(format: Format, file: impl Read + Seek) -> Result<Book, Strin
         Format::Epub => epub(file),
         Format::Mobi => mobi(file),
         Format::Fb2 => fb2(file),
+        Format::Comic => comic(file),
     }
 }
 
@@ -673,6 +677,112 @@ fn parse(xml: &str) -> Element {
         close(&mut open);
     }
     open.pop().expect("the root stays")
+}
+
+// Comic books
+
+/// Reads a comic book. Its cover is its first page, or the page its
+/// `ComicInfo.xml` calls the front cover, and its details are in that file,
+/// if it has one, as comic book apps write it.
+fn comic(file: impl Read + Seek) -> Result<Book, String> {
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|err| format!("isn't a zip file: {err}"))?;
+    let mut pages: Vec<String> = archive
+        .file_names()
+        .filter_map(Result::ok)
+        .filter(|name| {
+            let file = name.rsplit('/').next().unwrap_or_default();
+            let extension = file
+                .rsplit_once('.')
+                .map(|(_, extension)| extension.to_ascii_lowercase());
+            // macOS leaves copies of each file's metadata, named as hidden.
+            !name.starts_with("__MACOSX/")
+                && !file.starts_with('.')
+                && matches!(
+                    extension.as_deref(),
+                    Some("jpg" | "jpeg" | "png" | "gif" | "webp")
+                )
+        })
+        .map(Cow::into_owned)
+        .collect();
+    pages.sort_by(|a, b| natural(a, b));
+
+    let mut details = Details::default();
+    let mut cover_page = 0;
+    let info = archive
+        .file_names()
+        .filter_map(Result::ok)
+        .find(|name| name.eq_ignore_ascii_case("ComicInfo.xml"))
+        .map(Cow::into_owned);
+    if let Some(info) = info
+        && let Some(info) = part(&mut archive, &info)?
+    {
+        let info = parse(&info);
+        let field = |name: &str| info.find(name).and_then(|field| line(&field.text()));
+        let issue = match (field("Series"), field("Number")) {
+            (Some(series), Some(number)) => Some(format!("{series} #{number}")),
+            (series, _) => series,
+        };
+        details.title = field("Title").or(issue);
+        details.authors = field("Writer")
+            .map(|writers| writers.split(',').filter_map(line).collect())
+            .unwrap_or_default();
+        details.authors.truncate(MAX_AUTHORS);
+        details.description = info
+            .find("Summary")
+            .and_then(|summary| paragraphs(&plain(&summary.text())));
+        cover_page = info
+            .all("Page")
+            .into_iter()
+            .find(|page| {
+                page.attribute("Type")
+                    .is_some_and(|kind| kind.split_whitespace().any(|kind| kind == "FrontCover"))
+            })
+            .and_then(|page| page.attribute("Image")?.parse().ok())
+            .filter(|page| *page < pages.len())
+            .unwrap_or(0);
+    }
+    let cover = match pages.get(cover_page) {
+        Some(page) => entry(&mut archive, page, MAX_COVER)?.filter(|cover| picture(cover)),
+        None => None,
+    };
+    Ok(Book { details, cover })
+}
+
+/// Orders names as people do, with numbers by their value, so page 2 comes
+/// before page 10.
+fn natural(a: &str, b: &str) -> std::cmp::Ordering {
+    let (mut a, mut b) = (a.as_bytes(), b.as_bytes());
+    loop {
+        match (a.first(), b.first()) {
+            (None, None) => return std::cmp::Ordering::Equal,
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+            (Some(x), Some(y)) if x.is_ascii_digit() && y.is_ascii_digit() => {
+                let digits = |text: &[u8]| text.iter().take_while(|c| c.is_ascii_digit()).count();
+                let (x_end, y_end) = (digits(a), digits(b));
+                let trim = |number: &[u8]| {
+                    let zeros = number.iter().take_while(|c| **c == b'0').count();
+                    number[zeros..].to_vec()
+                };
+                let (x, y) = (trim(&a[..x_end]), trim(&b[..y_end]));
+                let order = x.len().cmp(&y.len()).then_with(|| x.cmp(&y));
+                if order != std::cmp::Ordering::Equal {
+                    return order;
+                }
+                a = &a[x_end..];
+                b = &b[y_end..];
+            }
+            (Some(x), Some(y)) => {
+                let order = x.to_ascii_lowercase().cmp(&y.to_ascii_lowercase());
+                if order != std::cmp::Ordering::Equal {
+                    return order;
+                }
+                a = &a[1..];
+                b = &b[1..];
+            }
+        }
+    }
 }
 
 // Mobipocket and Kindle
@@ -1572,6 +1682,92 @@ mod tests {
         let book = mobi(65001, b"Name", &[(EXTH_COVER, &7u32.to_be_bytes())]);
         assert_eq!(read(Format::Mobi, Cursor::new(book)).unwrap().cover, None);
         assert!(read(Format::Mobi, Cursor::new(vec![0; 100])).is_err());
+    }
+
+    /// A zip file of `files`, as a comic book app makes one.
+    fn zip_of(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for (path, contents) in files {
+            zip.start_file(*path, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(contents).unwrap();
+        }
+        zip.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn shows_a_comic_books_first_page_and_its_details() {
+        let page = b"\x89PNG\r\n\x1a\npage";
+        let info = br#"<?xml version="1.0"?>
+<ComicInfo xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <Series>Little Nemo</Series><Number>3</Number>
+  <Writer>Winsor McCay, A. N. Other</Writer>
+  <Summary>Nemo visits &lt;i&gt;Slumberland&lt;/i&gt;.</Summary>
+</ComicInfo>"#;
+        let book = zip_of(&[
+            ("__MACOSX/Nemo/._page1.jpg", b"metadata"),
+            ("Nemo/page10.jpg", page),
+            ("Nemo/.hidden.jpg", page),
+            ("Nemo/page2.jpg", page),
+            ("Nemo/Page1.JPG", JPEG),
+            ("ComicInfo.xml", info),
+        ]);
+        let book = read(Format::Comic, Cursor::new(book)).unwrap();
+        assert_eq!(book.cover.as_deref(), Some(JPEG));
+        assert_eq!(
+            book.details,
+            Details {
+                title: Some("Little Nemo #3".into()),
+                authors: vec!["Winsor McCay".into(), "A. N. Other".into()],
+                description: Some("Nemo visits Slumberland.".into()),
+                contents: Vec::new(),
+            }
+        );
+
+        // The page its details call the front cover, and none without
+        // details.
+        let info = br#"<ComicInfo><Title>Back first</Title><Pages>
+<Page Image="0" Type="Story"/><Page Image="1" Type="FrontCover"/></Pages></ComicInfo>"#;
+        let book = zip_of(&[("1.png", page), ("2.jpg", JPEG), ("comicinfo.xml", info)]);
+        assert_eq!(
+            read(Format::Comic, Cursor::new(book))
+                .unwrap()
+                .cover
+                .as_deref(),
+            Some(JPEG)
+        );
+        let book = read(Format::Comic, Cursor::new(zip_of(&[("1.jpg", JPEG)]))).unwrap();
+        assert_eq!(book.details, Details::default());
+        let book = read(
+            Format::Comic,
+            Cursor::new(zip_of(&[("notes.txt", b"no pages")])),
+        )
+        .unwrap();
+        assert_eq!(book.cover, None);
+    }
+
+    #[test]
+    fn orders_pages_as_people_do() {
+        let mut names = [
+            "p10.jpg",
+            "p2.jpg",
+            "P1.jpg",
+            "p02a.jpg",
+            "cover.jpg",
+            "p1b.jpg",
+        ];
+        names.sort_by(|a, b| natural(a, b));
+        assert_eq!(
+            names,
+            [
+                "cover.jpg",
+                "P1.jpg",
+                "p1b.jpg",
+                "p2.jpg",
+                "p02a.jpg",
+                "p10.jpg"
+            ]
+        );
     }
 
     #[test]

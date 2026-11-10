@@ -2104,3 +2104,161 @@ async fn shows_an_e_books_cover_and_keeps_its_details() {
     assert_eq!(server.preview_state(empty).await.as_deref(), Some("none"));
     assert_eq!(server.thumbnails.status().borrow().failed, 0);
 }
+
+/// A TrueType font from the system's packages: Liberation, as CI installs
+/// with LibreOffice, or DejaVu.
+fn truetype() -> Vec<u8> {
+    [
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+    .iter()
+    .find_map(|path| std::fs::read(path).ok())
+    .expect("the tests need fonts-liberation2 or fonts-dejavu-core")
+}
+
+/// A TrueType font's tables: each one's tag, and its data.
+fn tables(font: &[u8]) -> Vec<([u8; 4], Vec<u8>)> {
+    let u16_at = |at: usize| usize::from(u16::from_be_bytes([font[at], font[at + 1]]));
+    let u32_at = |at: usize| u32::from_be_bytes(font[at..at + 4].try_into().unwrap()) as usize;
+    (0..u16_at(4))
+        .map(|index| {
+            let entry = 12 + index * 16;
+            let (offset, length) = (u32_at(entry + 8), u32_at(entry + 12));
+            (
+                font[entry..entry + 4].try_into().unwrap(),
+                font[offset..offset + length].to_vec(),
+            )
+        })
+        .collect()
+}
+
+/// `font` as a WOFF web font, with its tables stored as they are, which
+/// WOFF allows.
+fn woff(font: &[u8]) -> Vec<u8> {
+    let tables = tables(font);
+    let mut data = Vec::new();
+    let mut directory = Vec::new();
+    let start = 44 + 20 * tables.len();
+    for (tag, table) in &tables {
+        directory.extend(tag);
+        directory.extend(((start + data.len()) as u32).to_be_bytes());
+        directory.extend((table.len() as u32).to_be_bytes());
+        directory.extend((table.len() as u32).to_be_bytes());
+        directory.extend([0; 4]);
+        data.extend(table);
+        data.resize(data.len().next_multiple_of(4), 0);
+    }
+    let mut woff = b"wOFF".to_vec();
+    woff.extend(&font[0..4]);
+    woff.extend(((start + data.len()) as u32).to_be_bytes());
+    woff.extend((tables.len() as u16).to_be_bytes());
+    woff.extend([0; 2]);
+    woff.extend((font.len() as u32).to_be_bytes());
+    woff.extend([0, 1, 0, 0]);
+    woff.extend([0; 20]);
+    woff.extend(directory);
+    woff.extend(data);
+    woff
+}
+
+/// `font` alone in a TrueType collection, whose header comes first, so
+/// every table moves.
+fn collection(font: &[u8]) -> Vec<u8> {
+    const HEADER: usize = 16;
+    let mut moved = font.to_vec();
+    let count = usize::from(u16::from_be_bytes([font[4], font[5]]));
+    for index in 0..count {
+        let at = 12 + index * 16 + 8;
+        let offset = u32::from_be_bytes(font[at..at + 4].try_into().unwrap());
+        moved[at..at + 4].copy_from_slice(&(offset + HEADER as u32).to_be_bytes());
+    }
+    let mut ttc = b"ttcf\0\x01\0\0\0\0\0\x01".to_vec();
+    ttc.extend((HEADER as u32).to_be_bytes());
+    ttc.extend(moved);
+    ttc
+}
+
+#[tokio::test]
+async fn shows_sample_text_in_each_kind_of_font() {
+    let server = start().await;
+    let ttf = truetype();
+    let fonts = [
+        ("Sans.ttf", ttf.clone()),
+        ("Sans.woff", woff(&ttf)),
+        ("Sans.ttc", collection(&ttf)),
+    ];
+    let mut hashes = Vec::new();
+    for (name, contents) in &fonts {
+        let hash = server.save(name, contents).await;
+        assert!(server.thumbnails.make_now(hash).await.unwrap(), "{name}");
+        let (width, height, _) = describe(&thumbnail(&server, hash));
+        assert_eq!((width, height), (480, 360), "{name}");
+        hashes.push(hash);
+    }
+    let (stop, worker) = start_worker(&server.thumbnails);
+    server.wait_for_previews().await;
+    stop.send(()).unwrap();
+    worker.await.unwrap();
+    // The browser draws TrueType and WOFF itself, but not collections.
+    assert!(server.thumbnails.picture(hashes[0]).is_none());
+    assert!(server.thumbnails.picture(hashes[1]).is_none());
+    let page = server
+        .thumbnails
+        .picture(hashes[2])
+        .expect("a page of sample text in the collection's font");
+    assert_eq!(describe(&page).0, 1920);
+
+    // A broken font fails, rather than showing another font's letters.
+    let mut broken = ttf[..64].to_vec();
+    broken.resize(4096, 0);
+    let broken = server.save("Broken.ttf", &broken).await;
+    assert!(!server.thumbnails.make_now(broken).await.unwrap());
+}
+
+#[tokio::test]
+async fn shows_a_comic_books_cover() {
+    use std::io::Write;
+    let server = start().await;
+    let comic = |info: Option<&str>| {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        for (page, (width, height)) in [(1, (800, 1200)), (2, (1200, 800))] {
+            zip.start_file(format!("Nemo/page{page}.jpg"), options)
+                .unwrap();
+            zip.write_all(&server.image(&format!("page{page}.jpg"), width, height))
+                .unwrap();
+        }
+        if let Some(info) = info {
+            zip.start_file("ComicInfo.xml", options).unwrap();
+            zip.write_all(info.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap().into_inner()
+    };
+    let plain = server.save("Nemo.cbz", &comic(None)).await;
+    let described = server
+        .save(
+            "Nemo 2.cbz",
+            &comic(Some("<ComicInfo><Title>Slumberland</Title></ComicInfo>")),
+        )
+        .await;
+    for hash in [plain, described] {
+        assert!(server.thumbnails.make_now(hash).await.unwrap());
+        let (width, height, _) = describe(&thumbnail(&server, hash));
+        assert_eq!((width, height), (320, 480));
+    }
+
+    let (stop, worker) = start_worker(&server.thumbnails);
+    server.wait_for_previews().await;
+    stop.send(()).unwrap();
+    worker.await.unwrap();
+    // Without details, its cover shows large.
+    let cover = server.thumbnails.picture(plain).expect("the cover, large");
+    assert_eq!(describe(&cover).1, 1200);
+    assert!(server.thumbnails.book(plain).is_none());
+    let details = server.thumbnails.book(described).expect("its details");
+    let details: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(details).unwrap()).unwrap();
+    assert_eq!(details["title"], "Slumberland");
+}

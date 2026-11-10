@@ -191,7 +191,7 @@ static MIGRATIONS: &[Migration] = &[
 
 /// The version of what makes thumbnails. Raise it when it can make
 /// thumbnails of files it couldn't before, so they get another try.
-pub const WORKER: u32 = 14;
+pub const WORKER: u32 = 15;
 
 /// The longer side of a thumbnail, in pixels.
 const SIZE: u32 = 480;
@@ -420,6 +420,21 @@ const NO_MNG_PICTURE: &str = "an MNG that doesn't start with a PNG picture";
 
 /// Why a song has no thumbnail.
 const NO_COVER: &str = "a sound without cover art";
+
+/// The sample text in a font's thumbnail and preview.
+const PANGRAM_START: &str = "The quick brown fox";
+const PANGRAM: &str = "The quick brown fox jumps over the lazy dog";
+
+/// Fontconfig's settings for drawing a font's sample: no fonts of its own.
+const NO_FONTS: &str = "<?xml version=\"1.0\"?>\n<fontconfig></fontconfig>\n";
+
+/// Which picture of a font's sample text to draw.
+#[derive(Clone, Copy)]
+enum FontPage {
+    Thumbnail,
+    /// A page of samples, for fonts the browser doesn't draw.
+    Preview,
+}
 
 /// Why an e-book has no thumbnail.
 const NO_BOOK_COVER: &str = "an e-book without a cover";
@@ -780,6 +795,33 @@ pub(crate) enum Kind {
     Document(&'static Format),
     /// An e-book, shown by its cover, with its details as its preview.
     Book(book::Format),
+    /// A font, shown by sample text that ffmpeg draws in it.
+    Font(Font),
+}
+
+/// The font formats FreeType reads that have outlines, so they draw at any
+/// size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Font {
+    /// TrueType, `.ttf`.
+    TrueType,
+    /// OpenType with PostScript outlines, `.otf`.
+    OpenType,
+    /// Several TrueType or OpenType fonts in one file, `.ttc` and `.otc`.
+    Collection,
+    /// Web fonts, `.woff` and `.woff2`.
+    Woff,
+    Woff2,
+    /// PostScript Type 1, `.pfb` and `.pfa`.
+    Type1,
+}
+
+impl Font {
+    /// Whether the browser draws fonts in this format itself, so the viewer
+    /// shows its sample from the font file. Others get a picture of one.
+    fn browser_draws(self) -> bool {
+        !matches!(self, Self::Collection | Self::Type1)
+    }
 }
 
 /// An Office format, with the one reader LibreOffice may use for it, so a
@@ -2402,6 +2444,14 @@ impl Thumbnails {
                 .document(hash, &file, format)
                 .await
                 .map_err(|problem| format!("{DOCUMENT_FAILED}{problem}")),
+            Kind::Font(_) if !self.inner.tools.has_ffmpeg() => return Outcome::None(NO_FFMPEG),
+            Kind::Font(_) => match self.font_sample(&file, FontPage::Thumbnail).await {
+                Ok(png) => {
+                    self.thumbnail(self.scratch(&png).map_err(io::Error::other))
+                        .await
+                }
+                Err(problem) => Err(problem),
+            },
             Kind::Book(format) => match self.read_book(&file, format, "cover").await {
                 Ok(cover) if cover.is_empty() => return Outcome::None(NO_BOOK_COVER),
                 Ok(cover) => {
@@ -2473,6 +2523,19 @@ impl Thumbnails {
                 return self.plan_video(hash, &file, container, size).await;
             }
             Some(Kind::Book(format)) => return self.book_details(hash, &file, format).await,
+            Some(Kind::Font(font)) if font.browser_draws() => {
+                return Outcome::None("the browser draws it");
+            }
+            Some(Kind::Font(_)) if !self.inner.tools.has_ffmpeg() => {
+                return Outcome::None(NO_FFMPEG);
+            }
+            Some(Kind::Font(_)) => match self.font_sample(&file, FontPage::Preview).await {
+                Ok(png) => {
+                    self.shrink(self.scratch(&png).map_err(io::Error::other), PREVIEW)
+                        .await
+                }
+                Err(problem) => Err(problem),
+            },
             Some(Kind::Still(_)) if !self.inner.tools.has_ffmpeg() => {
                 return Outcome::None(NO_FFMPEG);
             }
@@ -3418,6 +3481,106 @@ impl Thumbnails {
     }
 
     /// Keeps a worker's picture in a temporary file, for libvips to read.
+    /// Sample text drawn in the font in `file`, as a PNG, from ffmpeg and
+    /// FreeType in the sandbox.
+    async fn font_sample(&self, file: &Path, page: FontPage) -> Result<Vec<u8>, String> {
+        let font = filter_value(&file.to_string_lossy());
+        let (size, lines): (&str, &[(&str, u32, &str, u32)]) = match page {
+            FontPage::Thumbnail => (
+                "480x360",
+                &[
+                    ("Aa", 160, "(w-text_w)/2", 50),
+                    (PANGRAM_START, 32, "(w-text_w)/2", 260),
+                ],
+            ),
+            FontPage::Preview => (
+                "1920x1440",
+                &[
+                    ("Aa", 240, "80", 60),
+                    ("ABCDEFGHIJKLMNOPQRSTUVWXYZ", 64, "80", 380),
+                    ("abcdefghijklmnopqrstuvwxyz", 64, "80", 480),
+                    ("0123456789 .!?&@()", 64, "80", 580),
+                    (PANGRAM, 24, "80", 740),
+                    (PANGRAM, 36, "80", 810),
+                    (PANGRAM, 48, "80", 900),
+                    (PANGRAM, 72, "80", 1010),
+                    (PANGRAM, 96, "80", 1150),
+                ],
+            ),
+        };
+        let filters: Vec<String> = lines
+            .iter()
+            .enumerate()
+            .map(|(index, (text, points, x, y))| {
+                // The first line is darker, as the web app's text is.
+                let color = if index == 0 { "0x1c2430" } else { "0x3c4552" };
+                format!(
+                    "drawtext=fontfile={font}:expansion=none:text={}:fontsize={points}:\
+                     fontcolor={color}:x={x}:y={y}",
+                    filter_value(text)
+                )
+            })
+            .collect();
+        let source = format!("color=c=white:s={size}:d=1");
+        let filters = filters.join(",");
+        let args = [
+            "-nostdin",
+            "-v",
+            "error",
+            "-threads",
+            "2",
+            "-f",
+            "lavfi",
+            "-i",
+            &source,
+            "-vf",
+            &filters,
+            "-frames:v",
+            "1",
+            "-c:v",
+            "png",
+            "-f",
+            "image2pipe",
+            "-",
+        ]
+        .map(OsString::from);
+        let input = std::fs::File::open("/dev/null").map_err(|err| err.to_string())?;
+        let limits = match page {
+            FontPage::Thumbnail => LIMITS,
+            FontPage::Preview => PREVIEW_LIMITS,
+        };
+        // ffmpeg draws in one of the system's fonts when it can't read the
+        // file, so a broken font would show another's letters. Fontconfig,
+        // which finds those, gets settings with none.
+        let config = self.inner.dir.join("fonts.conf");
+        if !config.is_file() {
+            self.keep(config.clone(), NO_FONTS.as_bytes())
+                .map_err(|err| format!("couldn't keep the font settings: {err}"))?;
+        }
+        let config_path = config
+            .to_str()
+            .ok_or("the data folder's path isn't UTF-8")?;
+        let png = self
+            .inner
+            .sandbox
+            .run(Job {
+                program: &self.inner.tools.ffmpeg,
+                args: &args,
+                env: &[("FONTCONFIG_FILE", config_path), ("MALLOC_ARENA_MAX", "2")],
+                input,
+                read: &[file.to_owned(), config.clone()],
+                write: &[],
+                sockets: None,
+                limits,
+            })
+            .await
+            .map_err(|err| err.to_string())?;
+        if png.is_empty() {
+            return Err("ffmpeg drew nothing in the font".into());
+        }
+        Ok(png)
+    }
+
     /// Runs the e-book reader in the sandbox, for the book's `cover` or its
     /// `details`.
     async fn read_book(
@@ -3451,6 +3614,26 @@ impl Thumbnails {
             });
         match empty {
             None => Outcome::Failed("the e-book reader wrote something other than details".into()),
+            // A comic book's pages are pictures, so one without details
+            // shows its cover large instead.
+            Some(true) if format == book::Format::Comic => {
+                match self.read_book(file, format, "cover").await {
+                    Ok(cover) if cover.is_empty() => Outcome::None(NO_BOOK_COVER),
+                    Ok(cover) => match self
+                        .shrink(self.scratch(&cover).map_err(io::Error::other), PREVIEW)
+                        .await
+                    {
+                        Ok(webp) => match self.keep(self.picture_path(hash), &webp) {
+                            Ok(()) => Outcome::Ready,
+                            Err(err) => {
+                                Outcome::Failed(format!("couldn't save the preview: {err}"))
+                            }
+                        },
+                        Err(problem) => Outcome::Failed(problem),
+                    },
+                    Err(problem) => Outcome::Failed(problem),
+                }
+            }
             Some(true) => Outcome::None("an e-book without a title or contents"),
             Some(false) => match self.keep(self.book_path(hash), &details) {
                 Ok(()) => Outcome::Ready,
@@ -4010,6 +4193,10 @@ fn kind(head: &[u8], whole: bool) -> Option<Kind> {
     if let Some(format) = ebook(head) {
         return Some(Kind::Book(format));
     }
+    // Before text, since a Type 1 font can be text.
+    if let Some(font) = font(head) {
+        return Some(Kind::Font(font));
+    }
     if djvu(head) {
         return Some(Kind::Djvu);
     }
@@ -4434,6 +4621,10 @@ fn named(name: &str, head: &[u8], kind: Option<Kind>) -> Option<Kind> {
         {
             Some(Kind::Book(book::Format::Epub))
         }
+        // A comic book is a zip file of its pages.
+        None if extension == "cbz" && head.starts_with(ZIP) => {
+            Some(Kind::Book(book::Format::Comic))
+        }
         None => unsigned_still(name, head)
             .map(Kind::Still)
             .or_else(|| unsigned_sound(&extension, head).map(Kind::Audio))
@@ -4441,6 +4632,61 @@ fn named(name: &str, head: &[u8], kind: Option<Kind>) -> Option<Kind> {
             .or_else(|| unsigned_video(&extension, head).map(Kind::Video)),
         kind => kind,
     }
+}
+
+/// The font format that starts with `head`, if it's one with outlines.
+fn font(head: &[u8]) -> Option<Font> {
+    let starts = |magic: &[u8]| head.starts_with(magic);
+    // TrueType and OpenType files start with a list of tables, each named
+    // with four letters.
+    let tables = || {
+        let count = u16::from_be_bytes([*head.get(4)?, *head.get(5)?]);
+        let first = head.get(12..16)?;
+        ((1..=100).contains(&count) && first.iter().all(|c| c.is_ascii_graphic() || *c == b' '))
+            .then_some(())
+    };
+    if starts(b"wOFF") {
+        Some(Font::Woff)
+    } else if starts(b"wOF2") {
+        Some(Font::Woff2)
+    } else if starts(b"ttcf") {
+        Some(Font::Collection)
+    } else if starts(b"OTTO") && tables().is_some() {
+        Some(Font::OpenType)
+    } else if (starts(b"\0\x01\0\0") || starts(b"true")) && tables().is_some() {
+        Some(Font::TrueType)
+    } else if starts(b"%!PS-AdobeFont-1")
+        || starts(b"%!FontType1")
+        // A binary Type 1 font's first segment is its text.
+        || (starts(b"\x80\x01")
+            && head.get(6..).is_some_and(|text| {
+                text.starts_with(b"%!PS-AdobeFont-1") || text.starts_with(b"%!FontType1")
+            }))
+    {
+        Some(Font::Type1)
+    } else {
+        None
+    }
+}
+
+/// `text` as a value in an ffmpeg filter graph, escaped for the filter's
+/// options and then for the graph.
+fn filter_value(text: &str) -> String {
+    let mut option = String::new();
+    for c in text.chars() {
+        if matches!(c, '\\' | '\'' | ':') {
+            option.push('\\');
+        }
+        option.push(c);
+    }
+    let mut graph = String::new();
+    for c in option.chars() {
+        if matches!(c, '\\' | '\'' | '[' | ']' | ',' | ';') {
+            graph.push('\\');
+        }
+        graph.push(c);
+    }
+    graph
 }
 
 /// The e-book format that starts with `head`, if it's one this reads.
@@ -4982,6 +5228,51 @@ mod tests {
         );
         assert_eq!(named("Alice.zip", b"PK\x03\x04", None), None);
         assert_eq!(named("Alice.epub", b"%PDF-1.4", None), None);
+    }
+
+    #[test]
+    fn knows_fonts_by_their_first_bytes() {
+        let tables = |magic: &[u8]| {
+            let mut head = magic.to_vec();
+            head.extend([0, 12, 0, 128, 0, 3, 0, 32]);
+            head.extend(b"GDEF\0\0\0\0");
+            head
+        };
+        let font = |head: &[u8]| match kind(head, false) {
+            Some(Kind::Font(font)) => Some(font),
+            _ => None,
+        };
+        assert_eq!(font(&tables(b"\0\x01\0\0")), Some(Font::TrueType));
+        assert_eq!(font(&tables(b"true")), Some(Font::TrueType));
+        assert_eq!(font(&tables(b"OTTO")), Some(Font::OpenType));
+        assert_eq!(font(b"ttcf\0\x01\0\0"), Some(Font::Collection));
+        assert_eq!(font(b"wOFF\0\x01\0\0"), Some(Font::Woff));
+        assert_eq!(font(b"wOF2OTTO"), Some(Font::Woff2));
+        assert_eq!(font(b"%!PS-AdobeFont-1.0: NimbusRoman"), Some(Font::Type1));
+        assert_eq!(font(b"%!FontType1-1.0: Example"), Some(Font::Type1));
+        assert_eq!(
+            font(b"\x80\x01\x10\x17\0\0%!PS-AdobeFont-1.0: Times"),
+            Some(Font::Type1)
+        );
+        // Other files that start the same way aren't fonts.
+        assert_eq!(font(b"\0\x01\0\0\0\0\0\0\0\0\0\0\0\0\0\0"), None);
+        assert_eq!(font(b"true story, told in text"), None);
+        assert_eq!(font(b"%!PS-Adobe-3.0 a PostScript page"), None);
+        assert!(Font::Woff2.browser_draws());
+        assert!(!Font::Collection.browser_draws());
+        assert!(!Font::Type1.browser_draws());
+        assert_eq!(
+            named("Nemo.CBZ", b"PK\x03\x04", None),
+            Some(Kind::Book(book::Format::Comic))
+        );
+    }
+
+    #[test]
+    fn escapes_values_in_ffmpeg_filters() {
+        assert_eq!(filter_value("/srv/data/ab/cd"), "/srv/data/ab/cd");
+        assert_eq!(filter_value("a:b"), "a\\\\:b");
+        assert_eq!(filter_value("it's"), "it\\\\\\'s");
+        assert_eq!(filter_value("a,b[c];"), "a\\,b\\[c\\]\\;");
     }
 
     #[test]

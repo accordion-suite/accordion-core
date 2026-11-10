@@ -2002,3 +2002,105 @@ async fn converts_videos_from_cameras_tv_and_without_a_container() {
         assert_eq!(watch(&path).0, "h264", "{name}");
     }
 }
+
+/// An EPUB 3 with `cover` as its cover picture, and a table of contents.
+fn epub(cover: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    let stored =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    zip.start_file("mimetype", stored).unwrap();
+    zip.write_all(b"application/epub+zip").unwrap();
+    let files: [(&str, &[u8]); 4] = [
+        (
+            "META-INF/container.xml",
+            br#"<container><rootfiles><rootfile full-path="OEBPS/book.opf"/></rootfiles></container>"#,
+        ),
+        (
+            "OEBPS/book.opf",
+            br#"<package version="3.0" xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <metadata><dc:title>Persuasion</dc:title><dc:creator>Jane Austen</dc:creator>
+    <dc:description>&lt;p&gt;Her last novel.&lt;/p&gt;&lt;script&gt;alert(1)&lt;/script&gt;</dc:description></metadata>
+  <manifest>
+    <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
+    <item id="cover" href="cover.jpg" media-type="image/jpeg" properties="cover-image"/>
+  </manifest>
+</package>"#,
+        ),
+        (
+            "OEBPS/nav.xhtml",
+            br#"<html><body><nav><ol><li><a href="1.xhtml">Chapter 1</a></li>
+<li><a href="2.xhtml">Chapter 2</a></li></ol></nav></body></html>"#,
+        ),
+        ("OEBPS/cover.jpg", cover),
+    ];
+    for (path, contents) in files {
+        zip.start_file(path, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(contents).unwrap();
+    }
+    zip.finish().unwrap().into_inner()
+}
+
+#[tokio::test]
+async fn shows_an_e_books_cover_and_keeps_its_details() {
+    let server = start().await;
+    let book = server
+        .save(
+            "Persuasion.epub",
+            &epub(&server.image("cover.jpg", 600, 900)),
+        )
+        .await;
+    // A FictionBook without a cover keeps its icon, but has details.
+    let fb2 = server
+        .save(
+            "Poems.fb2",
+            br#"<?xml version="1.0" encoding="utf-8"?>
+<FictionBook><description><title-info><author><first-name>Anna</first-name>
+<last-name>Akhmatova</last-name></author><book-title>Poems</book-title></title-info></description>
+<body><section><title><p>Evening</p></title></section></body></FictionBook>"#,
+        )
+        .await;
+    // An e-book with nothing in it has neither.
+    let empty = server
+        .save(
+            "Empty.fb2",
+            br#"<?xml version="1.0"?><FictionBook></FictionBook>"#,
+        )
+        .await;
+    assert!(server.thumbnails.make_now(book).await.unwrap());
+    let (width, height, _) = describe(&thumbnail(&server, book));
+    assert_eq!((width, height), (320, 480));
+    assert!(!server.thumbnails.make_now(fb2).await.unwrap());
+    assert!(!server.thumbnails.make_now(empty).await.unwrap());
+
+    let (stop, worker) = start_worker(&server.thumbnails);
+    server.wait_for_previews().await;
+    stop.send(()).unwrap();
+    worker.await.unwrap();
+    let details = |hash| {
+        let path = server.thumbnails.book(hash).expect("the book's details");
+        serde_json::from_slice::<serde_json::Value>(&std::fs::read(path).unwrap()).unwrap()
+    };
+    assert_eq!(
+        details(book),
+        serde_json::json!({
+            "title": "Persuasion",
+            "authors": ["Jane Austen"],
+            "description": "Her last novel.",
+            "contents": [
+                { "title": "Chapter 1", "depth": 0 },
+                { "title": "Chapter 2", "depth": 0 },
+            ],
+        })
+    );
+    assert_eq!(
+        details(fb2)["authors"],
+        serde_json::json!(["Anna Akhmatova"])
+    );
+    assert_eq!(details(fb2)["contents"][0]["title"], "Evening");
+    assert_eq!(server.preview_state(book).await.as_deref(), Some("book"));
+    assert!(server.thumbnails.book(empty).is_none());
+    assert_eq!(server.preview_state(empty).await.as_deref(), Some("none"));
+    assert_eq!(server.thumbnails.status().borrow().failed, 0);
+}

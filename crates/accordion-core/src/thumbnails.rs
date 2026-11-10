@@ -26,6 +26,10 @@
 //! the document's preview, kept beside its thumbnail. The thumbnail is the
 //! PDF's first page.
 //!
+//! An e-book's thumbnail is its cover, and its preview is its details as
+//! JSON, both from Accordion's own reader in [`book`], which runs in the
+//! sandbox too.
+//!
 //! A file that fails isn't tried again until [`WORKER`] changes, such as
 //! when an update makes thumbnails of more kinds of file.
 
@@ -44,6 +48,8 @@ use crate::db::{self, Database, Migration};
 use crate::live::{self, Hint};
 use crate::sql_now;
 use crate::storage::{ContentHash, Storage, blobs};
+
+pub mod book;
 
 const OWNER: &str = "thumbnails";
 
@@ -154,11 +160,38 @@ static MIGRATIONS: &[Migration] = &[
     INSERT INTO thumbnail_settings VALUES (1, NULL, 10);
 ",
     },
+    Migration {
+        version: 5,
+        name: "Add e-book previews",
+        sql: "
+    -- book: an e-book's details, its title, authors, description, and
+    -- table of contents, as JSON in cache/previews (decision 26).
+    CREATE TABLE thumbnails_new (
+        hash BLOB PRIMARY KEY CHECK (length(hash) = 32),
+        state TEXT NOT NULL CHECK (state IN ('ready', 'none', 'failed')),
+        worker INTEGER NOT NULL,
+        reason TEXT,
+        made_at TEXT NOT NULL,
+        preview TEXT CHECK (preview IN ('picture', 'audio', 'video', 'book', 'waiting', 'none',
+                                        'failed')),
+        preview_reason TEXT,
+        plan TEXT CHECK (plan IN ('copy', 'convert')),
+        wanted_at TEXT,
+        opened_at TEXT,
+        removed INTEGER NOT NULL DEFAULT 0 CHECK (removed IN (0, 1))
+    ) STRICT, WITHOUT ROWID;
+    INSERT INTO thumbnails_new SELECT * FROM thumbnails;
+    DROP TABLE thumbnails;
+    ALTER TABLE thumbnails_new RENAME TO thumbnails;
+    CREATE INDEX thumbnails_failed ON thumbnails (state) WHERE state = 'failed';
+    CREATE INDEX thumbnails_videos ON thumbnails (preview) WHERE preview IN ('video', 'waiting');
+",
+    },
 ];
 
 /// The version of what makes thumbnails. Raise it when it can make
 /// thumbnails of files it couldn't before, so they get another try.
-pub const WORKER: u32 = 13;
+pub const WORKER: u32 = 14;
 
 /// The longer side of a thumbnail, in pixels.
 const SIZE: u32 = 480;
@@ -387,6 +420,18 @@ const NO_MNG_PICTURE: &str = "an MNG that doesn't start with a PNG picture";
 
 /// Why a song has no thumbnail.
 const NO_COVER: &str = "a sound without cover art";
+
+/// Why an e-book has no thumbnail.
+const NO_BOOK_COVER: &str = "an e-book without a cover";
+
+/// What the e-book reader may use. It reads a few small parts of a book,
+/// or the whole of a FictionBook, which is at most 64 MB.
+const BOOK_LIMITS: Limits = Limits {
+    memory: 1024 * 1024 * 1024,
+    cpu: Duration::from_secs(20),
+    time: Duration::from_secs(30),
+    output: 40 * 1024 * 1024,
+};
 
 /// How every MNG file starts.
 const MNG: &[u8] = b"\x8aMNG\r\n\x1a\n";
@@ -733,6 +778,8 @@ pub(crate) enum Kind {
     /// UTF-8 text, such as notes, Markdown, CSV, or code.
     Text,
     Document(&'static Format),
+    /// An e-book, shown by its cover, with its details as its preview.
+    Book(book::Format),
 }
 
 /// An Office format, with the one reader LibreOffice may use for it, so a
@@ -1337,6 +1384,20 @@ impl Thumbnails {
         Some(self.sound_path(hash)).filter(|path| path.is_file())
     }
 
+    /// An e-book's details for the viewer, as JSON: its `title`, `authors`,
+    /// `description`, and `contents`, a list of entries with a `title` and
+    /// a `depth`, if there are any yet.
+    pub fn book(&self, hash: ContentHash) -> Option<PathBuf> {
+        Some(self.book_path(hash)).filter(|path| path.is_file())
+    }
+
+    fn book_path(&self, hash: ContentHash) -> PathBuf {
+        self.inner
+            .previews
+            .join(blobs::shard(hash))
+            .with_extension("json")
+    }
+
     fn sound_path(&self, hash: ContentHash) -> PathBuf {
         self.inner
             .previews
@@ -1457,6 +1518,7 @@ impl Thumbnails {
         let (state, reason, plan) = match outcome {
             // The worker has made it, so its file says which it is.
             Outcome::Ready if self.sound(hash).is_some() => ("audio", None, None),
+            Outcome::Ready if self.book(hash).is_some() => ("book", None, None),
             Outcome::Ready => ("picture", None, None),
             Outcome::Waiting(plan) => ("waiting", None, Some(plan)),
             Outcome::None(reason) => ("none", Some(reason.to_owned()), None),
@@ -2116,7 +2178,7 @@ impl Thumbnails {
             .read(|conn| {
                 conn.prepare(
                     "SELECT hash, preview FROM thumbnails
-                     WHERE preview IN ('picture', 'audio', 'video')",
+                     WHERE preview IN ('picture', 'audio', 'video', 'book')",
                 )?
                 .query_map([], |row| Ok((hash(row, 0)?, row.get::<_, String>(1)?)))?
                 .collect::<Result<Vec<_>, _>>()
@@ -2128,6 +2190,7 @@ impl Thumbnails {
             .filter(|(hash, preview)| match preview.as_str() {
                 "audio" => self.sound(*hash).is_none(),
                 "video" => self.video(*hash).is_none(),
+                "book" => self.book(*hash).is_none(),
                 _ => self.picture(*hash).is_none(),
             })
             .map(|(hash, preview)| (hash, preview == "video"))
@@ -2200,6 +2263,7 @@ impl Thumbnails {
                 self.preview_path(hash, true),
                 self.picture_path(hash),
                 self.sound_path(hash),
+                self.book_path(hash),
                 self.video_path(hash, false),
                 self.video_path(hash, true),
             ];
@@ -2338,6 +2402,14 @@ impl Thumbnails {
                 .document(hash, &file, format)
                 .await
                 .map_err(|problem| format!("{DOCUMENT_FAILED}{problem}")),
+            Kind::Book(format) => match self.read_book(&file, format, "cover").await {
+                Ok(cover) if cover.is_empty() => return Outcome::None(NO_BOOK_COVER),
+                Ok(cover) => {
+                    self.thumbnail(self.scratch(&cover).map_err(io::Error::other))
+                        .await
+                }
+                Err(problem) => Err(problem),
+            },
             Kind::Text => unreachable!("text is kept above"),
         };
         match made {
@@ -2400,6 +2472,7 @@ impl Thumbnails {
             Some(Kind::Video(container)) => {
                 return self.plan_video(hash, &file, container, size).await;
             }
+            Some(Kind::Book(format)) => return self.book_details(hash, &file, format).await,
             Some(Kind::Still(_)) if !self.inner.tools.has_ffmpeg() => {
                 return Outcome::None(NO_FFMPEG);
             }
@@ -3345,6 +3418,47 @@ impl Thumbnails {
     }
 
     /// Keeps a worker's picture in a temporary file, for libvips to read.
+    /// Runs the e-book reader in the sandbox, for the book's `cover` or its
+    /// `details`.
+    async fn read_book(
+        &self,
+        file: &Path,
+        format: book::Format,
+        part: &str,
+    ) -> Result<Vec<u8>, String> {
+        let input =
+            std::fs::File::open(file).map_err(|err| format!("couldn't open the file: {err}"))?;
+        let args = [book::COMMAND, format.as_str(), part].map(OsString::from);
+        self.work_within(&self.inner.tools.launcher, &args, input, &[], BOOK_LIMITS)
+            .await
+    }
+
+    /// Keeps an e-book's details, for the viewer.
+    async fn book_details(&self, hash: ContentHash, file: &Path, format: book::Format) -> Outcome {
+        let details = match self.read_book(file, format, "details").await {
+            Ok(details) => details,
+            Err(problem) => return Outcome::Failed(problem),
+        };
+        let empty = serde_json::from_slice::<serde_json::Value>(&details)
+            .ok()
+            .and_then(|details| {
+                let object = details.as_object()?;
+                Some(object.values().all(|value| match value {
+                    serde_json::Value::Null => true,
+                    serde_json::Value::Array(values) => values.is_empty(),
+                    _ => false,
+                }))
+            });
+        match empty {
+            None => Outcome::Failed("the e-book reader wrote something other than details".into()),
+            Some(true) => Outcome::None("an e-book without a title or contents"),
+            Some(false) => match self.keep(self.book_path(hash), &details) {
+                Ok(()) => Outcome::Ready,
+                Err(err) => Outcome::Failed(format!("couldn't save the preview: {err}")),
+            },
+        }
+    }
+
     fn scratch(&self, picture: &[u8]) -> Result<std::fs::File, String> {
         tempfile::tempfile_in(self.inner.dir.join("partial"))
             .and_then(|mut file| {
@@ -3893,6 +4007,9 @@ fn kind(head: &[u8], whole: bool) -> Option<Kind> {
     if starts(b"%PDF-") {
         return Some(Kind::Pdf);
     }
+    if let Some(format) = ebook(head) {
+        return Some(Kind::Book(format));
+    }
     if djvu(head) {
         return Some(Kind::Djvu);
     }
@@ -4311,6 +4428,12 @@ fn named(name: &str, head: &[u8], kind: Option<Kind>) -> Option<Kind> {
             Some(Kind::Video(Container::Mjpeg))
         }
         None if extension == "svgz" && head.starts_with(b"\x1f\x8b") => Some(Kind::Svg),
+        // An EPUB is meant to start by saying so, but some don't.
+        None if matches!(extension.as_str(), "epub" | "kepub" | "ibooks")
+            && head.starts_with(ZIP) =>
+        {
+            Some(Kind::Book(book::Format::Epub))
+        }
         None => unsigned_still(name, head)
             .map(Kind::Still)
             .or_else(|| unsigned_sound(&extension, head).map(Kind::Audio))
@@ -4318,6 +4441,25 @@ fn named(name: &str, head: &[u8], kind: Option<Kind>) -> Option<Kind> {
             .or_else(|| unsigned_video(&extension, head).map(Kind::Video)),
         kind => kind,
     }
+}
+
+/// The e-book format that starts with `head`, if it's one this reads.
+fn ebook(head: &[u8]) -> Option<book::Format> {
+    if head.starts_with(ZIP) && head.get(30..58) == Some(b"mimetypeapplication/epub+zip") {
+        return Some(book::Format::Epub);
+    }
+    // A Palm database, named at its start, says what it is at 60.
+    if head.get(60..68) == Some(b"BOOKMOBI") {
+        return Some(book::Format::Mobi);
+    }
+    // FictionBook is XML, after a declaration and perhaps a comment.
+    let xml = head.strip_prefix(b"\xef\xbb\xbf").unwrap_or(head);
+    if (xml.starts_with(b"<?xml") || xml.starts_with(b"<FictionBook"))
+        && xml.windows(12).any(|window| window == b"<FictionBook")
+    {
+        return Some(book::Format::Fb2);
+    }
+    None
 }
 
 /// Whether to turn a raw photo's JPEG as its orientation says, from what
@@ -4811,6 +4953,35 @@ mod tests {
         let avif = b"\0\0\0\x18ftypavif\0\0\0\0";
         assert_eq!(heif_limit(heic).0, 64_000_000);
         assert_eq!(heif_limit(avif).0, 24_000_000);
+    }
+
+    #[test]
+    fn knows_e_books_by_their_first_bytes_or_name() {
+        let epub = b"PK\x03\x04\x0a\0\0\0\0\0\0\0\0\0\0\0\0\0\x14\0\0\0\x14\0\0\0\x08\0\0\0mimetypeapplication/epub+zip";
+        assert_eq!(kind(epub, false), Some(Kind::Book(book::Format::Epub)));
+        let mut mobi = b"Alice_s_Adventures_in_Wonderlan\0".to_vec();
+        mobi.resize(60, 0);
+        mobi.extend(b"BOOKMOBI\0\0\0\0");
+        assert_eq!(kind(&mobi, false), Some(Kind::Book(book::Format::Mobi)));
+        let fb2 = "\u{feff}<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<!-- made by hand -->\n\
+            <FictionBook xmlns=\"http://www.gribuser.ru/xml/fictionbook/2.0\">";
+        assert_eq!(
+            kind(fb2.as_bytes(), false),
+            Some(Kind::Book(book::Format::Fb2))
+        );
+        // Other XML is still text.
+        assert_eq!(
+            kind(b"<?xml version=\"1.0\"?><notes/>", true),
+            Some(Kind::Text)
+        );
+        // An EPUB that doesn't start by saying so is known by its name.
+        assert_eq!(kind(b"PK\x03\x04", false), None);
+        assert_eq!(
+            named("Alice.EPUB", b"PK\x03\x04", None),
+            Some(Kind::Book(book::Format::Epub))
+        );
+        assert_eq!(named("Alice.zip", b"PK\x03\x04", None), None);
+        assert_eq!(named("Alice.epub", b"%PDF-1.4", None), None);
     }
 
     #[test]

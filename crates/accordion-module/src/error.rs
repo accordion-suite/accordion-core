@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use accordion_core::{events, identity, storage, texts};
+use accordion_core::{events, identity, storage, texts, thumbnails};
 use axum::Json;
 use axum::http::StatusCode;
 use axum::http::header::RETRY_AFTER;
@@ -169,6 +169,13 @@ impl From<events::Error> for ApiError {
                 Self::server_problem()
             }
         }
+    }
+}
+
+impl From<thumbnails::Error> for ApiError {
+    fn from(err: thumbnails::Error) -> Self {
+        tracing::error!("thumbnails error: {err}");
+        Self::server_problem()
     }
 }
 

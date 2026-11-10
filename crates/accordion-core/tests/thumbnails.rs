@@ -11,8 +11,11 @@ use std::time::Duration;
 use accordion_core::db::Database;
 use accordion_core::identity::{Identity, NewUser};
 use accordion_core::storage::{ContentHash, ItemKind, Storage};
-use accordion_core::thumbnails::{PREVIEW_PAGES, ThumbnailKind, Thumbnails, Tools};
+use accordion_core::thumbnails::{
+    PREVIEW_PAGES, PreviewSettings, ThumbnailKind, Thumbnails, Tools, VideoConversion,
+};
 use accordion_types::{ItemId, Role};
+use rusqlite::OptionalExtension;
 
 struct Server {
     dir: tempfile::TempDir,
@@ -1542,5 +1545,460 @@ async fn plays_older_sound_once_sox_is_installed() {
         }
         // They can't have cover art.
         assert!(thumbnails.find(hash).is_none(), "{format}");
+    }
+}
+
+/// What ffprobe says about a video's preview: its picture's codec, width,
+/// and height, and its sound's codec, if it has sound.
+fn watch(path: &Path) -> (String, u32, u32, Option<String>) {
+    let probed = Command::new("ffprobe")
+        .args(["-v", "error"])
+        .args(["-show_entries", "stream=codec_type,codec_name,width,height"])
+        .args(["-of", "json"])
+        .arg(path)
+        .output()
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&probed.stdout).unwrap();
+    let streams = json["streams"].as_array().unwrap();
+    let picture = streams
+        .iter()
+        .find(|stream| stream["codec_type"] == "video")
+        .expect("a picture");
+    let sound = streams
+        .iter()
+        .find(|stream| stream["codec_type"] == "audio")
+        .map(|stream| stream["codec_name"].as_str().unwrap().to_owned());
+    (
+        picture["codec_name"].as_str().unwrap().to_owned(),
+        picture["width"].as_u64().unwrap() as u32,
+        picture["height"].as_u64().unwrap() as u32,
+        sound,
+    )
+}
+
+impl Server {
+    /// A video's preview state: video, waiting, none, or failed.
+    async fn preview_state(&self, hash: ContentHash) -> Option<String> {
+        self.db
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT preview FROM thumbnails WHERE hash = ?1",
+                    [&hash.0[..]],
+                    |row| row.get(0),
+                )
+                .optional()
+            })
+            .await
+            .unwrap()
+            .flatten()
+    }
+
+    /// Waits until each video's preview is made, or decided against.
+    async fn wait_for_videos(&self, hashes: &[ContentHash]) {
+        tokio::time::timeout(Duration::from_secs(120), async {
+            loop {
+                let mut done = true;
+                for hash in hashes {
+                    let state = self.preview_state(*hash).await;
+                    done &= !matches!(state.as_deref(), None | Some("waiting"));
+                }
+                if done {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the worker should make each video's preview");
+    }
+
+    /// Waits until the worker has decided how each video's preview is made.
+    async fn wait_for_plans(&self, hashes: &[ContentHash]) {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let mut done = true;
+                for hash in hashes {
+                    done &= self.preview_state(*hash).await.is_some();
+                }
+                if done {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the worker should decide each video");
+    }
+}
+
+const SOUND: [&str; 4] = ["-f", "lavfi", "-i", "sine=duration=2"];
+
+#[tokio::test]
+async fn repackages_or_converts_videos_browsers_cant_play() {
+    let server = start().await;
+    let settings = PreviewSettings {
+        convert_videos: Some(VideoConversion::Upload),
+        space_percent: 10,
+    };
+    server.thumbnails.set_settings(settings).await.unwrap();
+    assert_eq!(server.thumbnails.settings().await.unwrap(), settings);
+    let h264 = ["-c:v", "libx264", "-preset", "ultrafast"];
+    let video = |name: &str, options: &[&[&str]]| server.video(name, &options.concat());
+    let film = server
+        .save(
+            "Film.mkv",
+            &video("film.mkv", &[&SOUND, &h264, &["-c:a", "aac"]]),
+        )
+        .await;
+    let camcorder = server
+        .save(
+            "00001.MTS",
+            &video(
+                "camcorder.mts",
+                &[&SOUND, &h264, &["-c:a", "ac3", "-f", "mpegts"]],
+            ),
+        )
+        .await;
+    let talk = server
+        .save(
+            "Talk.mkv",
+            &video(
+                "talk.mkv",
+                &[
+                    &SOUND,
+                    &["-c:v", "libvpx-vp9", "-deadline", "realtime"],
+                    &["-c:a", "libopus"],
+                ],
+            ),
+        )
+        .await;
+    let old = server
+        .save(
+            "Old.avi",
+            &video(
+                "old.avi",
+                &[&SOUND, &["-c:v", "mpeg4", "-c:a", "libmp3lame"]],
+            ),
+        )
+        .await;
+    let iphone = server
+        .save(
+            "IMG_0001.MOV",
+            &video(
+                "iphone.mov",
+                &[
+                    &SOUND,
+                    &[
+                        "-vf",
+                        "transpose=1",
+                        "-c:v",
+                        "libx265",
+                        "-preset",
+                        "ultrafast",
+                    ],
+                    &[
+                        "-x265-params",
+                        "log-level=error",
+                        "-tag:v",
+                        "hvc1",
+                        "-c:a",
+                        "aac",
+                    ],
+                ],
+            ),
+        )
+        .await;
+    let large = server
+        .save(
+            "Large.avi",
+            &video("large.avi", &[&["-vf", "scale=2560:1440", "-c:v", "mpeg4"]]),
+        )
+        .await;
+    let plays = server
+        .save(
+            "Android.mp4",
+            &video("android.mp4", &[&SOUND, &h264, &["-c:a", "aac"]]),
+        )
+        .await;
+
+    let (stop, worker) = start_worker(&server.thumbnails);
+    let all = [film, camcorder, talk, old, iphone, large, plays];
+    server.wait_for_videos(&all).await;
+    stop.send(()).unwrap();
+    worker.await.unwrap();
+
+    let expect = [
+        (film, "video/mp4", "h264", 640, 360, Some("aac")),
+        (camcorder, "video/mp4", "h264", 640, 360, Some("aac")),
+        (talk, "video/webm", "vp9", 640, 360, Some("opus")),
+        // Browsers play MP3 in MP4, so it's copied.
+        (old, "video/mp4", "h264", 640, 360, Some("mp3")),
+        // Turned upright, as the phone recorded it.
+        (iphone, "video/mp4", "h264", 360, 640, Some("aac")),
+        // Shrunk to 1080p.
+        (large, "video/mp4", "h264", 1920, 1080, None),
+    ];
+    for (hash, kind, codec, width, height, sound) in expect {
+        let Some((path, found)) = server.thumbnails.video(hash) else {
+            panic!(
+                "no preview for {kind} {codec}: {:?}",
+                server.preview_reason(hash).await
+            );
+        };
+        assert_eq!(found, kind);
+        assert_eq!(
+            watch(&path),
+            (codec.into(), width, height, sound.map(str::to_owned)),
+            "{codec} {width}x{height}"
+        );
+    }
+    assert!(server.thumbnails.video(plays).is_none());
+    assert_eq!(
+        server.preview_reason(plays).await.as_deref(),
+        Some("the browser plays it")
+    );
+    assert!(server.thumbnails.space().await.unwrap().used > 0);
+    assert_eq!(server.thumbnails.status().borrow().failed, 0);
+}
+
+#[tokio::test]
+async fn converts_a_video_when_someone_opens_it_or_never() {
+    let server = start().await;
+    server
+        .thumbnails
+        .set_settings(PreviewSettings {
+            convert_videos: Some(VideoConversion::Opened),
+            space_percent: 10,
+        })
+        .await
+        .unwrap();
+    let old = server
+        .save("Old.avi", &server.video("old.avi", &["-c:v", "mpeg4"]))
+        .await;
+    // Repackaging is quick, so it happens after upload anyway.
+    let film = server
+        .save(
+            "Film.mkv",
+            &server.video("film.mkv", &["-c:v", "libx264", "-preset", "ultrafast"]),
+        )
+        .await;
+    let (stop, worker) = start_worker(&server.thumbnails);
+    server.wait_for_videos(&[film]).await;
+    assert!(server.thumbnails.video(film).is_some());
+    assert_eq!(server.preview_state(old).await.as_deref(), Some("waiting"));
+    assert!(server.thumbnails.video_waiting(old));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(server.thumbnails.video(old).is_none());
+
+    assert!(server.thumbnails.want(old).await.unwrap());
+    server.wait_for_videos(&[old]).await;
+    assert!(server.thumbnails.video(old).is_some());
+
+    // On a server that never converts, a video that needs it waits for
+    // nothing, and opening it doesn't start it.
+    server
+        .thumbnails
+        .set_settings(PreviewSettings {
+            convert_videos: Some(VideoConversion::Never),
+            space_percent: 10,
+        })
+        .await
+        .unwrap();
+    let never = server
+        .save(
+            "Never.avi",
+            &server.video("never.avi", &["-c:v", "mpeg4", "-t", "1"]),
+        )
+        .await;
+    server.wait_for_plans(&[never]).await;
+    assert!(!server.thumbnails.video_waiting(never));
+    assert!(!server.thumbnails.want(never).await.unwrap());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(server.thumbnails.video(never).is_none());
+    stop.send(()).unwrap();
+    worker.await.unwrap();
+}
+
+#[tokio::test]
+async fn makes_a_lost_video_preview_again_when_someone_opens_it() {
+    let server = start().await;
+    server
+        .thumbnails
+        .set_settings(PreviewSettings {
+            convert_videos: Some(VideoConversion::Upload),
+            space_percent: 10,
+        })
+        .await
+        .unwrap();
+    let film = server
+        .save(
+            "Film.mkv",
+            &server.video("film.mkv", &["-c:v", "libx264", "-preset", "ultrafast"]),
+        )
+        .await;
+    let (stop, worker) = start_worker(&server.thumbnails);
+    server.wait_for_videos(&[film]).await;
+    stop.send(()).unwrap();
+    worker.await.unwrap();
+    let (path, _) = server.thumbnails.video(film).unwrap();
+    std::fs::remove_file(path).unwrap();
+
+    // The worker notices when it starts, as the cache limit would leave
+    // it, but doesn't make it again until someone opens it.
+    let (stop, worker) = start_worker(&server.thumbnails);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !server.thumbnails.video_waiting(film) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the worker should notice the lost preview");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(server.thumbnails.video(film).is_none());
+    assert!(server.thumbnails.want(film).await.unwrap());
+    server.wait_for_videos(&[film]).await;
+    assert!(server.thumbnails.video(film).is_some());
+    assert!(!server.thumbnails.video_waiting(film));
+    stop.send(()).unwrap();
+    worker.await.unwrap();
+}
+
+#[tokio::test]
+async fn converts_4k_hdr_phone_video_within_its_limits() {
+    let server = start().await;
+    server
+        .thumbnails
+        .set_settings(PreviewSettings {
+            convert_videos: Some(VideoConversion::Upload),
+            space_percent: 10,
+        })
+        .await
+        .unwrap();
+    let path = server.dir.path().join("hdr.mov");
+    let made = Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-f", "lavfi"])
+        .args(["-i", "testsrc2=size=3840x2160:rate=30:duration=1"])
+        .args([
+            "-pix_fmt",
+            "yuv420p10le",
+            "-c:v",
+            "libx265",
+            "-preset",
+            "ultrafast",
+        ])
+        .args([
+            "-x265-params",
+            "log-level=error:colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc",
+        ])
+        .args(["-tag:v", "hvc1"])
+        .arg(&path)
+        .status()
+        .unwrap();
+    assert!(made.success());
+    let hash = server
+        .save("IMG_0003.MOV", &std::fs::read(path).unwrap())
+        .await;
+    let (stop, worker) = start_worker(&server.thumbnails);
+    server.wait_for_videos(&[hash]).await;
+    stop.send(()).unwrap();
+    worker.await.unwrap();
+    let Some((path, _)) = server.thumbnails.video(hash) else {
+        panic!("no preview: {:?}", server.preview_reason(hash).await);
+    };
+    assert_eq!(watch(&path), ("h264".into(), 1920, 1080, None));
+}
+
+#[tokio::test]
+async fn converts_videos_from_cameras_tv_and_without_a_container() {
+    let server = start().await;
+    server
+        .thumbnails
+        .set_settings(PreviewSettings {
+            convert_videos: Some(VideoConversion::Upload),
+            space_percent: 10,
+        })
+        .await
+        .unwrap();
+    let mpeg2 = ["-c:v", "mpeg2video"];
+    let videos = [
+        (
+            "Camera.mxf",
+            "camera.mxf",
+            [&mpeg2[..], &["-f", "mxf"]].concat(),
+        ),
+        (
+            "Recording.wtv",
+            "recording.wtv",
+            [&mpeg2[..], &["-f", "wtv"]].concat(),
+        ),
+        (
+            "Tape.dv",
+            "tape.dv",
+            vec![
+                "-vf",
+                "scale=720:480",
+                "-r",
+                "30000/1001",
+                "-pix_fmt",
+                "yuv411p",
+                "-c:v",
+                "dvvideo",
+                "-f",
+                "dv",
+            ],
+        ),
+        (
+            "Camera.mjpeg",
+            "camera.mjpeg",
+            vec!["-c:v", "mjpeg", "-f", "mjpeg"],
+        ),
+        (
+            "Clip.hevc",
+            "clip.hevc",
+            vec![
+                "-c:v",
+                "libx265",
+                "-preset",
+                "ultrafast",
+                "-x265-params",
+                "log-level=error",
+                "-f",
+                "hevc",
+            ],
+        ),
+        (
+            "Clip.h264",
+            "clip.h264",
+            vec!["-c:v", "libx264", "-preset", "ultrafast", "-f", "h264"],
+        ),
+    ];
+    let mut hashes = Vec::new();
+    for (name, made, options) in &videos {
+        hashes.push((*name, server.save(name, &server.video(made, options)).await));
+    }
+    let (stop, worker) = start_worker(&server.thumbnails);
+    let all: Vec<ContentHash> = hashes.iter().map(|(_, hash)| *hash).collect();
+    server.wait_for_videos(&all).await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while all
+            .iter()
+            .any(|hash| server.thumbnails.find(*hash).is_none())
+        {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("each video should get a thumbnail");
+    stop.send(()).unwrap();
+    worker.await.unwrap();
+    for (name, hash) in hashes {
+        let Some((path, kind)) = server.thumbnails.video(hash) else {
+            panic!(
+                "no preview of {name}: {:?}",
+                server.preview_reason(hash).await
+            );
+        };
+        assert_eq!(kind, "video/mp4", "{name}");
+        assert_eq!(watch(&path).0, "h264", "{name}");
     }
 }

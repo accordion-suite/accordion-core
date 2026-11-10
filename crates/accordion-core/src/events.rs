@@ -89,13 +89,24 @@ static MIGRATIONS: &[Migration] = &[
         UPDATE events_notices SET seen_at = read_at;
     ",
     },
+    Migration {
+        version: 3,
+        name: "Show preview settings in the admin log",
+        sql: "
+        DROP INDEX events_log_admin;
+        CREATE INDEX events_log_admin ON events_log (id) WHERE action IN (
+            'account_created', 'account_changed', 'account_deleted', 'module_changed',
+            'backup_changed', 'backup_restored', 'update_installed', 'retention_changed',
+            'previews_changed', 'sign_in_failed');
+    ",
+    },
 ];
 
 /// The actions the admin log shows. It matches the `events_log_admin`
 /// index, so the admin log's query can use it.
 const ADMIN_ACTIONS: &str = "'account_created', 'account_changed', 'account_deleted', \
     'module_changed', 'backup_changed', 'backup_restored', 'update_installed', \
-    'retention_changed', 'sign_in_failed'";
+    'retention_changed', 'previews_changed', 'sign_in_failed'";
 
 /// Sign-ins and account changes, which make up someone's own activity log.
 const ACCOUNT_ACTIONS: &str = "'signed_in', 'sign_in_failed', 'signed_out', 'session_ended', \
@@ -301,6 +312,9 @@ pub enum Action {
     UpdateInstalled,
     /// Details: `keep_days`, or null for forever.
     RetentionChanged,
+    /// Details: `convert_videos`, or null to follow the server's hardware,
+    /// and `space_percent`.
+    PreviewsChanged,
 }
 
 impl Action {
@@ -340,10 +354,11 @@ impl Action {
             Self::BackupRestored => "backup_restored",
             Self::UpdateInstalled => "update_installed",
             Self::RetentionChanged => "retention_changed",
+            Self::PreviewsChanged => "previews_changed",
         }
     }
 
-    const ALL: [Self; 34] = [
+    const ALL: [Self; 35] = [
         Self::Added,
         Self::Edited,
         Self::Renamed,
@@ -378,6 +393,7 @@ impl Action {
         Self::BackupRestored,
         Self::UpdateInstalled,
         Self::RetentionChanged,
+        Self::PreviewsChanged,
     ];
 
     fn from_column(row: &Row<'_>, index: usize) -> rusqlite::Result<Self> {

@@ -29,6 +29,7 @@
 //! A file that fails isn't tried again until [`WORKER`] changes, such as
 //! when an update makes thumbnails of more kinds of file.
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -106,11 +107,58 @@ static MIGRATIONS: &[Migration] = &[
     CREATE INDEX thumbnails_failed ON thumbnails (state) WHERE state = 'failed';
 ",
     },
+    Migration {
+        version: 4,
+        name: "Add video previews and their settings",
+        sql: "
+    -- video: a video the browser can't play, repackaged or converted in
+    -- cache/previews. waiting: one that needs that, which the worker makes
+    -- in turn, or when someone opens it (decision 26).
+    CREATE TABLE thumbnails_new (
+        hash BLOB PRIMARY KEY CHECK (length(hash) = 32),
+        state TEXT NOT NULL CHECK (state IN ('ready', 'none', 'failed')),
+        worker INTEGER NOT NULL,
+        reason TEXT,
+        made_at TEXT NOT NULL,
+        preview TEXT CHECK (preview IN ('picture', 'audio', 'video', 'waiting', 'none', 'failed')),
+        preview_reason TEXT,
+        -- For a video, copy: its picture as it is, in a container the
+        -- browser opens, with its sound converted if need be. convert: its
+        -- picture converted too, which takes much longer.
+        plan TEXT CHECK (plan IN ('copy', 'convert')),
+        -- When someone opened a waiting video, so it goes first.
+        wanted_at TEXT,
+        -- When someone last watched the video's preview, so the cache limit
+        -- removes the least recently watched first.
+        opened_at TEXT,
+        -- Whether the cache limit removed the video's preview, so it's
+        -- made again only when someone opens it.
+        removed INTEGER NOT NULL DEFAULT 0 CHECK (removed IN (0, 1))
+    ) STRICT, WITHOUT ROWID;
+    INSERT INTO thumbnails_new
+        (hash, state, worker, reason, made_at, preview, preview_reason)
+        SELECT hash, state, worker, reason, made_at, preview, preview_reason FROM thumbnails;
+    DROP TABLE thumbnails;
+    ALTER TABLE thumbnails_new RENAME TO thumbnails;
+    CREATE INDEX thumbnails_failed ON thumbnails (state) WHERE state = 'failed';
+    CREATE INDEX thumbnails_videos ON thumbnails (preview) WHERE preview IN ('video', 'waiting');
+
+    -- The admin's choices for previews. convert_videos is upload, opened,
+    -- or never, or NULL to follow what the server's hardware suits.
+    CREATE TABLE thumbnail_settings (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        convert_videos TEXT CHECK (convert_videos IN ('upload', 'opened', 'never')),
+        -- The share of the data disk previews may use, in percent.
+        space_percent INTEGER NOT NULL CHECK (space_percent BETWEEN 1 AND 50)
+    ) STRICT;
+    INSERT INTO thumbnail_settings VALUES (1, NULL, 10);
+",
+    },
 ];
 
 /// The version of what makes thumbnails. Raise it when it can make
 /// thumbnails of files it couldn't before, so they get another try.
-pub const WORKER: u32 = 11;
+pub const WORKER: u32 = 13;
 
 /// The longer side of a thumbnail, in pixels.
 const SIZE: u32 = 480;
@@ -140,6 +188,40 @@ const SOUND_LIMITS: Limits = Limits {
 /// Longer sounds get no converted preview, so one can't keep the worker
 /// busy for long. Three hours at 128 kbit/s is about 170 MB.
 const MAX_SOUND_SECONDS: f64 = 3.0 * 60.0 * 60.0;
+
+/// What ffmpeg may use to repackage a video, which reads and writes it
+/// all, and may convert its sound.
+const COPY_LIMITS: Limits = Limits {
+    memory: 1024 * 1024 * 1024,
+    cpu: Duration::from_secs(30 * 60),
+    time: Duration::from_secs(60 * 60),
+    output: 1024 * 1024,
+};
+
+/// What ffmpeg may use to convert a video. Converting takes several times
+/// a video's length in processor time, and more on small servers, so a
+/// feature film takes hours. Step 6 of decision 26 measures it.
+const CONVERT_LIMITS: Limits = Limits {
+    memory: 1536 * 1024 * 1024,
+    cpu: Duration::from_secs(6 * 60 * 60),
+    time: Duration::from_secs(4 * 60 * 60),
+    output: 1024 * 1024,
+};
+
+/// Larger videos get no converted preview. They keep their thumbnail and
+/// the download.
+const MAX_VIDEO: u64 = 4 * 1024 * 1024 * 1024;
+
+/// The longer side of a converted video, in pixels: 1080p.
+const VIDEO_SIZE: u32 = 1920;
+
+/// Servers with this many cores or more convert videos after upload.
+/// Smaller ones convert a video when someone first opens it.
+const UPLOAD_CORES: usize = 6;
+
+/// How long after someone last watched a video's preview the worker notes
+/// it again, so watching doesn't write to the database at every seek.
+const OPENED_EVERY: Duration = Duration::from_secs(60 * 60);
 
 /// How large a worker's picture is, and what the worker may use.
 #[derive(Clone, Copy)]
@@ -239,7 +321,7 @@ const DOCUMENT_SETTINGS: &str = r#"<item oor:path="/org.openoffice.Office.Common
 /// including older ones from DVDs, Windows Media, and Flash.
 const VIDEO_DECODERS: &str = "h264,hevc,vp8,vp9,av1,libdav1d,mpeg4,mpeg1video,mpeg2video,mjpeg,\
                               prores,msmpeg4v1,msmpeg4v2,msmpeg4,wmv1,wmv2,wmv3,vc1,flv,\
-                              vp6f,theora,rv10,rv20,rv30,rv40";
+                              vp6f,theora,rv10,rv20,rv30,rv40,dnxhd,dvvideo";
 
 /// ffprobe opens a decoder for every track, and stops at one it may not use,
 /// so it may also use the decoders for the audio in those videos. ffmpeg
@@ -513,12 +595,109 @@ struct Inner {
     /// [`office_stamp`]. `None` until the first look after the server
     /// starts.
     office_seen: std::sync::Mutex<Option<OfficeStamp>>,
+    /// Videos waiting for their preview, and how each is made, so item
+    /// lists can say so without asking the database.
+    videos_waiting: std::sync::Mutex<HashMap<ContentHash, Plan>>,
+    /// When the server converts videos: the admin's choice, or what the
+    /// server's hardware suits.
+    conversion: std::sync::Mutex<VideoConversion>,
+    /// Wakes the video worker when a video starts waiting, someone opens
+    /// one, or the setting changes.
+    videos_wake: tokio::sync::Notify,
+    /// When each video's preview was last noted as watched.
+    watched: std::sync::Mutex<HashMap<ContentHash, std::time::Instant>>,
+}
+
+/// When the server converts videos the browser can't play. Repackaging,
+/// which is quick, happens after upload whatever this says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VideoConversion {
+    /// In the background, after upload, so a video is ready when someone
+    /// opens it.
+    Upload,
+    /// When someone first opens the video, so only watched videos take
+    /// work and space.
+    Opened,
+    /// Never: people download the video to watch it.
+    Never,
+}
+
+impl VideoConversion {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Upload => "upload",
+            Self::Opened => "opened",
+            Self::Never => "never",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        [Self::Upload, Self::Opened, Self::Never]
+            .into_iter()
+            .find(|choice| choice.as_str() == text)
+    }
+
+    /// What this server's hardware suits: after upload with 6 or more
+    /// cores, and when opened with fewer.
+    pub fn automatic() -> Self {
+        if cores() >= UPLOAD_CORES {
+            Self::Upload
+        } else {
+            Self::Opened
+        }
+    }
+}
+
+/// How many cores the server has.
+pub fn cores() -> usize {
+    std::thread::available_parallelism().map_or(1, usize::from)
+}
+
+/// The admin's choices for previews.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PreviewSettings {
+    /// `None` follows [`VideoConversion::automatic`].
+    pub convert_videos: Option<VideoConversion>,
+    /// The share of the data disk previews may use, in percent: 1 to 50.
+    pub space_percent: u32,
+}
+
+/// How much room previews take, in bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PreviewSpace {
+    pub used: u64,
+    /// The share of the data disk they may use.
+    pub limit: u64,
+    /// The size of the data disk.
+    pub disk: u64,
+}
+
+/// How a video's preview is made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Plan {
+    /// Its picture as it is, in a container the browser opens, with its
+    /// sound converted if the browser can't play it.
+    Copy,
+    /// Its picture converted too.
+    Convert,
+}
+
+impl Plan {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Copy => "copy",
+            Self::Convert => "convert",
+        }
+    }
 }
 
 /// What became of one file.
 #[derive(Debug, PartialEq, Eq)]
 enum Outcome {
     Ready,
+    /// A video that needs a preview made, which the video worker makes in
+    /// turn.
+    Waiting(Plan),
     None(&'static str),
     Failed(String),
 }
@@ -677,6 +856,18 @@ pub(crate) enum Container {
     Ogg,
     /// RealMedia: `.rm`, `.rmvb`, and some `.ra` files.
     RealMedia,
+    /// MXF, from professional cameras and editing.
+    Mxf,
+    /// Windows Media Center's TV recordings, `.wtv`.
+    Wtv,
+    /// DV, from older camcorders, `.dv`.
+    Dv,
+    /// Motion JPEG on its own, `.mjpeg`, which starts as a JPEG does.
+    Mjpeg,
+    /// H.264 and HEVC on their own, without a container: `.h264`, `.hevc`,
+    /// and `.h265`.
+    H264,
+    Hevc,
 }
 
 impl Container {
@@ -692,6 +883,12 @@ impl Container {
             Self::Flv => "flv",
             Self::Ogg => "ogg",
             Self::RealMedia => "rm",
+            Self::Mxf => "mxf",
+            Self::Wtv => "wtv",
+            Self::Dv => "dv",
+            Self::Mjpeg => "mjpeg",
+            Self::H264 => "h264",
+            Self::Hevc => "hevc",
         }
     }
 }
@@ -951,6 +1148,8 @@ pub(crate) enum Loader {
 struct Tracks {
     /// The first sound track.
     sound: Option<Track>,
+    /// The first video track, not counting cover art.
+    picture: Option<Picture>,
     /// Whether there's cover art: a picture kept with the sound.
     cover: bool,
     /// Whether there's video, not counting cover art.
@@ -965,6 +1164,28 @@ struct Track {
     /// Samples a second.
     rate: u32,
     channels: u32,
+}
+
+/// A video track.
+#[derive(Debug, PartialEq)]
+struct Picture {
+    codec: String,
+    /// How its pixels are kept, such as `yuv420p`, which says how many bits
+    /// each has.
+    pixels: String,
+    /// Whether it's HDR, as HLG or PQ.
+    hdr: bool,
+}
+
+/// How a video's preview is made from it.
+#[derive(Debug, PartialEq)]
+struct Recipe {
+    /// WebM, for VP8, VP9, and AV1, rather than MP4.
+    webm: bool,
+    /// Whether the picture is copied as it is, rather than converted.
+    copy_picture: bool,
+    /// Whether the sound is copied as it is, rather than converted.
+    copy_sound: bool,
 }
 
 /// What ffprobe says about a video.
@@ -1015,6 +1236,20 @@ impl Thumbnails {
             )
         })
         .await?;
+        let settings = db.read(read_settings).await?;
+        let videos_waiting = db
+            .read(|conn| {
+                conn.prepare("SELECT hash, plan FROM thumbnails WHERE preview = 'waiting'")?
+                    .query_map([], |row| {
+                        let plan = match row.get_ref(1)?.as_str_or_null()? {
+                            Some("convert") => Plan::Convert,
+                            _ => Plan::Copy,
+                        };
+                        Ok((hash(row, 0)?, plan))
+                    })?
+                    .collect::<Result<HashMap<_, _>, _>>()
+            })
+            .await?;
         let unavailable = unavailable(&tools);
         let videos = videos_unavailable(&tools);
         let documents = documents_unavailable(&tools);
@@ -1039,6 +1274,14 @@ impl Thumbnails {
                 }),
                 office: tokio::sync::Mutex::new(None),
                 office_seen: std::sync::Mutex::new(None),
+                videos_waiting: std::sync::Mutex::new(videos_waiting),
+                conversion: std::sync::Mutex::new(
+                    settings
+                        .convert_videos
+                        .unwrap_or_else(VideoConversion::automatic),
+                ),
+                videos_wake: tokio::sync::Notify::new(),
+                watched: std::sync::Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -1124,6 +1367,17 @@ impl Thumbnails {
             stopped.await;
             return;
         }
+        // Videos take minutes, so they have a worker of their own, and
+        // thumbnails don't wait behind them.
+        tokio::select! {
+            () = &mut stopped => {}
+            () = self.pictures() => {}
+            () = self.videos() => {}
+        }
+    }
+
+    /// Makes thumbnails and the quick previews, forever.
+    async fn pictures(&self) {
         let mut saved = self.inner.storage.saved();
         let mut tidied_at: Option<tokio::time::Instant> = None;
         loop {
@@ -1143,10 +1397,7 @@ impl Thumbnails {
                 }
             };
             for hash in &waiting {
-                let outcome = tokio::select! {
-                    () = &mut stopped => return,
-                    outcome = self.make(*hash) => outcome,
-                };
+                let outcome = self.make(*hash).await;
                 let result = self.record(*hash, outcome).await;
                 self.note(result.err());
             }
@@ -1164,10 +1415,7 @@ impl Thumbnails {
                 Vec::new()
             };
             for hash in &previews {
-                let outcome = tokio::select! {
-                    () = &mut stopped => return,
-                    outcome = self.make_preview(*hash) => outcome,
-                };
+                let outcome = self.make_preview(*hash).await;
                 let result = self.record_preview(*hash, outcome).await;
                 self.note(result.err());
             }
@@ -1175,7 +1423,6 @@ impl Thumbnails {
             self.note(result.err());
             if waiting.is_empty() && previews.is_empty() {
                 tokio::select! {
-                    () = &mut stopped => return,
                     _ = saved.changed() => {}
                     () = tokio::time::sleep(TIDY_EVERY) => {}
                 }
@@ -1207,31 +1454,464 @@ impl Thumbnails {
 
     /// Records whether the contents with `hash` have a preview.
     async fn record_preview(&self, hash: ContentHash, outcome: Outcome) -> Result<(), Error> {
-        let (state, reason) = match outcome {
+        let (state, reason, plan) = match outcome {
             // The worker has made it, so its file says which it is.
-            Outcome::Ready if self.sound(hash).is_some() => ("audio", None),
-            Outcome::Ready => ("picture", None),
-            Outcome::None(reason) => ("none", Some(reason.to_owned())),
+            Outcome::Ready if self.sound(hash).is_some() => ("audio", None, None),
+            Outcome::Ready => ("picture", None, None),
+            Outcome::Waiting(plan) => ("waiting", None, Some(plan)),
+            Outcome::None(reason) => ("none", Some(reason.to_owned()), None),
             Outcome::Failed(problem) => {
                 tracing::info!(contents = %hash, %problem, "couldn't make a preview");
-                ("failed", Some(problem))
+                ("failed", Some(problem), None)
             }
         };
         self.inner
             .db
             .write(move |tx| {
                 tx.execute(
-                    "UPDATE thumbnails SET preview = ?2, preview_reason = ?3 WHERE hash = ?1",
-                    (&hash.0[..], state, reason),
+                    "UPDATE thumbnails SET preview = ?2, preview_reason = ?3, plan = ?4,
+                         wanted_at = NULL, removed = 0
+                     WHERE hash = ?1",
+                    (&hash.0[..], state, reason, plan.map(Plan::as_str)),
                 )?;
-                // Open lists load the items again, which now have a preview.
-                if state == "picture" || state == "audio" {
+                // Open lists load the items again, which now have a preview,
+                // or say a video's is coming.
+                if state != "none" && state != "failed" {
                     hint_folders(tx, hash)?;
                 }
                 Ok::<_, rusqlite::Error>(())
             })
             .await?;
+        if let Some(plan) = plan {
+            self.lock_waiting().insert(hash, plan);
+            self.inner.videos_wake.notify_one();
+        }
         Ok(())
+    }
+
+    fn lock_waiting(&self) -> std::sync::MutexGuard<'_, HashMap<ContentHash, Plan>> {
+        self.inner.videos_waiting.lock().expect("never poisoned")
+    }
+
+    fn conversion(&self) -> VideoConversion {
+        *self.inner.conversion.lock().expect("never poisoned")
+    }
+
+    /// Whether the video with `hash` is waiting for a preview the server
+    /// will make: in turn, or once someone opens it. A video waiting to be
+    /// converted on a server that never converts isn't.
+    pub fn video_waiting(&self, hash: ContentHash) -> bool {
+        match self.lock_waiting().get(&hash) {
+            Some(Plan::Copy) => true,
+            Some(Plan::Convert) => self.conversion() != VideoConversion::Never,
+            None => false,
+        }
+    }
+
+    /// Notes that someone opened the video with `hash`, which is waiting for
+    /// its preview, so the worker makes it next. Returns whether the server
+    /// will make it.
+    pub async fn want(&self, hash: ContentHash) -> Result<bool, Error> {
+        if !self.video_waiting(hash) {
+            return Ok(false);
+        }
+        self.inner
+            .db
+            .write(move |tx| {
+                tx.execute(
+                    concat!(
+                        "UPDATE thumbnails SET wanted_at = ",
+                        sql_now!(),
+                        " WHERE hash = ?1 AND preview = 'waiting' AND wanted_at IS NULL"
+                    ),
+                    [&hash.0[..]],
+                )
+            })
+            .await?;
+        self.inner.videos_wake.notify_one();
+        Ok(true)
+    }
+
+    /// Notes that someone is watching the preview of the video with `hash`,
+    /// so the cache limit removes it after ones watched less recently.
+    pub async fn watched(&self, hash: ContentHash) -> Result<(), Error> {
+        {
+            let mut watched = self.inner.watched.lock().expect("never poisoned");
+            let now = std::time::Instant::now();
+            if watched
+                .get(&hash)
+                .is_some_and(|at| now.duration_since(*at) < OPENED_EVERY)
+            {
+                return Ok(());
+            }
+            watched.insert(hash, now);
+        }
+        self.inner
+            .db
+            .write(move |tx| {
+                tx.execute(
+                    concat!(
+                        "UPDATE thumbnails SET opened_at = ",
+                        sql_now!(),
+                        " WHERE hash = ?1"
+                    ),
+                    [&hash.0[..]],
+                )
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// The admin's choices for previews.
+    pub async fn settings(&self) -> Result<PreviewSettings, Error> {
+        Ok(self.inner.db.read(read_settings).await?)
+    }
+
+    /// Changes the admin's choices for previews. Returns whether they
+    /// changed. Previews over a smaller limit go now.
+    pub async fn set_settings(&self, settings: PreviewSettings) -> Result<bool, Error> {
+        let changed = self
+            .inner
+            .db
+            .write(move |tx| {
+                tx.execute(
+                    "UPDATE thumbnail_settings SET convert_videos = ?1, space_percent = ?2
+                     WHERE convert_videos IS NOT ?1 OR space_percent != ?2",
+                    (
+                        settings.convert_videos.map(VideoConversion::as_str),
+                        settings.space_percent.clamp(1, 50),
+                    ),
+                )
+            })
+            .await?
+            > 0;
+        *self.inner.conversion.lock().expect("never poisoned") = settings
+            .convert_videos
+            .unwrap_or_else(VideoConversion::automatic);
+        self.inner.videos_wake.notify_one();
+        if changed {
+            self.limit_space(None).await?;
+        }
+        Ok(changed)
+    }
+
+    /// How much room previews take, and may take.
+    pub async fn space(&self) -> Result<PreviewSpace, Error> {
+        let settings = self.settings().await?;
+        let previews = self.inner.previews.clone();
+        let (used, disk) = tokio::task::spawn_blocking(move || {
+            Ok::<_, io::Error>((folder_size(&previews)?, disk_size(&previews)?))
+        })
+        .await
+        .map_err(io::Error::other)??;
+        Ok(PreviewSpace {
+            used,
+            limit: disk / 100 * u64::from(settings.space_percent),
+            disk,
+        })
+    }
+
+    /// Removes the least recently watched videos' previews while previews
+    /// take more than their limit, except `keep`'s, which was just made.
+    /// They're made again when someone opens them. Pictures' and sounds'
+    /// previews count, but stay, since they're small.
+    async fn limit_space(&self, keep: Option<ContentHash>) -> Result<(), Error> {
+        let space = self.space().await?;
+        if space.used <= space.limit {
+            return Ok(());
+        }
+        let videos = self
+            .inner
+            .db
+            .read(|conn| {
+                conn.prepare(
+                    "SELECT hash, plan FROM thumbnails WHERE preview = 'video'
+                     ORDER BY coalesce(opened_at, made_at)",
+                )?
+                .query_map([], |row| {
+                    let plan = match row.get_ref(1)?.as_str_or_null()? {
+                        Some("convert") => Plan::Convert,
+                        _ => Plan::Copy,
+                    };
+                    Ok((hash(row, 0)?, plan))
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(Error::from)
+            })
+            .await?;
+        let plans: HashMap<ContentHash, Plan> = videos.iter().copied().collect();
+        let sizes: Vec<(ContentHash, u64)> = videos
+            .iter()
+            .filter_map(|&(hash, _)| {
+                let (path, _) = self.video(hash)?;
+                Some((hash, std::fs::metadata(path).ok()?.len()))
+            })
+            .collect();
+        let remove = over_limit(&sizes, space.used, space.limit, keep);
+        if remove.is_empty() {
+            return Ok(());
+        }
+        tracing::info!(
+            count = remove.len(),
+            "removing videos' previews over the limit"
+        );
+        for hash in &remove {
+            if let Some((path, _)) = self.video(*hash) {
+                std::fs::remove_file(path)?;
+            }
+        }
+        let removed = remove.clone();
+        self.inner
+            .db
+            .write(move |tx| {
+                let mut update = tx.prepare(
+                    "UPDATE thumbnails SET preview = 'waiting', removed = 1, wanted_at = NULL
+                     WHERE hash = ?1",
+                )?;
+                for hash in &removed {
+                    update.execute([&hash.0[..]])?;
+                    hint_folders(tx, *hash)?;
+                }
+                Ok::<_, rusqlite::Error>(())
+            })
+            .await?;
+        let mut waiting = self.lock_waiting();
+        for hash in remove {
+            waiting.insert(hash, plans[&hash]);
+        }
+        Ok(())
+    }
+
+    /// Makes videos' previews, one at a time, forever: those someone
+    /// opened first, then, as the setting says, the rest.
+    async fn videos(&self) {
+        loop {
+            // Before looking, so a wake after the look isn't missed.
+            let woken = self.inner.videos_wake.notified();
+            let mut woken = std::pin::pin!(woken);
+            woken.as_mut().enable();
+            match self.next_video().await {
+                Ok(Some((hash, plan))) => {
+                    let outcome = self.make_video(hash, plan).await;
+                    let made = outcome == Outcome::Ready;
+                    let result = self.record_video(hash, outcome).await;
+                    self.note(result.err());
+                    if made {
+                        let result = self.limit_space(Some(hash)).await;
+                        self.note(result.err());
+                    }
+                }
+                Ok(None) => {
+                    tokio::select! {
+                        () = woken => {}
+                        () = tokio::time::sleep(TIDY_EVERY) => {}
+                    }
+                }
+                Err(err) => {
+                    self.note(Some(err));
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                }
+            }
+        }
+    }
+
+    /// The next video to make a preview of: one someone opened, newest
+    /// first, then, after upload, one to repackage, then one to convert.
+    /// Previews the cache limit removed are made again only when someone
+    /// opens them, and so are new ones while previews are at their limit.
+    async fn next_video(&self) -> Result<Option<(ContentHash, Plan)>, Error> {
+        let conversion = self.conversion();
+        let upload = conversion == VideoConversion::Upload;
+        let converts = conversion != VideoConversion::Never;
+        // Once previews fill their space, a new one would only push out
+        // another, so only videos someone opens are made.
+        let room = match self.space().await {
+            Ok(space) => space.used < space.limit,
+            Err(err) => {
+                tracing::warn!(%err, "couldn't measure previews' space");
+                true
+            }
+        };
+        self.inner
+            .db
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT hash, plan FROM thumbnails
+                     WHERE preview = 'waiting'
+                       AND (plan = 'copy' OR ?2)
+                       AND (wanted_at IS NOT NULL
+                            OR (?3 AND removed = 0 AND (plan = 'copy' OR ?1)))
+                     ORDER BY wanted_at IS NULL, wanted_at DESC, plan = 'convert', made_at DESC
+                     LIMIT 1",
+                    (upload, converts, room),
+                    |row| {
+                        let plan = match row.get_ref(1)?.as_str_or_null()? {
+                            Some("convert") => Plan::Convert,
+                            _ => Plan::Copy,
+                        };
+                        Ok((hash(row, 0)?, plan))
+                    },
+                )
+                .optional()
+                .map_err(Error::from)
+            })
+            .await
+    }
+
+    /// Records how a video's preview went.
+    async fn record_video(&self, hash: ContentHash, outcome: Outcome) -> Result<(), Error> {
+        let (state, reason, plan) = match outcome {
+            Outcome::Ready => ("video", None, None),
+            // Repackaging failed, so it's converted instead, as the setting
+            // says.
+            Outcome::Waiting(plan) => ("waiting", None, Some(plan)),
+            Outcome::None(reason) => ("none", Some(reason.to_owned()), None),
+            Outcome::Failed(problem) => {
+                tracing::info!(contents = %hash, %problem, "couldn't make a video's preview");
+                ("failed", Some(problem), None)
+            }
+        };
+        self.inner
+            .db
+            .write(move |tx| {
+                tx.execute(
+                    concat!(
+                        "UPDATE thumbnails SET preview = ?2, preview_reason = ?3,
+                             plan = coalesce(?4, plan), removed = 0,
+                             wanted_at = CASE WHEN ?2 = 'waiting' THEN wanted_at END,
+                             opened_at = ",
+                        sql_now!(),
+                        " WHERE hash = ?1 AND preview = 'waiting'"
+                    ),
+                    (&hash.0[..], state, reason, plan.map(Plan::as_str)),
+                )?;
+                hint_folders(tx, hash)
+            })
+            .await?;
+        let mut waiting = self.lock_waiting();
+        match plan {
+            Some(plan) => {
+                waiting.insert(hash, plan);
+            }
+            None => {
+                waiting.remove(&hash);
+            }
+        }
+        Ok(())
+    }
+
+    /// Makes the preview of the video with `hash` as `plan` says: its
+    /// picture copied if browsers play it, or converted.
+    async fn make_video(&self, hash: ContentHash, plan: Plan) -> Outcome {
+        let file = self.inner.storage.contents_file(hash);
+        let (container, size) = match self.identify(&file, hash).await {
+            Ok((Some(Kind::Video(container)), size, _)) => (container, size),
+            Ok(_) => return Outcome::None("not a video"),
+            Err(problem) => return Outcome::Failed(problem),
+        };
+        if size > MAX_VIDEO {
+            return Outcome::None("a video over 4 GB");
+        }
+        let decoders = format!("{VIDEO_DECODERS},{SOUND_DECODERS},{COVER_DECODERS}");
+        let tracks = match self.tracks(&file, container.format(), &decoders).await {
+            Ok(tracks) => tracks,
+            Err(problem) => return Outcome::Failed(problem),
+        };
+        let name = match self.name(hash).await {
+            Ok(name) => name.unwrap_or_default(),
+            Err(err) => return Outcome::Failed(format!("couldn't read the file's name: {err}")),
+        };
+        let Some(mut recipe) = recipe(&name, container, &tracks) else {
+            return Outcome::None("the browser plays it");
+        };
+        if plan == Plan::Convert {
+            recipe = Recipe {
+                webm: false,
+                copy_picture: false,
+                copy_sound: recipe.copy_sound && !recipe.webm,
+            };
+        }
+        let scratch = match self.scratch_dir() {
+            Ok(scratch) => scratch,
+            Err(problem) => return Outcome::Failed(problem),
+        };
+        let made = scratch.path().join("video");
+        let args = video_args(
+            &file,
+            container.format(),
+            &decoders,
+            &tracks,
+            &recipe,
+            &made,
+        );
+        let limits = if recipe.copy_picture {
+            COPY_LIMITS
+        } else {
+            CONVERT_LIMITS
+        };
+        let input = match std::fs::File::open("/dev/null") {
+            Ok(input) => input,
+            Err(err) => return Outcome::Failed(err.to_string()),
+        };
+        let converted = self
+            .inner
+            .sandbox
+            .run(Job {
+                program: &self.inner.tools.ffmpeg,
+                args: &args,
+                // glibc reserves memory for each thread's own heap, which
+                // counts toward the limit, unless it shares a few.
+                env: &[("MALLOC_ARENA_MAX", "2")],
+                input,
+                read: std::slice::from_ref(&file),
+                write: &[scratch.path().to_owned()],
+                sockets: None,
+                limits,
+            })
+            .await
+            .map_err(|err| err.to_string())
+            .and_then(|_| {
+                // The worker could only make folders and plain files there.
+                made.symlink_metadata()
+                    .is_ok_and(|found| found.is_file() && found.len() > 0)
+                    .then_some(())
+                    .ok_or_else(|| "ffmpeg didn't make the video".to_owned())
+            });
+        match converted {
+            Ok(()) => {
+                let path = self.video_path(hash, recipe.webm);
+                let kept =
+                    std::fs::create_dir_all(path.parent().expect("a preview is in a folder"))
+                        .and_then(|()| std::fs::rename(&made, &path));
+                match kept {
+                    Ok(()) => Outcome::Ready,
+                    Err(err) => Outcome::Failed(format!("couldn't keep the preview: {err}")),
+                }
+            }
+            // Some files' pictures can't be copied as they are, such as
+            // H.264 in an older AVI, so they're converted instead.
+            Err(problem) if recipe.copy_picture => {
+                tracing::info!(contents = %hash, %problem, "couldn't repackage a video");
+                Outcome::Waiting(Plan::Convert)
+            }
+            Err(problem) => Outcome::Failed(problem),
+        }
+    }
+
+    /// The preview the viewer plays of the video with `hash`, if there is
+    /// one yet, and its content type.
+    pub fn video(&self, hash: ContentHash) -> Option<(PathBuf, &'static str)> {
+        [(false, "video/mp4"), (true, "video/webm")]
+            .into_iter()
+            .map(|(webm, kind)| (self.video_path(hash, webm), kind))
+            .find(|(path, _)| path.is_file())
+    }
+
+    fn video_path(&self, hash: ContentHash, webm: bool) -> PathBuf {
+        self.inner
+            .previews
+            .join(blobs::shard(hash))
+            .with_extension(if webm { "webm" } else { "mp4" })
     }
 
     /// Contents whose preview isn't decided yet, newest first: those with a
@@ -1317,6 +1997,7 @@ impl Thumbnails {
     async fn record(&self, hash: ContentHash, outcome: Outcome) -> Result<(), Error> {
         let (state, reason) = match outcome {
             Outcome::Ready => ("ready", None),
+            Outcome::Waiting(_) => unreachable!("only previews wait"),
             Outcome::None(reason) => ("none", Some(reason.to_owned())),
             Outcome::Failed(problem) => {
                 tracing::info!(contents = %hash, %problem, "couldn't make a thumbnail");
@@ -1334,7 +2015,8 @@ impl Thumbnails {
                         ") ON CONFLICT (hash) DO UPDATE SET
                              state = excluded.state, worker = excluded.worker,
                              reason = excluded.reason, made_at = excluded.made_at,
-                             preview = NULL, preview_reason = NULL"
+                             preview = NULL, preview_reason = NULL, plan = NULL,
+                             wanted_at = NULL, removed = 0"
                     ),
                     (&hash.0[..], state, WORKER, reason),
                 )?;
@@ -1344,6 +2026,8 @@ impl Thumbnails {
                 Ok::<_, rusqlite::Error>(())
             })
             .await?;
+        // Its preview is decided again.
+        self.lock_waiting().remove(&hash);
         Ok(())
     }
 
@@ -1431,38 +2115,68 @@ impl Thumbnails {
             .db
             .read(|conn| {
                 conn.prepare(
-                    "SELECT hash, preview = 'audio' FROM thumbnails
-                     WHERE preview IN ('picture', 'audio')",
+                    "SELECT hash, preview FROM thumbnails
+                     WHERE preview IN ('picture', 'audio', 'video')",
                 )?
-                .query_map([], |row| Ok((hash(row, 0)?, row.get::<_, bool>(1)?)))?
+                .query_map([], |row| Ok((hash(row, 0)?, row.get::<_, String>(1)?)))?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(Error::from)
             })
             .await?;
-        let lost: Vec<ContentHash> = previews
+        let lost: Vec<(ContentHash, bool)> = previews
             .into_iter()
-            .filter(|&(hash, sound)| {
-                if sound {
-                    self.sound(hash).is_none()
-                } else {
-                    self.picture(hash).is_none()
-                }
+            .filter(|(hash, preview)| match preview.as_str() {
+                "audio" => self.sound(*hash).is_none(),
+                "video" => self.video(*hash).is_none(),
+                _ => self.picture(*hash).is_none(),
             })
-            .map(|(hash, _)| hash)
+            .map(|(hash, preview)| (hash, preview == "video"))
             .collect();
         if !lost.is_empty() {
+            let videos: Vec<ContentHash> = lost
+                .iter()
+                .filter(|(_, video)| *video)
+                .map(|(hash, _)| *hash)
+                .collect();
             self.inner
                 .db
                 .write(move |tx| {
-                    let mut reset =
-                        tx.prepare("UPDATE thumbnails SET preview = NULL WHERE hash = ?1")?;
-                    for hash in &lost {
-                        reset.execute([&hash.0[..]])?;
+                    // A video's is made again when someone opens it, as one
+                    // the cache limit removed is.
+                    let mut reset = tx.prepare(
+                        "UPDATE thumbnails
+                         SET preview = CASE WHEN ?2 THEN 'waiting' END,
+                             removed = ?2, wanted_at = NULL
+                         WHERE hash = ?1",
+                    )?;
+                    for (hash, video) in &lost {
+                        reset.execute((&hash.0[..], video))?;
                     }
                     Ok::<_, rusqlite::Error>(())
                 })
                 .await?;
+            let plans = self
+                .inner
+                .db
+                .read(move |conn| {
+                    let mut plan = conn.prepare("SELECT plan FROM thumbnails WHERE hash = ?1")?;
+                    videos
+                        .iter()
+                        .map(|hash| {
+                            let convert = plan
+                                .query_row([&hash.0[..]], |row| {
+                                    Ok(row.get_ref(0)?.as_str_or_null()? == Some("convert"))
+                                })
+                                .optional()?
+                                .unwrap_or(false);
+                            Ok((*hash, if convert { Plan::Convert } else { Plan::Copy }))
+                        })
+                        .collect::<Result<Vec<_>, rusqlite::Error>>()
+                })
+                .await?;
+            self.lock_waiting().extend(plans);
         }
+        self.limit_space(None).await?;
 
         let gone = self
             .inner
@@ -1478,6 +2192,7 @@ impl Thumbnails {
             })
             .await?;
         for hash in gone {
+            self.lock_waiting().remove(&hash);
             let paths = [
                 self.path(hash, ThumbnailKind::Picture),
                 self.path(hash, ThumbnailKind::Text),
@@ -1485,6 +2200,8 @@ impl Thumbnails {
                 self.preview_path(hash, true),
                 self.picture_path(hash),
                 self.sound_path(hash),
+                self.video_path(hash, false),
+                self.video_path(hash, true),
             ];
             for path in paths {
                 match std::fs::remove_file(path) {
@@ -1506,8 +2223,9 @@ impl Thumbnails {
     ) -> Result<(Option<Kind>, u64, Vec<u8>), String> {
         let (kind, size, head) =
             sniff(file).map_err(|err| format!("couldn't read the file: {err}"))?;
+        // A JPEG may be the first frame of a Motion JPEG stream.
         let by_name = kind.is_none()
-            || (kind == Some(Kind::Image) && tiff(&head))
+            || (kind == Some(Kind::Image) && (tiff(&head) || head.starts_with(b"\xff\xd8")))
             || FORMATS
                 .iter()
                 .any(|format| head.starts_with(format.signature));
@@ -1596,7 +2314,7 @@ impl Thumbnails {
             Kind::Loaded(loader) => self.loaded(&file, loader, THUMBNAIL).await,
             Kind::Pdf => self.pdf(&file).await,
             Kind::Video(_) if !self.inner.tools.has_ffmpeg() => return Outcome::None(NO_FFMPEG),
-            Kind::Video(container) => match self.video(&file, container).await {
+            Kind::Video(container) => match self.video_frame(&file, container).await {
                 Ok(Some(frame)) => self.thumbnail(Ok(frame)).await,
                 Ok(None) => return Outcome::None(NO_COVER),
                 Err(problem) => Err(problem),
@@ -1632,7 +2350,7 @@ impl Thumbnails {
     /// can't show itself, such as a TIFF, a HEIC, or a Photoshop file.
     async fn make_preview(&self, hash: ContentHash) -> Outcome {
         let file = self.inner.storage.contents_file(hash);
-        let (kind, _, head) = match self.identify(&file, hash).await {
+        let (kind, size, head) = match self.identify(&file, hash).await {
             Ok(identified) => identified,
             Err(problem) => return Outcome::Failed(problem),
         };
@@ -1679,12 +2397,8 @@ impl Thumbnails {
             }
             Some(Kind::Sox(_)) if !self.inner.tools.has_sox() => return Outcome::None(NO_SOX),
             Some(Kind::Sox(format)) => return self.old_sound(hash, &file, format).await,
-            // Videos with only sound, such as Windows Media songs.
             Some(Kind::Video(container)) => {
-                let decoders = format!("{VIDEO_DECODERS},{SOUND_DECODERS},{COVER_DECODERS}");
-                return self
-                    .listen(hash, &file, container.format(), &decoders)
-                    .await;
+                return self.plan_video(hash, &file, container, size).await;
             }
             Some(Kind::Still(_)) if !self.inner.tools.has_ffmpeg() => {
                 return Outcome::None(NO_FFMPEG);
@@ -2213,7 +2927,7 @@ impl Thumbnails {
     /// A frame from 10% into a video, which skips black frames and fade-ins
     /// at the start, at most [`SIZE`] pixels on its longer side, as a PNG.
     /// `None` if the file has no video, such as a song.
-    async fn video(
+    async fn video_frame(
         &self,
         file: &Path,
         container: Container,
@@ -2386,7 +3100,7 @@ impl Thumbnails {
             "-codec_whitelist",
             decoders,
             "-show_entries",
-            "stream=codec_type,codec_name,sample_rate,channels:\
+            "stream=codec_type,codec_name,sample_rate,channels,pix_fmt,color_transfer:\
              stream_disposition=attached_pic:format=duration",
             "-of",
             "json",
@@ -2429,6 +3143,38 @@ impl Thumbnails {
         }
         self.keep_sound(hash, file, demuxer, decoders, &track, tracks.seconds)
             .await
+    }
+
+    /// Decides how a video's preview is made, which the video worker then
+    /// makes in turn. Videos with only sound, such as Windows Media songs,
+    /// have it converted now, as other sound is.
+    async fn plan_video(
+        &self,
+        hash: ContentHash,
+        file: &Path,
+        container: Container,
+        size: u64,
+    ) -> Outcome {
+        let decoders = format!("{VIDEO_DECODERS},{SOUND_DECODERS},{COVER_DECODERS}");
+        let tracks = match self.tracks(file, container.format(), &decoders).await {
+            Ok(tracks) => tracks,
+            Err(problem) => return Outcome::Failed(problem),
+        };
+        if tracks.picture.is_none() {
+            return self.listen(hash, file, container.format(), &decoders).await;
+        }
+        if size > MAX_VIDEO {
+            return Outcome::None("a video over 4 GB");
+        }
+        let name = match self.name(hash).await {
+            Ok(name) => name.unwrap_or_default(),
+            Err(err) => return Outcome::Failed(format!("couldn't read the file's name: {err}")),
+        };
+        match recipe(&name, container, &tracks) {
+            None => Outcome::None("the browser plays it"),
+            Some(recipe) if recipe.copy_picture => Outcome::Waiting(Plan::Copy),
+            Some(_) => Outcome::Waiting(Plan::Convert),
+        }
     }
 
     /// Converts a sound only SoX reads. SoX turns it into WAV in a scratch
@@ -2829,8 +3575,22 @@ fn tracks(output: &[u8]) -> Result<Tracks, String> {
                 .and_then(|channels| u32::try_from(channels).ok())
                 .unwrap_or_default(),
         });
+    let picture = streams
+        .iter()
+        .find(|stream| {
+            stream["codec_type"] == "video" && stream["disposition"]["attached_pic"] != 1
+        })
+        .map(|stream| Picture {
+            codec: stream["codec_name"].as_str().unwrap_or_default().to_owned(),
+            pixels: stream["pix_fmt"].as_str().unwrap_or_default().to_owned(),
+            hdr: matches!(
+                stream["color_transfer"].as_str(),
+                Some("smpte2084" | "arib-std-b67")
+            ),
+        });
     Ok(Tracks {
         sound,
+        picture,
         cover: video(true),
         video: video(false),
         seconds: json["format"]["duration"]
@@ -2838,6 +3598,215 @@ fn tracks(output: &[u8]) -> Result<Tracks, String> {
             .and_then(|seconds| seconds.parse::<f64>().ok())
             .filter(|seconds| seconds.is_finite() && *seconds > 0.0),
     })
+}
+
+/// How to make the preview of a video named `name`, in `container`, with
+/// `tracks`, which has a picture. `None` if browsers play it as it is, as
+/// Drive sends it: an MP4 or QuickTime file with H.264 and AAC or MP3, or a
+/// WebM with VP8, VP9, or AV1 and Opus or Vorbis. Other codecs, such as
+/// HEVC, which only some browsers play, and H.264 with more than 8 bits,
+/// which few do, are converted.
+fn recipe(name: &str, container: Container, tracks: &Tracks) -> Option<Recipe> {
+    let picture = tracks.picture.as_ref()?;
+    let sound = tracks.sound.as_ref().map(|track| track.codec.as_str());
+    let extension = name
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .unwrap_or_default();
+    let mp4_picture =
+        picture.codec == "h264" && matches!(picture.pixels.as_str(), "yuv420p" | "yuvj420p");
+    let webm_picture = matches!(picture.codec.as_str(), "vp8" | "vp9" | "av1")
+        && matches!(
+            picture.pixels.as_str(),
+            "yuv420p" | "yuvj420p" | "yuv420p10le"
+        );
+    let mp4_sound = sound.is_none_or(|codec| matches!(codec, "aac" | "mp3"));
+    let webm_sound = sound.is_none_or(|codec| matches!(codec, "opus" | "vorbis"));
+    let named_mp4 = matches!(extension.as_str(), "mp4" | "m4v" | "mov");
+    if container == Container::Mov && named_mp4 && mp4_picture && mp4_sound {
+        return None;
+    }
+    if container == Container::Matroska && extension == "webm" && webm_picture && webm_sound {
+        return None;
+    }
+    Some(if webm_picture {
+        Recipe {
+            webm: true,
+            copy_picture: true,
+            copy_sound: webm_sound,
+        }
+    } else {
+        Recipe {
+            webm: false,
+            copy_picture: mp4_picture,
+            copy_sound: mp4_sound,
+        }
+    })
+}
+
+/// ffmpeg's arguments to make a video's preview at `output`, reading `file`
+/// with only the `demuxer` and the `decoders`. A converted picture is at
+/// most [`VIDEO_SIZE`] on its longer side, at most 60 frames a second, and
+/// HDR is turned into ordinary colors. Sound is at most stereo.
+fn video_args(
+    file: &Path,
+    demuxer: &str,
+    decoders: &str,
+    tracks: &Tracks,
+    recipe: &Recipe,
+    output: &Path,
+) -> Vec<OsString> {
+    let mut args: Vec<OsString> = [
+        "-nostdin",
+        "-v",
+        "error",
+        // Each of the decoder's threads holds frames too, which for 4K
+        // HDR would pass the memory limit on a server with many cores.
+        "-threads",
+        "4",
+        "-protocol_whitelist",
+        "file",
+        "-f",
+        demuxer,
+        "-codec_whitelist",
+        decoders,
+        "-i",
+    ]
+    .map(OsString::from)
+    .into_iter()
+    .chain([file.into()])
+    .collect();
+    let mut add = |more: &[&str]| args.extend(more.iter().map(OsString::from));
+    add(&[
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        "-sn",
+        "-dn",
+        "-map_metadata",
+        "-1",
+    ]);
+    if recipe.copy_picture {
+        add(&["-c:v", "copy"]);
+    } else {
+        // Interlaced video, as from DVDs and camcorders, is deinterlaced.
+        // The longer side is shrunk, so a phone's upright video stays 1080p.
+        let shrink = format!(
+            "bwdif=deint=interlaced,scale=w='if(gte(iw,ih),min({VIDEO_SIZE},trunc(iw/2)*2),-2)':\
+             h='if(gte(iw,ih),-2,min({VIDEO_SIZE},trunc(ih/2)*2))'"
+        );
+        let hdr = tracks.picture.as_ref().is_some_and(|picture| picture.hdr);
+        let filters = if hdr {
+            format!("{shrink},{TONE_MAP}")
+        } else {
+            format!("{shrink},format=yuv420p")
+        };
+        add(&["-vf", &filters, "-fpsmax", "60"]);
+        add(&[
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-profile:v",
+            "high",
+            // Each of x264's threads holds frames of its own.
+            "-threads",
+            "4",
+        ]);
+    }
+    if let Some(track) = &tracks.sound {
+        let channels = track.channels.clamp(1, 2).to_string();
+        if recipe.copy_sound {
+            add(&["-c:a", "copy"]);
+        } else if recipe.webm {
+            // Opus takes only 48 kHz.
+            add(&[
+                "-c:a", "libopus", "-b:a", "128k", "-ac", &channels, "-ar", "48000",
+            ]);
+        } else {
+            let rate = rate(track.rate).to_string();
+            add(&[
+                "-c:a", "aac", "-b:a", "128k", "-ac", &channels, "-ar", &rate,
+            ]);
+        }
+    }
+    if recipe.webm {
+        add(&["-f", "webm"]);
+    } else {
+        // The index goes at the start, so the browser can play it before
+        // it has it all.
+        add(&["-movflags", "+faststart", "-f", "mp4"]);
+    }
+    args.push(output.into());
+    args
+}
+
+/// Which videos to remove, in order, until `used` is within `limit`:
+/// the least recently watched first, never `keep`.
+fn over_limit(
+    videos: &[(ContentHash, u64)],
+    mut used: u64,
+    limit: u64,
+    keep: Option<ContentHash>,
+) -> Vec<ContentHash> {
+    let mut remove = Vec::new();
+    for &(hash, size) in videos {
+        if used <= limit {
+            break;
+        }
+        if Some(hash) == keep {
+            continue;
+        }
+        used = used.saturating_sub(size);
+        remove.push(hash);
+    }
+    remove
+}
+
+/// The admin's choices for previews.
+fn read_settings(conn: &rusqlite::Connection) -> rusqlite::Result<PreviewSettings> {
+    conn.query_row(
+        "SELECT convert_videos, space_percent FROM thumbnail_settings",
+        [],
+        |row| {
+            Ok(PreviewSettings {
+                convert_videos: row
+                    .get::<_, Option<String>>(0)?
+                    .and_then(|choice| VideoConversion::parse(&choice)),
+                space_percent: row.get(1)?,
+            })
+        },
+    )
+}
+
+/// The size of every file in `dir` and the folders in it.
+fn folder_size(dir: &Path) -> io::Result<u64> {
+    let mut size = 0;
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            size += folder_size(&entry.path())?;
+        } else if kind.is_file() {
+            size += entry.metadata()?.len();
+        }
+    }
+    Ok(size)
+}
+
+/// The size of the disk `dir` is on, in bytes.
+fn disk_size(dir: &Path) -> io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(path.as_ptr(), &mut stats) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    #[allow(clippy::unnecessary_cast)]
+    Ok(stats.f_blocks as u64 * stats.f_frsize as u64)
 }
 
 /// Whether the browser plays a sound file named `name`, whose sound is in
@@ -3010,6 +3979,13 @@ fn container(head: &[u8]) -> Option<Container> {
     }
     if head.starts_with(b".RMF\0\0\0") {
         return Some(Container::RealMedia);
+    }
+    // A SMPTE key, then a partition pack's.
+    if head.starts_with(b"\x06\x0e\x2b\x34\x02\x05\x01\x01\x0d\x01\x02\x01\x01") {
+        return Some(Container::Mxf);
+    }
+    if head.starts_with(WTV) {
+        return Some(Container::Wtv);
     }
     // Ogg is mostly songs, so only a file whose first track is Theora,
     // which names itself in the first page, is a video.
@@ -3193,6 +4169,33 @@ fn unsigned_sox(extension: &str, head: &[u8]) -> Option<Sox> {
     }
 }
 
+/// How every WTV file starts: the GUID of its header.
+const WTV: &[u8] = b"\xb7\xd8\x00\x20\x37\x49\xda\x11\xa6\x4e\x00\x07\xe9\x5e\xad\x8d";
+
+/// A video without a container, known by its name, if its first bytes fit
+/// the format.
+fn unsigned_video(extension: &str, head: &[u8]) -> Option<Container> {
+    // H.264 and HEVC streams start with a start code, then the first unit's
+    // type: H.264's settings or a delimiter, or HEVC's video settings.
+    let unit = if head.starts_with(&[0, 0, 0, 1]) {
+        head.get(4)
+    } else if head.starts_with(&[0, 0, 1]) {
+        head.get(3)
+    } else {
+        None
+    };
+    let h264 = unit.is_some_and(|unit| matches!(unit & 0x1f, 7 | 9) && unit & 0x80 == 0);
+    let hevc = unit.is_some_and(|unit| matches!((unit >> 1) & 0x3f, 32 | 35) && unit & 0x80 == 0);
+    // A DV frame starts with its header block.
+    let dv = head.starts_with(&[0x1f, 0x07, 0x00]);
+    match extension {
+        "h264" | "264" if h264 => Some(Container::H264),
+        "hevc" | "h265" | "265" if hevc => Some(Container::Hevc),
+        "dv" if dv => Some(Container::Dv),
+        _ => None,
+    }
+}
+
 /// How every ASF file starts: the GUID of its header.
 const ASF: &[u8] = b"\x30\x26\xb2\x75\x8e\x66\xcf\x11\xa6\xd9\x00\xaa\x00\x62\xce\x6c";
 
@@ -3303,11 +4306,16 @@ fn named(name: &str, head: &[u8], kind: Option<Kind>) -> Option<Kind> {
         Some(Kind::Image) if tiff(head) && TIFF_RAWS.contains(&extension.as_str()) => {
             Some(Kind::Raw)
         }
+        // A Motion JPEG stream starts with its first frame.
+        Some(Kind::Image) if matches!(extension.as_str(), "mjpeg" | "mjpg") => {
+            Some(Kind::Video(Container::Mjpeg))
+        }
         None if extension == "svgz" && head.starts_with(b"\x1f\x8b") => Some(Kind::Svg),
         None => unsigned_still(name, head)
             .map(Kind::Still)
             .or_else(|| unsigned_sound(&extension, head).map(Kind::Audio))
-            .or_else(|| unsigned_sox(&extension, head).map(Kind::Sox)),
+            .or_else(|| unsigned_sox(&extension, head).map(Kind::Sox))
+            .or_else(|| unsigned_video(&extension, head).map(Kind::Video)),
         kind => kind,
     }
 }
@@ -4119,6 +5127,277 @@ mod tests {
         assert_eq!(named("disk.ima", noise, None), None);
     }
 
+    fn video_tracks(codec: &str, pixels: &str, sound: Option<&str>) -> Tracks {
+        Tracks {
+            picture: Some(Picture {
+                codec: codec.into(),
+                pixels: pixels.into(),
+                hdr: false,
+            }),
+            sound: sound.map(|codec| Track {
+                codec: codec.into(),
+                rate: 48000,
+                channels: 6,
+            }),
+            video: true,
+            ..Tracks::default()
+        }
+    }
+
+    #[test]
+    fn knows_videos_from_cameras_tv_and_without_a_container() {
+        let mxf = b"\x06\x0e\x2b\x34\x02\x05\x01\x01\x0d\x01\x02\x01\x01\x02\x04\x00";
+        assert_eq!(kind(mxf, false), Some(Kind::Video(Container::Mxf)));
+        let mut wtv = WTV.to_vec();
+        wtv.extend_from_slice(b"\x8c\xc3\xd2\xc2");
+        assert_eq!(kind(&wtv, false), Some(Kind::Video(Container::Wtv)));
+
+        let hevc = b"\0\0\0\x01\x40\x01\x0c\x01\xff\xff";
+        assert_eq!(kind(hevc, false), None);
+        assert_eq!(
+            named("clip.hevc", hevc, None),
+            Some(Kind::Video(Container::Hevc))
+        );
+        assert_eq!(
+            named("clip.h265", hevc, None),
+            Some(Kind::Video(Container::Hevc))
+        );
+        // Not HEVC's video settings.
+        assert_eq!(named("clip.hevc", b"\0\0\0\x01\x67\x64", None), None);
+        let h264 = b"\0\0\0\x01\x67\x64\x00\x1f";
+        assert_eq!(
+            named("clip.h264", h264, None),
+            Some(Kind::Video(Container::H264))
+        );
+        assert_eq!(
+            named("clip.h264", b"\0\0\x01\x09\xf0", None),
+            Some(Kind::Video(Container::H264))
+        );
+        assert_eq!(named("notes.h264", b"#include", None), None);
+        let dv = b"\x1f\x07\x00\x3f\xf8\x78\x78\x78";
+        assert_eq!(named("tape.dv", dv, None), Some(Kind::Video(Container::Dv)));
+
+        // A Motion JPEG stream starts as a photo does, so its name says.
+        let jpeg = b"\xff\xd8\xff\xe0\0\x10JFIF";
+        assert_eq!(kind(jpeg, false), Some(Kind::Image));
+        assert_eq!(
+            named("camera.mjpeg", jpeg, Some(Kind::Image)),
+            Some(Kind::Video(Container::Mjpeg))
+        );
+        assert_eq!(
+            named("photo.jpg", jpeg, Some(Kind::Image)),
+            Some(Kind::Image)
+        );
+    }
+
+    #[test]
+    fn plays_copies_or_converts_each_video() {
+        let copy = |webm, copy_sound| {
+            Some(Recipe {
+                webm,
+                copy_picture: true,
+                copy_sound,
+            })
+        };
+        let convert = |copy_sound| {
+            Some(Recipe {
+                webm: false,
+                copy_picture: false,
+                copy_sound,
+            })
+        };
+        let h264 = video_tracks("h264", "yuv420p", Some("aac"));
+        // Browsers play these as they are.
+        assert_eq!(recipe("clip.mp4", Container::Mov, &h264), None);
+        assert_eq!(recipe("IMG_0001.MOV", Container::Mov, &h264), None);
+        let vp9 = video_tracks("vp9", "yuv420p", Some("opus"));
+        assert_eq!(recipe("talk.webm", Container::Matroska, &vp9), None);
+        assert_eq!(
+            recipe(
+                "silent.mp4",
+                Container::Mov,
+                &video_tracks("h264", "yuvj420p", None)
+            ),
+            None
+        );
+
+        // The same codecs in another container are repackaged.
+        assert_eq!(
+            recipe("film.mkv", Container::Matroska, &h264),
+            copy(false, true)
+        );
+        assert_eq!(
+            recipe("talk.mkv", Container::Matroska, &vp9),
+            copy(true, true)
+        );
+        assert_eq!(recipe("old.flv", Container::Flv, &h264), copy(false, true));
+        // A camcorder's AC-3 sound is converted, and its picture copied.
+        let camcorder = video_tracks("h264", "yuv420p", Some("ac3"));
+        assert_eq!(
+            recipe("00001.MTS", Container::MpegTs, &camcorder),
+            copy(false, false)
+        );
+        assert_eq!(
+            recipe("clip.mp4", Container::Mov, &camcorder),
+            copy(false, false)
+        );
+        // AAC can't go in WebM.
+        let av1 = video_tracks("av1", "yuv420p10le", Some("aac"));
+        assert_eq!(
+            recipe("clip.mkv", Container::Matroska, &av1),
+            copy(true, false)
+        );
+
+        // Pictures not every browser plays are converted.
+        let hevc = video_tracks("hevc", "yuv420p10le", Some("aac"));
+        assert_eq!(recipe("IMG_0002.MOV", Container::Mov, &hevc), convert(true));
+        let hi10 = video_tracks("h264", "yuv420p10le", Some("aac"));
+        assert_eq!(
+            recipe("anime.mkv", Container::Matroska, &hi10),
+            convert(true)
+        );
+        let divx = video_tracks("mpeg4", "yuv420p", Some("mp3"));
+        assert_eq!(recipe("movie.avi", Container::Avi, &divx), convert(true));
+        let wmv = video_tracks("wmv3", "yuv420p", Some("wmav2"));
+        assert_eq!(recipe("home.wmv", Container::Asf, &wmv), convert(false));
+        // A WebM name doesn't make H.264 play as WebM.
+        assert_eq!(
+            recipe("odd.webm", Container::Matroska, &h264),
+            copy(false, true)
+        );
+        // Only videos have a recipe.
+        assert_eq!(recipe("song.mp4", Container::Mov, &Tracks::default()), None);
+    }
+
+    #[test]
+    fn tells_ffmpeg_how_to_make_each_preview() {
+        let text = |args: Vec<OsString>| {
+            args.iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        let file = Path::new("/data/blob");
+        let out = Path::new("/scratch/video");
+        let camcorder = video_tracks("h264", "yuv420p", Some("ac3"));
+        let copied = text(video_args(
+            file,
+            "mpegts",
+            "h264,ac3",
+            &camcorder,
+            &Recipe {
+                webm: false,
+                copy_picture: true,
+                copy_sound: false,
+            },
+            out,
+        ));
+        assert!(
+            copied.starts_with("-nostdin -v error -threads 4 -protocol_whitelist file -f mpegts")
+        );
+        assert!(copied.contains("-codec_whitelist h264,ac3 -i /data/blob"));
+        assert!(copied.contains("-c:v copy"), "{copied}");
+        // Surround sound is mixed down to stereo.
+        assert!(
+            copied.contains("-c:a aac -b:a 128k -ac 2 -ar 48000"),
+            "{copied}"
+        );
+        assert!(copied.ends_with("-movflags +faststart -f mp4 /scratch/video"));
+
+        let mut hdr = video_tracks("hevc", "yuv420p10le", Some("aac"));
+        hdr.picture.as_mut().unwrap().hdr = true;
+        let converted = text(video_args(
+            file,
+            "mov",
+            "hevc,aac",
+            &hdr,
+            &Recipe {
+                webm: false,
+                copy_picture: false,
+                copy_sound: true,
+            },
+            out,
+        ));
+        assert!(
+            converted.contains("-c:v libx264 -preset veryfast -crf 23"),
+            "{converted}"
+        );
+        assert!(
+            converted.contains("bwdif=deint=interlaced,scale="),
+            "{converted}"
+        );
+        assert!(converted.contains("tonemap=hable"), "{converted}");
+        assert!(converted.contains("-fpsmax 60"), "{converted}");
+        assert!(converted.contains("-c:a copy"), "{converted}");
+
+        let webm = text(video_args(
+            file,
+            "matroska",
+            "av1,aac",
+            &video_tracks("av1", "yuv420p", Some("aac")),
+            &Recipe {
+                webm: true,
+                copy_picture: true,
+                copy_sound: false,
+            },
+            out,
+        ));
+        assert!(
+            webm.contains("-c:a libopus -b:a 128k -ac 2 -ar 48000"),
+            "{webm}"
+        );
+        assert!(webm.ends_with("-f webm /scratch/video"), "{webm}");
+        // A video without sound has no sound settings.
+        let silent = text(video_args(
+            file,
+            "mov",
+            "h264",
+            &video_tracks("mpeg4", "yuv420p", None),
+            &Recipe {
+                webm: false,
+                copy_picture: false,
+                copy_sound: true,
+            },
+            out,
+        ));
+        assert!(!silent.contains("-c:a"), "{silent}");
+    }
+
+    #[test]
+    fn removes_the_least_recently_watched_videos_first() {
+        let video = |byte: u8| ContentHash([byte; 32]);
+        // Oldest first, as the database lists them.
+        let videos = [(video(1), 300), (video(2), 500), (video(3), 200)];
+        assert_eq!(over_limit(&videos, 900, 1000, None), vec![]);
+        assert_eq!(over_limit(&videos, 1100, 1000, None), vec![video(1)]);
+        assert_eq!(
+            over_limit(&videos, 1500, 1000, None),
+            vec![video(1), video(2)]
+        );
+        // The one just made stays, even if it's the oldest.
+        assert_eq!(
+            over_limit(&videos, 1100, 1000, Some(video(1))),
+            vec![video(2)]
+        );
+    }
+
+    #[test]
+    fn names_when_videos_are_converted() {
+        for choice in [
+            VideoConversion::Upload,
+            VideoConversion::Opened,
+            VideoConversion::Never,
+        ] {
+            assert_eq!(VideoConversion::parse(choice.as_str()), Some(choice));
+        }
+        assert_eq!(VideoConversion::parse("always"), None);
+        let automatic = VideoConversion::automatic();
+        assert_eq!(
+            automatic == VideoConversion::Upload,
+            cores() >= UPLOAD_CORES
+        );
+    }
+
     #[test]
     fn reads_what_ffprobe_says_about_tracks() {
         let song = br#"{"streams": [
@@ -4134,18 +5413,28 @@ mod tests {
                     rate: 44100,
                     channels: 2
                 }),
+                picture: None,
                 cover: true,
                 video: false,
                 seconds: Some(105.772948),
             }
         );
         let film = br#"{"streams": [
-            {"codec_name": "h264", "codec_type": "video", "disposition": {"attached_pic": 0}},
+            {"codec_name": "h264", "codec_type": "video", "pix_fmt": "yuv420p10le",
+             "color_transfer": "arib-std-b67", "disposition": {"attached_pic": 0}},
             {"codec_name": "ac3", "codec_type": "audio", "sample_rate": "48000", "channels": 6,
              "disposition": {"attached_pic": 0}}
         ], "format": {}}"#;
         let film = tracks(film).unwrap();
         assert!(film.video && !film.cover);
+        assert_eq!(
+            film.picture,
+            Some(Picture {
+                codec: "h264".into(),
+                pixels: "yuv420p10le".into(),
+                hdr: true,
+            })
+        );
         assert_eq!(film.sound.unwrap().channels, 6);
         assert_eq!(tracks(br#"{"streams": []}"#).unwrap(), Tracks::default());
         assert!(tracks(b"not json").is_err());

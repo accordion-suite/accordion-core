@@ -1395,8 +1395,30 @@ async fn reads_sizes_lengths_and_pages_for_the_details_panel() {
         )
         .await;
 
+    // A PNG without an orientation, which libvips can't be asked for by
+    // name. ffmpeg makes it, since libvips adds one.
+    let png = server.dir.path().join("drawing.png");
+    let made = Command::new("ffmpeg")
+        .args([
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=size=120x80",
+        ])
+        .args(["-frames:v", "1"])
+        .arg(&png)
+        .status()
+        .unwrap();
+    assert!(made.success());
+    let drawing = server
+        .save("Drawing.png", &std::fs::read(png).unwrap())
+        .await;
+
     let (stop, worker) = start_worker(&server.thumbnails);
-    let all = [photo, video, song, pdf, letter, notes, bare];
+    let all = [photo, video, song, pdf, letter, notes, bare, drawing];
     let facts = tokio::time::timeout(Duration::from_secs(120), async {
         loop {
             let mut found = Vec::new();
@@ -1425,6 +1447,7 @@ async fn reads_sizes_lengths_and_pages_for_the_details_panel() {
     assert_eq!(facts[5], Facts::default());
     assert_eq!((facts[6].width, facts[6].height), (Some(640), Some(360)));
     assert!((facts[6].seconds.unwrap() - 2.0).abs() < 0.1);
+    assert_eq!((facts[7].width, facts[7].height), (Some(120), Some(80)));
 }
 
 #[tokio::test]

@@ -220,7 +220,7 @@ pub const WORKER: u32 = 15;
 
 /// The version of what reads files' [`Facts`]. Raise it when it reads
 /// more, so every file is read again.
-const FACTS: u32 = 4;
+const FACTS: u32 = 5;
 
 /// The longer side of a thumbnail, in pixels.
 const SIZE: u32 = 480;
@@ -2794,10 +2794,10 @@ impl Thumbnails {
     /// A picture's width and height as it's shown, from its header. A photo
     /// whose orientation says to turn it a quarter has them swapped.
     async fn picture_size(&self, file: &Path) -> Result<Facts, String> {
-        let args = ["-f", "width", "-f", "height", "-f", "orientation"]
-            .map(OsString::from)
+        // All the fields, since asking for orientation by name fails for a
+        // picture without one, such as most PNGs.
+        let args = [OsString::from("-a"), file.as_os_str().to_owned()]
             .into_iter()
-            .chain([file.as_os_str().to_owned()])
             .collect::<Vec<_>>();
         let input = std::fs::File::open("/dev/null").map_err(|err| err.to_string())?;
         let output = self
@@ -4124,13 +4124,19 @@ fn videos_unavailable(tools: &Tools) -> Option<String> {
     })
 }
 
-/// A picture's size as it's shown, from libvips's width, height, and
-/// orientation, one to a line. Orientations 5 to 8 turn it a quarter.
+/// A picture's size as it's shown, from the fields libvips lists, one to a
+/// line as "name: value". Orientations 5 to 8 turn it a quarter. The first
+/// of each counts, since libvips lists its own fields before a picture's
+/// text, which could hold lines that look like them.
 fn picture_size(output: &[u8]) -> Option<Facts> {
-    let text = std::str::from_utf8(output).ok()?;
-    let mut lines = text.lines().map(|line| line.trim().parse::<u32>().ok());
-    let (width, height) = (lines.next()??, lines.next()??);
-    let orientation = lines.next().flatten().unwrap_or(1);
+    let text = String::from_utf8_lossy(output);
+    let field = |name: &str| {
+        text.lines()
+            .find_map(|line| line.strip_prefix(name)?.strip_prefix(": "))
+            .and_then(|value| value.trim().parse::<u32>().ok())
+    };
+    let (width, height) = (field("width")?, field("height")?);
+    let orientation = field("orientation").unwrap_or(1);
     let (width, height) = if (5..=8).contains(&orientation) {
         (height, width)
     } else {
@@ -5734,12 +5740,23 @@ mod tests {
     #[test]
     fn reads_a_pictures_size_as_its_shown() {
         let size = |output: &[u8]| picture_size(output).map(|facts| (facts.width, facts.height));
-        assert_eq!(size(b"4032\n3024\n1\n"), Some((Some(4032), Some(3024))));
+        let photo = |orientation: &str| {
+            format!(
+                "photo.jpg: 4032x3024 uchar, 3 bands, srgb, jpegload\n\
+                 width: 4032\nheight: 3024\nbands: 3\n\
+                 exif-ifd0-Orientation: 6 (Right-top, Short, 1 components, 2 bytes)\n\
+                 orientation: {orientation}\n"
+            )
+        };
+        assert_eq!(size(photo("1").as_bytes()), Some((Some(4032), Some(3024))));
         // A phone's portrait photo, kept sideways with a flag to turn it.
-        assert_eq!(size(b"4032\n3024\n6\n"), Some((Some(3024), Some(4032))));
-        assert_eq!(size(b"4032\n3024\n3\n"), Some((Some(4032), Some(3024))));
-        assert_eq!(size(b"640\n480\n"), Some((Some(640), Some(480))));
-        assert_eq!(size(b"wide\n480\n1\n"), None);
+        assert_eq!(size(photo("6").as_bytes()), Some((Some(3024), Some(4032))));
+        assert_eq!(size(photo("3").as_bytes()), Some((Some(4032), Some(3024))));
+        // Most PNGs have no orientation.
+        let png = b"plain.png: 640x480 uchar, 1 band, b-w, pngload\nwidth: 640\nheight: 480\n\
+            png-comment-0-Title: x\nwidth: 9\n";
+        assert_eq!(size(png), Some((Some(640), Some(480))));
+        assert_eq!(size(b"width: wide\nheight: 480\n"), None);
         assert_eq!(size(b""), None);
     }
 

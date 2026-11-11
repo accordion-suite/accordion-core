@@ -240,6 +240,21 @@ async fn stops_a_worker_that_writes_too_much() {
 }
 
 #[tokio::test]
+async fn reads_random_numbers_but_not_other_devices() {
+    // Random bytes aren't text, so od shows them as numbers.
+    let random = run(
+        "/usr/bin/od",
+        &["-An", "-N", "16", "-tx1", "/dev/urandom"],
+        LIMITS,
+    )
+    .await
+    .unwrap();
+    assert_eq!(random.split_whitespace().count(), 16, "{random}");
+    let other = run("/usr/bin/od", &["-An", "-N", "16", "/dev/zero"], LIMITS).await;
+    assert!(matches!(other, Err(RunError::Failed { .. })), "{other:?}");
+}
+
+#[tokio::test]
 async fn reads_one_file_it_is_given_and_not_the_rest_of_its_folder() {
     let dir = tempfile::tempdir().unwrap();
     let given = dir.path().join("given.jpg");

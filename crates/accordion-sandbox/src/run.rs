@@ -11,14 +11,20 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
-/// The folders every worker can read: programs, their libraries, and the
-/// list of where libraries are. Ones a system doesn't have are left out.
-const SYSTEM: [&str; 5] = [
+/// The folders every worker can read: programs, their libraries, the list
+/// of where libraries are, and random numbers. Ones a system doesn't have
+/// are left out.
+///
+/// Without `/dev/urandom`, ffmpeg 6 seeds its random numbers from a CPU
+/// counter instead, which ARM doesn't let programs read, so it stops with
+/// SIGILL. It does that to name a WebM file's tracks and to draw text.
+const SYSTEM: [&str; 6] = [
     "/usr",
     "/lib",
     "/lib64",
     "/etc/ld.so.cache",
     "/etc/ld.so.conf",
+    "/dev/urandom",
 ];
 
 /// How much of a worker's error output the server keeps, for its log.

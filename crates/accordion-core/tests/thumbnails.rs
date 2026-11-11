@@ -12,7 +12,7 @@ use accordion_core::db::Database;
 use accordion_core::identity::{Identity, NewUser};
 use accordion_core::storage::{ContentHash, ItemKind, Storage};
 use accordion_core::thumbnails::{
-    PREVIEW_PAGES, PreviewSettings, ThumbnailKind, Thumbnails, Tools, VideoConversion,
+    Facts, PREVIEW_PAGES, PreviewSettings, ThumbnailKind, Thumbnails, Tools, VideoConversion,
 };
 use accordion_types::{ItemId, Role};
 use rusqlite::OptionalExtension;
@@ -1348,6 +1348,83 @@ async fn shows_a_songs_cover_art() {
     let plain = server.save("Plain.mp3", &plain).await;
     assert!(!server.thumbnails.make_now(plain).await.unwrap());
     assert_eq!(server.thumbnails.status().borrow().failed, 0);
+}
+
+#[tokio::test]
+async fn reads_sizes_lengths_and_pages_for_the_details_panel() {
+    let server = start().await;
+    server.video("sideways.mp4", &["-c:v", "libx264", "-preset", "ultrafast"]);
+    let portrait = server.dir.path().join("portrait.mp4");
+    let made = Command::new("ffmpeg")
+        .args(["-v", "error", "-y", "-display_rotation", "90", "-i"])
+        .arg(server.dir.path().join("sideways.mp4"))
+        .args(["-c", "copy"])
+        .arg(&portrait)
+        .status()
+        .unwrap();
+    assert!(made.success());
+    let photo = server
+        .save("Photo.jpg", &server.image("photo.jpg", 300, 200))
+        .await;
+    let video = server
+        .save("Portrait.mp4", &std::fs::read(portrait).unwrap())
+        .await;
+    let song = server
+        .save(
+            "Song.mp3",
+            &server.sound("song.mp3", &["-c:a", "libmp3lame"], None),
+        )
+        .await;
+    let pdf = server.save("Square.pdf", &pdf()).await;
+    let letter = server
+        .save(
+            "Letter.docx",
+            &server.document("letter.fodt", LETTER, "docx"),
+        )
+        .await;
+    let notes = server.save("Notes.txt", b"Water the garden").await;
+    // H.264 on its own doesn't say how long it lasts, so its frames are
+    // counted.
+    let bare = server
+        .save(
+            "Bare.h264",
+            &server.video(
+                "bare.h264",
+                &["-c:v", "libx264", "-preset", "ultrafast", "-f", "h264"],
+            ),
+        )
+        .await;
+
+    let (stop, worker) = start_worker(&server.thumbnails);
+    let all = [photo, video, song, pdf, letter, notes, bare];
+    let facts = tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            let mut found = Vec::new();
+            for hash in all {
+                found.push(server.thumbnails.facts(hash).await.unwrap());
+            }
+            if found.iter().all(Option::is_some) {
+                break found.into_iter().map(Option::unwrap).collect::<Vec<_>>();
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the worker should read each file's facts");
+    stop.send(()).unwrap();
+    worker.await.unwrap();
+
+    assert_eq!((facts[0].width, facts[0].height), (Some(300), Some(200)));
+    // Stored sideways, shown upright.
+    assert_eq!((facts[1].width, facts[1].height), (Some(360), Some(640)));
+    assert!((facts[1].seconds.unwrap() - 2.0).abs() < 0.1);
+    assert!((facts[2].seconds.unwrap() - 3.0).abs() < 0.1);
+    assert_eq!(facts[2].width, None);
+    assert_eq!(facts[3].pages, Some(1));
+    assert_eq!((facts[4].pages, facts[4].more_pages), (Some(2), false));
+    assert_eq!(facts[5], Facts::default());
+    assert_eq!((facts[6].width, facts[6].height), (Some(640), Some(360)));
+    assert!((facts[6].seconds.unwrap() - 2.0).abs() < 0.1);
 }
 
 #[tokio::test]

@@ -32,6 +32,11 @@
 //!
 //! A file that fails isn't tried again until [`WORKER`] changes, such as
 //! when an update makes thumbnails of more kinds of file.
+//!
+//! After the thumbnails and previews, the worker reads each file's
+//! [`Facts`] for Drive's details panel: a picture's or a video's size, how
+//! long a video or a sound lasts, and how many pages a document has. The
+//! same sandboxed programs read them, and only the numbers are kept.
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -187,11 +192,35 @@ static MIGRATIONS: &[Migration] = &[
     CREATE INDEX thumbnails_videos ON thumbnails (preview) WHERE preview IN ('video', 'waiting');
 ",
     },
+    Migration {
+        version: 6,
+        name: "Add file facts",
+        sql: "
+    -- What the worker read about each file, for Drive's details panel.
+    -- facts: the FACTS version that read them, or NULL for not read yet.
+    -- width and height: a picture's or a video's size as it's shown, in
+    -- pixels. seconds: how long a video or a sound lasts. pages: how many
+    -- pages a document has, and more_pages: whether it goes on past them,
+    -- when its preview stops at the most a preview has.
+    ALTER TABLE thumbnails ADD COLUMN facts INTEGER;
+    ALTER TABLE thumbnails ADD COLUMN width INTEGER;
+    ALTER TABLE thumbnails ADD COLUMN height INTEGER;
+    ALTER TABLE thumbnails ADD COLUMN seconds REAL;
+    ALTER TABLE thumbnails ADD COLUMN pages INTEGER;
+    ALTER TABLE thumbnails ADD COLUMN more_pages INTEGER NOT NULL DEFAULT 0
+        CHECK (more_pages IN (0, 1));
+    CREATE INDEX thumbnails_facts ON thumbnails (facts);
+",
+    },
 ];
 
 /// The version of what makes thumbnails. Raise it when it can make
 /// thumbnails of files it couldn't before, so they get another try.
 pub const WORKER: u32 = 15;
+
+/// The version of what reads files' [`Facts`]. Raise it when it reads
+/// more, so every file is read again.
+const FACTS: u32 = 4;
 
 /// The longer side of a thumbnail, in pixels.
 const SIZE: u32 = 480;
@@ -308,6 +337,15 @@ const LIMITS: Limits = Limits {
     cpu: Duration::from_secs(20),
     time: Duration::from_secs(30),
     output: 10 * 1024 * 1024,
+};
+
+/// What ffprobe may use to count a bare video's frames, which reads it all
+/// without decoding it: about a second for 100 MB on a fast computer.
+const COUNT_LIMITS: Limits = Limits {
+    memory: 256 * 1024 * 1024,
+    cpu: Duration::from_secs(5 * 60),
+    time: Duration::from_secs(10 * 60),
+    output: 1024 * 1024,
 };
 
 /// What LibreOffice may use for each document, which is more than other
@@ -595,6 +633,24 @@ pub struct Preview {
     /// Whether the PDF stops at [`PREVIEW_PAGES`], so the document may go
     /// on past it.
     pub partial: bool,
+}
+
+/// What the worker read about a file, for Drive's details panel. Each is
+/// `None` for a kind of file without it, or when the worker couldn't read
+/// it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Facts {
+    /// A picture's or a video's width in pixels, as it's shown, so a photo
+    /// or a video that's turned upright has its width and height swapped.
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    /// How long a video or a sound lasts.
+    pub seconds: Option<f64>,
+    /// How many pages a PDF or a document has, or a presentation's slides.
+    pub pages: Option<u32>,
+    /// Whether a document goes on past `pages`, because its preview stops
+    /// at [`PREVIEW_PAGES`] and only the preview is counted.
+    pub more_pages: bool,
 }
 
 /// How thumbnails are doing, for the health page.
@@ -978,6 +1034,19 @@ impl Container {
             Self::Mjpeg => "mjpeg",
             Self::H264 => "h264",
             Self::Hevc => "hevc",
+        }
+    }
+
+    /// For video on its own, which doesn't say how long it lasts, so its
+    /// frames are counted instead: how many of the frame rate ffprobe gives
+    /// make one frame. H.264 counts its time in fields, two to a frame.
+    /// Motion JPEG on its own has no frame rate, so ffmpeg plays it at 25
+    /// frames a second, and its length is how long it plays for.
+    fn ticks_per_frame(self) -> Option<f64> {
+        match self {
+            Self::H264 => Some(2.0),
+            Self::MpegVideo | Self::Mjpeg | Self::Hevc => Some(1.0),
+            _ => None,
         }
     }
 }
@@ -1433,6 +1502,32 @@ impl Thumbnails {
         Some(self.book_path(hash)).filter(|path| path.is_file())
     }
 
+    /// What the worker read about the contents with `hash`, or `None` if
+    /// it hasn't read them yet.
+    pub async fn facts(&self, hash: ContentHash) -> Result<Option<Facts>, Error> {
+        self.inner
+            .db
+            .read(move |conn| {
+                conn.query_row(
+                    "SELECT width, height, seconds, pages, more_pages FROM thumbnails
+                     WHERE hash = ?1 AND facts IS NOT NULL",
+                    [&hash.0[..]],
+                    |row| {
+                        Ok(Facts {
+                            width: row.get(0)?,
+                            height: row.get(1)?,
+                            seconds: row.get(2)?,
+                            pages: row.get(3)?,
+                            more_pages: row.get(4)?,
+                        })
+                    },
+                )
+                .optional()
+                .map_err(Error::from)
+            })
+            .await
+    }
+
     fn book_path(&self, hash: ContentHash) -> PathBuf {
         self.inner
             .previews
@@ -1522,9 +1617,27 @@ impl Thumbnails {
                 let result = self.record_preview(*hash, outcome).await;
                 self.note(result.err());
             }
+            // Facts come last. A document's pages are counted in its
+            // preview, which its thumbnail makes.
+            let facts = if waiting.is_empty() && previews.is_empty() {
+                match self.facts_waiting(BATCH).await {
+                    Ok(facts) => facts,
+                    Err(err) => {
+                        self.note(Some(err));
+                        Vec::new()
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            for hash in &facts {
+                let read = self.read_facts(*hash).await;
+                let result = self.record_facts(*hash, read).await;
+                self.note(result.err());
+            }
             let result = self.count().await;
             self.note(result.err());
-            if waiting.is_empty() && previews.is_empty() {
+            if waiting.is_empty() && previews.is_empty() && facts.is_empty() {
                 tokio::select! {
                     _ = saved.changed() => {}
                     () = tokio::time::sleep(TIDY_EVERY) => {}
@@ -1541,6 +1654,15 @@ impl Thumbnails {
         let ready = outcome == Outcome::Ready;
         self.record(hash, outcome).await?;
         Ok(ready)
+    }
+
+    /// Reads the facts of the contents with `hash` now, whether or not
+    /// they're waiting, and records them. A document's pages need its
+    /// thumbnail made first.
+    pub async fn read_facts_now(&self, hash: ContentHash) -> Result<Facts, Error> {
+        let facts = self.read_facts(hash).await;
+        self.record_facts(hash, facts.clone()).await?;
+        Ok(facts)
     }
 
     fn note(&self, err: Option<Error>) {
@@ -2038,6 +2160,55 @@ impl Thumbnails {
             .await
     }
 
+    /// The newest contents with a thumbnail decided whose facts haven't
+    /// been read, or were read by an older [`FACTS`].
+    async fn facts_waiting(&self, limit: usize) -> Result<Vec<ContentHash>, Error> {
+        self.inner
+            .db
+            .read(move |conn| {
+                conn.prepare(
+                    "SELECT hash FROM thumbnails
+                     WHERE facts IS NULL OR facts < ?2
+                     ORDER BY made_at DESC
+                     LIMIT ?1",
+                )?
+                .query_map((limit as i64, FACTS), |row| hash(row, 0))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(Error::from)
+            })
+            .await
+    }
+
+    /// Keeps what the worker read about the contents with `hash`.
+    async fn record_facts(&self, hash: ContentHash, facts: Facts) -> Result<(), Error> {
+        let found = facts != Facts::default();
+        self.inner
+            .db
+            .write(move |tx| {
+                // Open lists load the items again, so a details panel that's
+                // open shows them.
+                if found {
+                    hint_folders(tx, hash)?;
+                }
+                tx.execute(
+                    "UPDATE thumbnails SET facts = ?2, width = ?3, height = ?4, seconds = ?5,
+                         pages = ?6, more_pages = ?7
+                     WHERE hash = ?1",
+                    (
+                        &hash.0[..],
+                        FACTS,
+                        facts.width,
+                        facts.height,
+                        facts.seconds,
+                        facts.pages,
+                        facts.more_pages,
+                    ),
+                )
+            })
+            .await?;
+        Ok(())
+    }
+
     /// The newest stored contents that a file uses and that have no
     /// thumbnail and no decision yet.
     async fn waiting(&self, limit: usize) -> Result<Vec<ContentHash>, Error> {
@@ -2120,7 +2291,7 @@ impl Thumbnails {
                              state = excluded.state, worker = excluded.worker,
                              reason = excluded.reason, made_at = excluded.made_at,
                              preview = NULL, preview_reason = NULL, plan = NULL,
-                             wanted_at = NULL, removed = 0"
+                             wanted_at = NULL, removed = 0, facts = NULL"
                     ),
                     (&hash.0[..], state, WORKER, reason),
                 )?;
@@ -2562,6 +2733,130 @@ impl Thumbnails {
             },
             Err(problem) => Outcome::Failed(problem),
         }
+    }
+
+    /// Reads what the details panel shows about the contents with `hash`.
+    /// What the worker can't read stays `None`, and isn't tried again
+    /// until [`FACTS`] changes or the thumbnail is made again.
+    async fn read_facts(&self, hash: ContentHash) -> Facts {
+        let file = self.inner.storage.contents_file(hash);
+        let kind = match self.identify(&file, hash).await {
+            Ok((kind, _, _)) => kind,
+            Err(problem) => {
+                tracing::debug!(contents = %hash, %problem, "couldn't read a file's facts");
+                return Facts::default();
+            }
+        };
+        let ffmpeg = self.inner.tools.has_ffmpeg();
+        let read = match kind {
+            Some(Kind::Image | Kind::Heif) => self.picture_size(&file).await,
+            Some(Kind::Still(still)) if ffmpeg => {
+                let (reader, decoders) = still.reader();
+                self.stream_facts(&file, reader, decoders, None).await
+            }
+            Some(Kind::Video(container)) if ffmpeg => {
+                let decoders = format!("{VIDEO_DECODERS},{AUDIO_DECODERS}");
+                let reader = ["-f", container.format()];
+                self.stream_facts(&file, &reader, &decoders, container.ticks_per_frame())
+                    .await
+            }
+            Some(Kind::Audio(sound)) if ffmpeg => {
+                let decoders = format!("{SOUND_DECODERS},{COVER_DECODERS}");
+                self.tracks(&file, sound.format(), &decoders)
+                    .await
+                    .map(|tracks| Facts {
+                        seconds: tracks.seconds,
+                        ..Facts::default()
+                    })
+            }
+            Some(Kind::Pdf) => self.pages(&file).await.map(|pages| Facts {
+                pages: Some(pages),
+                ..Facts::default()
+            }),
+            // Only the preview is counted, since LibreOffice reads the
+            // whole document to count its pages.
+            Some(Kind::Document(_) | Kind::Djvu) => match self.preview(hash) {
+                Some(preview) => self.pages(&preview.path).await.map(|pages| Facts {
+                    pages: Some(pages),
+                    more_pages: preview.partial,
+                    ..Facts::default()
+                }),
+                None => Ok(Facts::default()),
+            },
+            _ => Ok(Facts::default()),
+        };
+        read.unwrap_or_else(|problem| {
+            tracing::debug!(contents = %hash, %problem, "couldn't read a file's facts");
+            Facts::default()
+        })
+    }
+
+    /// A picture's width and height as it's shown, from its header. A photo
+    /// whose orientation says to turn it a quarter has them swapped.
+    async fn picture_size(&self, file: &Path) -> Result<Facts, String> {
+        let args = ["-f", "width", "-f", "height", "-f", "orientation"]
+            .map(OsString::from)
+            .into_iter()
+            .chain([file.as_os_str().to_owned()])
+            .collect::<Vec<_>>();
+        let input = std::fs::File::open("/dev/null").map_err(|err| err.to_string())?;
+        let output = self
+            .work(
+                &self.inner.tools.vipsheader,
+                &args,
+                input,
+                &[file.to_owned()],
+            )
+            .await?;
+        picture_size(&output)
+            .ok_or_else(|| "libvips didn't say how large the picture is".to_owned())
+    }
+
+    /// A video's or a picture's size as it's shown, and how long it lasts,
+    /// from ffprobe reading it with only the `reader` and the `decoders`.
+    /// With `ticks_per_frame`, ffprobe counts its frames too, for a video
+    /// that doesn't say how long it lasts.
+    async fn stream_facts(
+        &self,
+        file: &Path,
+        reader: &[&str],
+        decoders: &str,
+        ticks_per_frame: Option<f64>,
+    ) -> Result<Facts, String> {
+        let entries = "stream=width,height,r_frame_rate,nb_read_packets\
+            :stream_side_data=rotation:format=duration";
+        let args = ["-v", "error", "-protocol_whitelist", "file"]
+            .into_iter()
+            .chain(reader.iter().copied())
+            .chain(ticks_per_frame.map(|_| "-count_packets"))
+            .chain([
+                "-codec_whitelist",
+                decoders,
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                entries,
+                "-of",
+                "json",
+            ])
+            .map(OsString::from)
+            .chain([file.as_os_str().to_owned()])
+            .collect::<Vec<_>>();
+        let input = std::fs::File::open("/dev/null").map_err(|err| err.to_string())?;
+        let limits = match ticks_per_frame {
+            Some(_) => COUNT_LIMITS,
+            None => LIMITS,
+        };
+        let output = self
+            .work_within(
+                &self.inner.tools.ffprobe,
+                &args,
+                input,
+                &[file.to_owned()],
+                limits,
+            )
+            .await?;
+        stream_facts(&output, ticks_per_frame.unwrap_or(1.0))
     }
 
     /// Keeps a thumbnail that's been made.
@@ -3826,6 +4121,69 @@ fn videos_unavailable(tools: &Tools) -> Option<String> {
         "ffmpeg isn't installed. Install it with apt to show a frame from each video and \
          songs' cover art, and to play audio the browser can't."
             .to_owned()
+    })
+}
+
+/// A picture's size as it's shown, from libvips's width, height, and
+/// orientation, one to a line. Orientations 5 to 8 turn it a quarter.
+fn picture_size(output: &[u8]) -> Option<Facts> {
+    let text = std::str::from_utf8(output).ok()?;
+    let mut lines = text.lines().map(|line| line.trim().parse::<u32>().ok());
+    let (width, height) = (lines.next()??, lines.next()??);
+    let orientation = lines.next().flatten().unwrap_or(1);
+    let (width, height) = if (5..=8).contains(&orientation) {
+        (height, width)
+    } else {
+        (width, height)
+    };
+    Some(Facts {
+        width: Some(width),
+        height: Some(height),
+        ..Facts::default()
+    })
+}
+
+/// What ffprobe's JSON says about a video's or a picture's size as it's
+/// shown, and how long it lasts. A video turned a quarter, as phones store
+/// portrait video, has its width and height swapped. A video that doesn't
+/// say how long it lasts, but whose frames were counted, lasts as long as
+/// its frames take at its frame rate, with `ticks_per_frame` of ffprobe's
+/// frame rate to each frame.
+fn stream_facts(output: &[u8], ticks_per_frame: f64) -> Result<Facts, String> {
+    let json: serde_json::Value = serde_json::from_slice(output)
+        .map_err(|err| format!("ffprobe's answer wasn't JSON: {err}"))?;
+    let stream = &json["streams"][0];
+    let side = |name: &str| {
+        stream[name]
+            .as_u64()
+            .and_then(|pixels| u32::try_from(pixels).ok())
+            .filter(|pixels| *pixels > 0)
+    };
+    let turned = stream["side_data_list"]
+        .as_array()
+        .and_then(|list| list.iter().find_map(|data| data["rotation"].as_f64()))
+        .is_some_and(|rotation| (rotation.round() as i64).rem_euclid(180) == 90);
+    let (width, height) = match (side("width"), side("height")) {
+        (Some(width), Some(height)) if turned => (Some(height), Some(width)),
+        (Some(width), Some(height)) => (Some(width), Some(height)),
+        _ => (None, None),
+    };
+    let counted = || {
+        let frames = stream["nb_read_packets"].as_str()?.parse::<f64>().ok()?;
+        let (per, every) = stream["r_frame_rate"].as_str()?.split_once('/')?;
+        let ticks = per.parse::<f64>().ok()? / every.parse::<f64>().ok()?;
+        let rate = ticks / ticks_per_frame;
+        Some(frames / rate)
+    };
+    Ok(Facts {
+        width,
+        height,
+        seconds: json["format"]["duration"]
+            .as_str()
+            .and_then(|seconds| seconds.parse::<f64>().ok())
+            .or_else(counted)
+            .filter(|seconds| seconds.is_finite() && *seconds > 0.0),
+        ..Facts::default()
     })
 }
 
@@ -5371,6 +5729,54 @@ mod tests {
         // Text with "wide" in the right place isn't a QuickTime file.
         assert_eq!(video(b"The wide river"), None);
         assert_eq!(video(b"RIFF\0\0\0\0WAVEfmt "), None);
+    }
+
+    #[test]
+    fn reads_a_pictures_size_as_its_shown() {
+        let size = |output: &[u8]| picture_size(output).map(|facts| (facts.width, facts.height));
+        assert_eq!(size(b"4032\n3024\n1\n"), Some((Some(4032), Some(3024))));
+        // A phone's portrait photo, kept sideways with a flag to turn it.
+        assert_eq!(size(b"4032\n3024\n6\n"), Some((Some(3024), Some(4032))));
+        assert_eq!(size(b"4032\n3024\n3\n"), Some((Some(4032), Some(3024))));
+        assert_eq!(size(b"640\n480\n"), Some((Some(640), Some(480))));
+        assert_eq!(size(b"wide\n480\n1\n"), None);
+        assert_eq!(size(b""), None);
+    }
+
+    #[test]
+    fn reads_a_videos_size_and_length() {
+        let portrait = br#"{"streams": [{"width": 1920, "height": 1080,
+            "side_data_list": [{"rotation": -90}]}], "format": {"duration": "12.5"}}"#;
+        assert_eq!(
+            stream_facts(portrait, 1.0).unwrap(),
+            Facts {
+                width: Some(1080),
+                height: Some(1920),
+                seconds: Some(12.5),
+                ..Facts::default()
+            }
+        );
+        let upside_down = br#"{"streams": [{"width": 1920, "height": 1080,
+            "side_data_list": [{"rotation": 180}]}], "format": {}}"#;
+        let facts = stream_facts(upside_down, 1.0).unwrap();
+        assert_eq!(
+            (facts.width, facts.height, facts.seconds),
+            (Some(1920), Some(1080), None)
+        );
+        let picture = br#"{"streams": [{"width": 300, "height": 200}], "format": {}}"#;
+        assert_eq!(stream_facts(picture, 1.0).unwrap().width, Some(300));
+        let bare = br#"{"streams": [{"width": 1280, "height": 720,
+            "r_frame_rate": "24000/1001", "nb_read_packets": "4389"}], "format": {}}"#;
+        let seconds = stream_facts(bare, 1.0).unwrap().seconds.unwrap();
+        assert!((seconds - 183.06).abs() < 0.01, "{seconds}");
+        let h264 = br#"{"streams": [{"r_frame_rate": "60/1", "nb_read_packets": "60"}],
+            "format": {}}"#;
+        assert_eq!(stream_facts(h264, 2.0).unwrap().seconds, Some(2.0));
+        let uncounted = br#"{"streams": [{"r_frame_rate": "0/0"}], "format": {}}"#;
+        assert_eq!(stream_facts(uncounted, 1.0).unwrap().seconds, None);
+        let none = br#"{"streams": [], "format": {"duration": "N/A"}}"#;
+        assert_eq!(stream_facts(none, 1.0).unwrap(), Facts::default());
+        assert!(stream_facts(b"not json", 1.0).is_err());
     }
 
     #[test]

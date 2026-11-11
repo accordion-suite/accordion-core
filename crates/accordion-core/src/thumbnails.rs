@@ -2118,6 +2118,7 @@ impl Thumbnails {
             // H.264 in an older AVI, so they're converted instead.
             Err(problem) if recipe.copy_picture => {
                 tracing::info!(contents = %hash, %problem, "couldn't repackage a video");
+                eprintln!("ARM-DEBUG repackage {hash}: {problem}");
                 Outcome::Waiting(Plan::Convert)
             }
             Err(problem) => Outcome::Failed(problem),
@@ -2270,6 +2271,9 @@ impl Thumbnails {
     }
 
     async fn record(&self, hash: ContentHash, outcome: Outcome) -> Result<(), Error> {
+        if outcome != Outcome::Ready {
+            eprintln!("ARM-DEBUG thumbnail {hash}: {outcome:?}");
+        }
         let (state, reason) = match outcome {
             Outcome::Ready => ("ready", None),
             Outcome::Waiting(_) => unreachable!("only previews wait"),

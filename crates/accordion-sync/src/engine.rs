@@ -74,6 +74,8 @@ pub struct Engine {
     renamed: AtomicBool,
     /// Places files on demand, instead of downloading them.
     on_demand: Option<Arc<dyn OnDemand>>,
+    /// Set once the first pass has looked for items left unmarked.
+    remarked: bool,
 }
 
 /// Whether a server change was applied, or waits for the next pass.
@@ -108,6 +110,7 @@ impl Engine {
             allow_deletes: false,
             renamed: AtomicBool::new(false),
             on_demand: None,
+            remarked: false,
         }
     }
 
@@ -125,6 +128,10 @@ impl Engine {
         fs::create_dir_all(&self.root)?;
         self.pull(&mut report).await?;
         self.push(&mut report).await?;
+        if !self.remarked {
+            self.remark(&mut report)?;
+            self.remarked = true;
+        }
         Ok(report)
     }
 
@@ -631,6 +638,38 @@ impl Engine {
                 .notices
                 .push(format!("Couldn't mark {path} as synced: {err}"));
         }
+    }
+
+    /// Marks again what matches the server but isn't marked as synced.
+    /// Items are marked as each change syncs, so one whose marking failed,
+    /// or whose change synced before the app marked moves, would otherwise
+    /// show as waiting to sync until it changes again. Only the first pass
+    /// after the engine starts looks, so later passes don't check every
+    /// item, and it runs after pushing, so anything really changed here
+    /// has gone up and been marked already.
+    fn remark(&self, report: &mut Report) -> Result<(), Error> {
+        if self.on_demand.is_none() {
+            return Ok(());
+        }
+        let now = SystemTime::now();
+        for item in self.state.all().map_err(db)? {
+            let at = self.root.join(&item.path);
+            let Some(local) = scan_entry(&at)? else {
+                continue;
+            };
+            if local.folder != item.folder
+                || matches!(self.status(&at), Status::InSync | Status::NotHere)
+            {
+                continue;
+            }
+            // A file is only marked if its contents are still the ones both
+            // sides last agreed on.
+            if !item.folder && (recent(&local, now) || !self.unchanged(&item, &local, &at)?) {
+                continue;
+            }
+            self.mark_synced(&remote_item(&item), &item.path, report);
+        }
+        Ok(())
     }
 
     /// What the system knows about the file at `at`, without reading it.
@@ -1302,6 +1341,22 @@ fn file_id(at: &Path) -> u64 {
 #[cfg(all(not(unix), not(windows)))]
 fn file_id(_at: &Path) -> u64 {
     0
+}
+
+/// The server's item as the engine last knew it, for marking it again
+/// without asking the server. Marking needs only its ID and contents.
+fn remote_item(known: &Known) -> RemoteItem {
+    RemoteItem {
+        id: known.id.clone(),
+        parent: known.parent.clone(),
+        name: known.name.clone(),
+        kind: if known.folder { "folder" } else { "file" }.to_owned(),
+        size: (!known.folder).then_some(known.size),
+        sha256: known.sha256.clone(),
+        modified_at: String::new(),
+        access: known.access.clone(),
+        whole: false,
+    }
 }
 
 fn recent(local: &Local, now: SystemTime) -> bool {

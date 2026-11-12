@@ -37,7 +37,9 @@ pub trait OnDemand: Send + Sync {
 
     /// Marks the file or folder at `at` as matching `item` on the server,
     /// such as after uploading it, or when it was already the same. Its
-    /// contents stay.
+    /// contents stay. When the engine marks an item again on starting, it
+    /// passes the item as it last knew it, so only its ID, folder or file,
+    /// and contents' hash are sure to be current.
     fn synced(&self, item: &RemoteItem, at: &Path) -> io::Result<()>;
 
     /// What the system knows about the file at `at`.

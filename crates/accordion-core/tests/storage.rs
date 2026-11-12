@@ -107,6 +107,38 @@ async fn stores_files_and_shows_them_by_name() {
 }
 
 #[tokio::test]
+async fn counts_the_space_each_file_takes() {
+    let server = start().await;
+    let alex = server.user("alex").await;
+    let top = server.storage.top_folder(alex).await.unwrap();
+    server.storage.create_folder(top, "Empty").await.unwrap();
+    server
+        .storage
+        .write_file(top, "notes.txt", &b"first"[..])
+        .await
+        .unwrap();
+    server
+        .storage
+        .write_file(top, "notes.txt", &b"second!"[..])
+        .await
+        .unwrap();
+    let old = server
+        .storage
+        .write_file(top, "old.jpg", &b"old"[..])
+        .await
+        .unwrap();
+    server.storage.delete(old.id).await.unwrap();
+
+    // Every version and the trash count, as they do toward the total, and
+    // folders take no space of their own.
+    let mut files = server.storage.space_by_file(alex).await.unwrap();
+    files.sort_by(|a, b| a.name.cmp(&b.name));
+    let files: Vec<_> = files.iter().map(|f| (f.name.as_str(), f.bytes)).collect();
+    assert_eq!(files, [("notes.txt", 12), ("old.jpg", 3)]);
+    assert_eq!(server.storage.usage(alex).await.unwrap().used, 15);
+}
+
+#[tokio::test]
 async fn stores_identical_contents_once() {
     let server = start().await;
     let alex = server.user("alex").await;

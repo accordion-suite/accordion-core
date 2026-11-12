@@ -498,6 +498,15 @@ pub struct Usage {
     pub quota: Option<u64>,
 }
 
+/// How much space one file takes, for showing what kinds of file use a
+/// user's space.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileSpace {
+    pub name: String,
+    /// Every version, counted as [`Usage::used`] counts them.
+    pub bytes: u64,
+}
+
 /// What happens to a user's files when [`Storage::remove_owner`] takes them
 /// out of storage.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1509,6 +1518,33 @@ impl Storage {
                     uploading: space_reserved(conn, owner, None)?,
                     quota: quota(conn, owner)?,
                 })
+            })
+            .await
+    }
+
+    /// How much space each of `owner`'s files takes, by name, including the
+    /// trash, so the sizes add up to [`Usage::used`]. Modules group them by
+    /// kind, such as photos, which storage doesn't know.
+    pub async fn space_by_file(&self, owner: UserId) -> Result<Vec<FileSpace>, Error> {
+        self.inner
+            .db
+            .read(move |conn| {
+                let mut statement = conn.prepare(
+                    "SELECT i.name, coalesce(sum(b.size), 0) FROM storage_items i
+                     JOIN storage_versions v ON v.item_id = i.id
+                     JOIN storage_blobs b ON b.hash = v.blob
+                     WHERE i.owner_id = ?1
+                     GROUP BY i.id",
+                )?;
+                let files = statement
+                    .query_map([owner.as_uuid()], |row| {
+                        Ok(FileSpace {
+                            name: row.get(0)?,
+                            bytes: size_from(row, 1)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(files)
             })
             .await
     }

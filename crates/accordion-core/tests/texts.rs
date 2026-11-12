@@ -380,6 +380,39 @@ async fn shows_where_the_words_matched() {
 }
 
 #[tokio::test]
+async fn shows_lines_only_for_the_contents_asked_about() {
+    let s = start().await;
+    let mut hashes = Vec::new();
+    for (name, text) in [
+        ("a.txt", "The garden needs water."),
+        ("b.txt", "A garden party on Sunday."),
+        ("c.txt", "Garden tools in the shed."),
+        ("d.txt", "Nothing about plants."),
+    ] {
+        let hash = s.save(name, text.as_bytes()).await;
+        s.texts.make_now(hash).await.unwrap();
+        hashes.push(hash);
+    }
+    let unknown = ContentHash([7; 32]);
+    let asked = vec![hashes[0], hashes[2], hashes[3], unknown];
+    let snippets = s
+        .texts
+        .snippets(&Words::parse("garden"), asked)
+        .await
+        .unwrap();
+    let mut found: Vec<_> = snippets.keys().map(|hash| hash.0).collect();
+    found.sort();
+    let mut expected = vec![hashes[0].0, hashes[2].0];
+    expected.sort();
+    assert_eq!(found, expected);
+    assert!(
+        snippets[&hashes[2]]
+            .iter()
+            .any(|piece| piece.matched && piece.text == "Garden")
+    );
+}
+
+#[tokio::test]
 async fn names_come_first_then_the_best_matches() {
     let s = start().await;
     for (name, text) in [

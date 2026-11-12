@@ -222,7 +222,9 @@ impl Words {
 
     /// The words as an FTS5 query: each word and phrase quoted, so nothing
     /// in it is taken as a command, and the last word matching the start of
-    /// words, so results appear while someone is still typing.
+    /// words, so results appear while someone is still typing. A start
+    /// shorter than [`MIN_START`] matches only the whole word: "s" would
+    /// match most of the index, which took over a minute on a Raspberry Pi.
     fn query(&self) -> String {
         let last = self.0.len().saturating_sub(1);
         self.0
@@ -230,7 +232,7 @@ impl Words {
             .enumerate()
             .map(|(index, term)| {
                 let quoted = format!("\"{}\"", term.text.replace('"', "\"\""));
-                if index == last && !term.phrase {
+                if index == last && !term.phrase && starts_long_enough(&term.text) {
                     format!("{quoted}*")
                 } else {
                     quoted
@@ -239,6 +241,21 @@ impl Words {
             .collect::<Vec<_>>()
             .join(" ")
     }
+}
+
+/// The fewest letters or digits a word needs to also match words that start
+/// with it.
+const MIN_START: usize = 3;
+
+/// Whether the last part of `word` the index sees as a word is long enough
+/// to match as a start. The index splits "it's" into "it" and "s", and only
+/// "s" would match as a start.
+fn starts_long_enough(word: &str) -> bool {
+    use unicode_normalization::char::is_combining_mark;
+    // Accents typed as separate marks belong to the letter before them.
+    word.split(|c: char| !c.is_alphanumeric() && !is_combining_mark(c))
+        .rfind(|part| !part.is_empty())
+        .is_some_and(|part| part.chars().filter(|&c| !is_combining_mark(c)).count() >= MIN_START)
 }
 
 /// `text` in lowercase, without accents, for comparing names.
@@ -462,21 +479,46 @@ impl Texts {
         self.inner
             .index
             .read(move |conn| {
+                let mut id_of = conn.prepare("SELECT id FROM contents WHERE hash = ?1")?;
+                let mut hash_of = HashMap::new();
+                for hash in hashes {
+                    let id: Option<i64> = id_of
+                        .query_row([&hash.0[..]], |row| row.get(0))
+                        .optional()?;
+                    if let Some(id) = id {
+                        hash_of.insert(id, hash);
+                    }
+                }
+                if hash_of.is_empty() {
+                    return Ok(HashMap::new());
+                }
+                let ids = format!(
+                    "[{}]",
+                    hash_of
+                        .keys()
+                        .map(i64::to_string)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+                // One pass over the matches. Looking up each content on
+                // its own made FTS5 read every match again each time, which
+                // took 5 seconds for a common word on a Raspberry Pi. The
+                // `+` keeps SQLite from turning the list into lookups.
                 let mut statement = conn.prepare(&format!(
-                    "SELECT snippet(words, 0, char({}), char({}), '…', {SNIPPET_WORDS})
+                    "SELECT rowid, snippet(words, 0, char({}), char({}), '…', {SNIPPET_WORDS})
                      FROM words
                      WHERE words MATCH ?1
-                       AND words.rowid = (SELECT id FROM contents WHERE hash = ?2)",
+                       AND +rowid IN (SELECT value FROM json_each(?2))",
                     u32::from(MARK_START),
                     u32::from(MARK_END),
                 ))?;
                 let mut snippets = HashMap::new();
-                for hash in hashes {
-                    let line: Option<String> = statement
-                        .query_row((&query, &hash.0[..]), |row| row.get(0))
-                        .optional()?;
-                    if let Some(line) = line {
-                        snippets.insert(hash, pieces(&line));
+                let mut rows = statement.query((&query, &ids))?;
+                while let Some(row) = rows.next()? {
+                    let id: i64 = row.get(0)?;
+                    let line: String = row.get(1)?;
+                    if let Some(hash) = hash_of.get(&id) {
+                        snippets.insert(*hash, pieces(&line));
                     }
                 }
                 Ok(snippets)
@@ -897,8 +939,24 @@ mod tests {
         // A quote with no partner still makes a phrase, and quotes inside
         // a word are doubled, as FTS5 wants.
         assert_eq!(Words::parse(r#"say"hi"#).query(), r#""say" "hi""#);
-        assert_eq!(Words::parse(r#"it's"#).query(), r#""it's"*"#);
         assert!(Words::parse(r#" " - * "#).is_empty());
+    }
+
+    #[test]
+    fn matches_starts_of_words_from_three_letters() {
+        assert_eq!(Words::parse("s").query(), r#""s""#);
+        assert_eq!(Words::parse("st").query(), r#""st""#);
+        assert_eq!(Words::parse("ste").query(), r#""ste"*"#);
+        assert_eq!(Words::parse("tax st").query(), r#""tax" "st""#);
+        // The index splits "it's" into "it" and "s", so only "s" would
+        // match as a start.
+        assert_eq!(Words::parse("it's").query(), r#""it's""#);
+        assert_eq!(Words::parse("2026-q1").query(), r#""2026-q1""#);
+        assert_eq!(Words::parse("2026-qtr").query(), r#""2026-qtr"*"#);
+        // Letters count, not bytes or separate accent marks.
+        assert_eq!(Words::parse("né").query(), r#""né""#);
+        assert_eq!(Words::parse("ne\u{301}e").query(), "\"ne\u{301}e\"*");
+        assert_eq!(Words::parse("日本語").query(), r#""日本語"*"#);
     }
 
     #[test]

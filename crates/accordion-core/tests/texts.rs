@@ -611,6 +611,32 @@ async fn narrows_by_owner_place_trash_and_sharing() {
         .await,
         ["Trips"]
     );
+    // Drive's People filter: what the user shared, and for a person, what
+    // they own and what the user shared with them.
+    assert_eq!(
+        find(Search {
+            owner: Some(Owner::SharedByMe),
+            ..Search::default()
+        })
+        .await,
+        ["Trips"]
+    );
+    assert_eq!(
+        find(Search {
+            owner: Some(Owner::Involving(kim)),
+            ..Search::default()
+        })
+        .await,
+        ["Trips"]
+    );
+    assert_eq!(
+        find(Search {
+            owner: Some(Owner::Involving(sam)),
+            ..Search::default()
+        })
+        .await,
+        ["Sam's", "sams.jpg"]
+    );
     assert_eq!(
         find(Search {
             among: Some(HashSet::from([lake.id])),

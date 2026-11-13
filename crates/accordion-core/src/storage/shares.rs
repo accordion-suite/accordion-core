@@ -487,6 +487,18 @@ pub(super) fn shared_by_with(
     Ok(ids)
 }
 
+/// Which of `owner`'s items they shared with anyone.
+pub(super) fn shared_by_anyone(conn: &Connection, owner: UserId) -> Result<HashSet<ItemId>, Error> {
+    let ids = conn
+        .prepare(
+            "SELECT DISTINCT s.item_id FROM storage_shares s
+             JOIN storage_items i ON i.id = s.item_id WHERE i.owner_id = ?1",
+        )?
+        .query_map([owner.as_uuid()], |row| Ok(ItemId::from_uuid(row.get(0)?)))?
+        .collect::<Result<_, _>>()?;
+    Ok(ids)
+}
+
 pub(super) fn roots(conn: &Connection, user: UserId) -> Result<Vec<ItemId>, Error> {
     let mut roots: Vec<ItemId> = conn
         .prepare("SELECT id FROM storage_items WHERE owner_id = ?1 AND parent_id IS NULL")?

@@ -443,7 +443,13 @@ pub struct Search {
 pub enum Owner {
     Me,
     Others,
+    /// Items this person owns.
     Person(UserId),
+    /// The user's own items that they shared with someone.
+    SharedByMe,
+    /// Items this person owns, and the user's own items that they shared
+    /// with them, as Drive's People filter means by a person.
+    Involving(UserId),
 }
 
 /// Where a [`Search`] looks.
@@ -898,7 +904,16 @@ impl Storage {
                     }
                     narrow(inside(conn, folder)?);
                 }
-                let matches = |found: &Found| hit(&search, user, among.as_ref(), found);
+                let mut involving = None;
+                match search.owner {
+                    Some(Owner::SharedByMe) => narrow(shares::shared_by_anyone(conn, user)?),
+                    Some(Owner::Involving(person)) => {
+                        involving = Some(shares::shared_by_with(conn, user, person)?);
+                    }
+                    _ => {}
+                }
+                let matches =
+                    |found: &Found| hit(&search, user, among.as_ref(), involving.as_ref(), found);
 
                 let mut hits = Vec::new();
                 if search.trash {
@@ -2037,6 +2052,7 @@ fn hit(
     search: &Search,
     user: UserId,
     among: Option<&HashSet<ItemId>>,
+    involving: Option<&HashSet<ItemId>>,
     found: &Found,
 ) -> Option<Hit> {
     let item = &found.item;
@@ -2047,6 +2063,13 @@ fn hit(
         Some(Owner::Me) if item.owner != user => return None,
         Some(Owner::Others) if item.owner == user => return None,
         Some(Owner::Person(person)) if item.owner != *person => return None,
+        Some(Owner::SharedByMe) if item.owner != user => return None,
+        Some(Owner::Involving(person)) => {
+            let shared = item.owner == user && involving.is_some_and(|ids| ids.contains(&item.id));
+            if item.owner != *person && !shared {
+                return None;
+            }
+        }
         _ => {}
     }
     // The trash isn't narrowed by SQL.

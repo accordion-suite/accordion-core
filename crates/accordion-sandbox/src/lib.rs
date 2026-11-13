@@ -23,12 +23,21 @@
 //! it started. A worker that outlives the server is stopped by systemd with
 //! the rest of the service, or by its CPU limit.
 //!
-//! Without Landlock there's no sandbox worth having, because the worker runs
-//! as the server's own user, so [`check`] says whether it's there, and the
-//! launcher refuses to run without it.
+//! Run by the server itself, the worker is the server's own user, so
+//! without Landlock there's no sandbox worth having: [`check`] says whether
+//! it's there, and the launcher refuses to run without it.
+//!
+//! On a server, workers go through the worker service instead ([`service`],
+//! decision 29). It runs each connection's jobs as a user ID of their own,
+//! which owns nothing and can't see the data folder beyond the job's own
+//! folder, with no network, so Landlock is one more layer where the kernel
+//! has it.
 
+mod acl;
 mod launch;
 mod run;
+pub mod service;
+mod wire;
 
 pub use launch::launch;
 
@@ -46,7 +55,7 @@ pub fn main() -> ! {
     }
     std::process::exit(launch(args));
 }
-pub use run::{Job, Limits, RunError, Sandbox};
+pub use run::{Folder, Job, Limits, RunError, Sandbox, Workers};
 
 /// Why the sandbox can't run on this system.
 #[derive(Debug, thiserror::Error)]
@@ -57,6 +66,13 @@ pub enum Unavailable {
          systems turn it off at boot"
     )]
     NoLandlock,
+    #[error("the worker service, which runs workers, isn't answering: {0}")]
+    NoService(String),
+    #[error(
+        "the data folder's file system doesn't have POSIX ACLs, which let each worker reach only \
+         its own files"
+    )]
+    NoAcls,
 }
 
 /// Whether workers can run in the sandbox here.

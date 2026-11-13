@@ -7,7 +7,7 @@ use std::fs::File;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use accordion_sandbox::{Job, Limits, RunError, Sandbox};
+use accordion_sandbox::{Folder, Job, Limits, RunError, Sandbox};
 
 const LIMITS: Limits = Limits {
     memory: 1024 * 1024 * 1024,
@@ -31,7 +31,7 @@ async fn run(program: &str, args: &[&str], limits: Limits) -> Result<String, Run
             env: &[],
             input: File::open("/dev/null").unwrap(),
             read: &[],
-            write: &[],
+            folder: None,
             sockets: None,
             limits,
         })
@@ -63,7 +63,7 @@ async fn reads_its_input_and_writes_its_output() {
             env: &[],
             input: File::open(&input).unwrap(),
             read: &[],
-            write: &[],
+            folder: None,
             sockets: None,
             limits: LIMITS,
         })
@@ -93,7 +93,7 @@ async fn reads_the_folders_it_is_given() {
             env: &[],
             input: File::open("/dev/null").unwrap(),
             read: &[dir.path().to_owned()],
-            write: &[],
+            folder: None,
             sockets: None,
             limits: LIMITS,
         })
@@ -169,7 +169,7 @@ async fn sees_only_the_environment_it_is_given() {
             env: &[("VIPS_BLOCK_UNTRUSTED", "1")],
             input: File::open("/dev/null").unwrap(),
             read: &[],
-            write: &[],
+            folder: None,
             sockets: None,
             limits: LIMITS,
         })
@@ -272,7 +272,7 @@ async fn reads_one_file_it_is_given_and_not_the_rest_of_its_folder() {
                     env: &[],
                     input: File::open("/dev/null").unwrap(),
                     read: &read,
-                    write: &[],
+                    folder: None,
                     sockets: None,
                     limits: LIMITS,
                 })
@@ -284,11 +284,11 @@ async fn reads_one_file_it_is_given_and_not_the_rest_of_its_folder() {
     assert!(matches!(result, Err(RunError::Failed { .. })), "{result:?}");
 }
 
-/// Runs a Python script that may write in `write` and make sockets in
+/// Runs a Python script that may write in `folder` and make sockets in
 /// `sockets`.
 async fn run_python(
     script: &str,
-    write: &[std::path::PathBuf],
+    folder: Option<&Folder>,
     sockets: Option<&Path>,
 ) -> Result<String, RunError> {
     let args = ["-I".into(), "-c".into(), OsString::from(script)];
@@ -299,7 +299,7 @@ async fn run_python(
             env: &[],
             input: File::open("/dev/null").unwrap(),
             read: &[],
-            write,
+            folder,
             sockets,
             limits: LIMITS,
         })
@@ -310,8 +310,8 @@ async fn run_python(
 #[tokio::test]
 async fn writes_in_its_scratch_folder_but_runs_nothing_from_it() {
     let dir = tempfile::tempdir().unwrap();
-    let scratch = dir.path().join("scratch");
-    std::fs::create_dir(&scratch).unwrap();
+    let folder = sandbox().folder(dir.path()).await.unwrap();
+    let scratch = folder.path().to_owned();
     let script = format!(
         r#"
 import os, shutil
@@ -333,14 +333,12 @@ except PermissionError:
 "#,
         scratch = scratch.to_str().unwrap()
     );
-    let output = run_python(&script, std::slice::from_ref(&scratch), None)
-        .await
-        .unwrap();
+    let output = run_python(&script, Some(&folder), None).await.unwrap();
     assert_eq!(output, "kept\ncan't link\ncan't run it\n");
 
     let outside = dir.path().join("planted.txt");
     let script = format!("open({:?}, 'w')", outside.to_str().unwrap());
-    let message = failure(run_python(&script, &[scratch], None).await);
+    let message = failure(run_python(&script, Some(&folder), None).await);
     assert!(message.contains("PermissionError"), "{message}");
     assert!(!outside.exists());
 }
@@ -374,7 +372,7 @@ for attempt in [
 "#,
         dir = dir.path().to_str().unwrap()
     );
-    let output = run_python(&script, &[], Some(dir.path())).await.unwrap();
+    let output = run_python(&script, None, Some(dir.path())).await.unwrap();
     assert_eq!(
         output,
         "listening\nrefused\nrefused\nrefused\nrefused\nrefused\n"

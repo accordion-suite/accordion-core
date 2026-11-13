@@ -4,6 +4,8 @@
 //! libraw-bin, librsvg2-bin, djvulibre-bin, and a kernel with Landlock, as
 //! CI has.
 
+mod workers;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -42,9 +44,12 @@ async fn start_with(tools: impl FnOnce(Tools) -> Tools) -> Server {
         .await
         .unwrap();
     let top = storage.top_folder(user.id).await.unwrap();
-    let tools = tools(Tools::installed(env!(
-        "CARGO_BIN_EXE_accordion-core-sandbox"
-    )));
+    let tools = Tools {
+        workers: workers::workers(dir.path()),
+        ..tools(Tools::installed(env!(
+            "CARGO_BIN_EXE_accordion-core-sandbox"
+        )))
+    };
     let thumbnails = Thumbnails::open(db.clone(), storage.clone(), dir.path(), tools)
         .await
         .unwrap();
@@ -667,7 +672,10 @@ async fn shows_videos_once_ffmpeg_is_installed() {
         server.db.clone(),
         server.storage.clone(),
         server.dir.path(),
-        Tools::installed(env!("CARGO_BIN_EXE_accordion-core-sandbox")),
+        Tools {
+            workers: workers::workers(server.dir.path()),
+            ..Tools::installed(env!("CARGO_BIN_EXE_accordion-core-sandbox"))
+        },
     )
     .await
     .unwrap();
@@ -780,7 +788,10 @@ async fn shows_documents_once_libreoffice_is_installed() {
         server.db.clone(),
         server.storage.clone(),
         server.dir.path(),
-        Tools::installed(env!("CARGO_BIN_EXE_accordion-core-sandbox")),
+        Tools {
+            workers: workers::workers(server.dir.path()),
+            ..Tools::installed(env!("CARGO_BIN_EXE_accordion-core-sandbox"))
+        },
     )
     .await
     .unwrap();
@@ -825,7 +836,10 @@ async fn tries_failed_documents_again_when_the_server_starts() {
         server.db.clone(),
         server.storage.clone(),
         server.dir.path(),
-        Tools::installed(env!("CARGO_BIN_EXE_accordion-core-sandbox")),
+        Tools {
+            workers: workers::workers(server.dir.path()),
+            ..Tools::installed(env!("CARGO_BIN_EXE_accordion-core-sandbox"))
+        },
     )
     .await
     .unwrap();
@@ -1122,7 +1136,10 @@ async fn shows_raw_photos_drawings_and_books_once_their_programs_are_installed()
         server.db.clone(),
         server.storage.clone(),
         server.dir.path(),
-        Tools::installed(env!("CARGO_BIN_EXE_accordion-core-sandbox")),
+        Tools {
+            workers: workers::workers(server.dir.path()),
+            ..Tools::installed(env!("CARGO_BIN_EXE_accordion-core-sandbox"))
+        },
     )
     .await
     .unwrap();
@@ -1609,7 +1626,10 @@ async fn plays_older_sound_once_sox_is_installed() {
         server.db.clone(),
         server.storage.clone(),
         server.dir.path(),
-        Tools::installed(env!("CARGO_BIN_EXE_accordion-core-sandbox")),
+        Tools {
+            workers: workers::workers(server.dir.path()),
+            ..Tools::installed(env!("CARGO_BIN_EXE_accordion-core-sandbox"))
+        },
     )
     .await
     .unwrap();

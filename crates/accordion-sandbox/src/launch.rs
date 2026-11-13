@@ -1,7 +1,11 @@
-//! The launcher: `sandbox --memory <bytes> --cpu <seconds> [--read <path>]...
-//! [--write <folder>]... [--sockets <folder>] -- <program> [<argument>]...`.
-//! It runs in a process of its own, after `exec`, so it restricts itself
-//! with ordinary code rather than between `fork` and `exec` in the server.
+//! The launcher: `sandbox --memory <bytes> --cpu <seconds>
+//! [--landlock-optional] [--read <path>]... [--write <folder>]...
+//! [--sockets <folder>] -- <program> [<argument>]...`. It runs in a process
+//! of its own, after `exec`, so it restricts itself with ordinary code
+//! rather than between `fork` and `exec` in the server.
+//!
+//! The worker service also runs it as a job's user to tidy up after the
+//! job, with `--settle` or `--clean` ([`crate::service`]).
 
 use std::collections::BTreeMap;
 use std::ffi::{CString, OsString};
@@ -30,6 +34,9 @@ struct Request {
     write: Vec<PathBuf>,
     /// Where the worker may make local sockets, to listen on.
     sockets: Option<PathBuf>,
+    /// Whether the worker may run without Landlock, which only the worker
+    /// service asks for, when the worker runs as a user of its own.
+    landlock_optional: bool,
     program: PathBuf,
     args: Vec<OsString>,
 }
@@ -37,6 +44,16 @@ struct Request {
 /// Runs the launcher with its arguments, the ones after `sandbox`. It only
 /// returns if it couldn't start the program, with the exit code to use.
 pub fn launch(args: impl IntoIterator<Item = OsString>) -> i32 {
+    let mut args = args.into_iter().peekable();
+    if let Some(mode) = args
+        .peek()
+        .and_then(|arg| arg.to_str())
+        .filter(|arg| matches!(*arg, "--settle" | "--clean"))
+        .map(str::to_owned)
+    {
+        args.next();
+        return crate::service::run_helper(&mode, args);
+    }
     let request = match parse(args) {
         Ok(request) => request,
         Err(message) => {
@@ -60,6 +77,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Request, String> {
     let mut read = Vec::new();
     let mut write = Vec::new();
     let mut sockets = None;
+    let mut landlock_optional = false;
     let number = |value: Option<OsString>, name: &str| {
         value
             .and_then(|value| value.to_str()?.parse::<u64>().ok())
@@ -70,6 +88,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Request, String> {
         match arg.to_str() {
             Some("--memory") => memory = Some(number(args.next(), "--memory")?),
             Some("--cpu") => cpu = Some(number(args.next(), "--cpu")?),
+            Some("--landlock-optional") => landlock_optional = true,
             Some("--read") => read.push(PathBuf::from(args.next().ok_or("--read needs a path")?)),
             Some("--write") => {
                 write.push(PathBuf::from(args.next().ok_or("--write needs a folder")?));
@@ -98,6 +117,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Request, String> {
         read,
         write,
         sockets,
+        landlock_optional,
         program,
         args: args.collect(),
     })
@@ -178,8 +198,9 @@ fn landlock(request: &Request, interpreter: Option<&Path>) -> Result<(), String>
     let fail = |err: &dyn std::fmt::Display| format!("couldn't set up Landlock: {err}");
     let read = AccessFs::from_read(ABI_WANTED) & !AccessFs::Execute;
     let mut ruleset = Ruleset::default()
-        // Landlock itself is required. Newer parts of it, such as network
-        // and signal rules, are used where the kernel has them.
+        // Landlock itself is required, unless the worker runs as a user of
+        // its own. Newer parts of it, such as network and signal rules, are
+        // used where the kernel has them.
         .set_compatibility(CompatLevel::BestEffort)
         .handle_access(AccessFs::from_all(ABI_WANTED))
         .map_err(|err| fail(&err))?
@@ -234,7 +255,7 @@ fn landlock(request: &Request, interpreter: Option<&Path>) -> Result<(), String>
             .map_err(|err| fail(&err))?;
     }
     let status = ruleset.restrict_self().map_err(|err| fail(&err))?;
-    if status.ruleset == RulesetStatus::NotEnforced {
+    if status.ruleset == RulesetStatus::NotEnforced && !request.landlock_optional {
         return Err(crate::Unavailable::NoLandlock.to_string());
     }
     Ok(())

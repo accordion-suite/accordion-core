@@ -10,9 +10,9 @@ publish.workspace = true
 landlock = "0.4.7"
 libc = "0.2.190"
 seccompiler = "0.5.0"
+tempfile = "3.27.0"
 thiserror = "2.0.21"
-tokio = { version = "1.53.3", features = ["io-util", "macros", "process", "rt", "time"] }
+tokio = { version = "1.53.3", features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
 
 [dev-dependencies]
-tempfile = "3.27.0"
 tokio = { version = "1.53.3", features = ["macros", "rt-multi-thread"] }

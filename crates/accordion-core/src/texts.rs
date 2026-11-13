@@ -123,6 +123,9 @@ pub struct Tools {
     /// The program that answers `sandbox` and [`office::COMMAND`]: the
     /// server itself.
     pub launcher: PathBuf,
+    /// The worker service, which runs workers as users of their own
+    /// (decision 29). Without it, the server runs them itself.
+    pub workers: Option<accordion_sandbox::Workers>,
     pub pdftotext: PathBuf,
 }
 
@@ -132,6 +135,7 @@ impl Tools {
     pub fn installed(launcher: impl Into<PathBuf>) -> Self {
         Self {
             launcher: launcher.into(),
+            workers: None,
             pdftotext: "/usr/bin/pdftotext".into(),
         }
     }
@@ -361,7 +365,8 @@ impl Texts {
             )
         })
         .await?;
-        let unavailable = unavailable(&tools);
+        let sandbox = Sandbox::new(&tools.launcher).with_workers(tools.workers.as_ref());
+        let unavailable = unavailable(&tools, &sandbox);
         if let Some(reason) = &unavailable {
             tracing::warn!("only plain text is searched: {reason}");
         }
@@ -371,7 +376,7 @@ impl Texts {
                 index,
                 storage,
                 thumbnails,
-                sandbox: Sandbox::new(&tools.launcher),
+                sandbox,
                 tools,
                 status: watch::Sender::new(TextStatus {
                     unavailable,
@@ -792,7 +797,7 @@ impl Texts {
                 env: &[("MALLOC_ARENA_MAX", "2")],
                 input,
                 read: &[],
-                write: &[],
+                folder: None,
                 sockets: None,
                 limits: LIMITS,
             })
@@ -828,8 +833,8 @@ async fn index_is_empty(index: &Database) -> Result<bool, Error> {
 }
 
 /// Why only plain text can be read here, if that's the case.
-fn unavailable(tools: &Tools) -> Option<String> {
-    if let Err(err) = accordion_sandbox::check() {
+fn unavailable(tools: &Tools, sandbox: &Sandbox) -> Option<String> {
+    if let Err(err) = sandbox.check() {
         return Some(format!("{err}."));
     }
     (!tools.pdftotext.is_file())

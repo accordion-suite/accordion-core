@@ -1,6 +1,8 @@
 //! Reading the text inside files, and searching it (decision 20). These run
 //! the real sandbox, pdftotext, and LibreOffice, which CI installs.
 
+mod workers;
+
 use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
@@ -42,7 +44,10 @@ async fn start() -> Server {
         db.clone(),
         storage.clone(),
         dir.path(),
-        thumbnails::Tools::installed(LAUNCHER),
+        thumbnails::Tools {
+            workers: workers::workers(dir.path()),
+            ..thumbnails::Tools::installed(LAUNCHER)
+        },
     )
     .await
     .unwrap();
@@ -70,7 +75,10 @@ async fn open_texts(
         storage.clone(),
         thumbnails.clone(),
         dir,
-        texts::Tools::installed(LAUNCHER),
+        texts::Tools {
+            workers: workers::workers(dir),
+            ..texts::Tools::installed(LAUNCHER)
+        },
     )
     .await
     .unwrap()

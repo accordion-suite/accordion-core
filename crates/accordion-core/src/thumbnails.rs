@@ -45,7 +45,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use accordion_sandbox::{Job, Limits, Sandbox};
+use accordion_sandbox::{Folder, Job, Limits, Sandbox, Workers};
 use rusqlite::{OptionalExtension, Row};
 use tokio::sync::watch;
 
@@ -512,6 +512,9 @@ const TIDY_EVERY: Duration = Duration::from_secs(60 * 60);
 pub struct Tools {
     /// The program that answers `sandbox`: the server itself.
     pub launcher: PathBuf,
+    /// The worker service, which runs workers as users of their own
+    /// (decision 29). Without it, the server runs them itself.
+    pub workers: Option<Workers>,
     pub vips: PathBuf,
     pub vipsheader: PathBuf,
     pub pdftoppm: PathBuf,
@@ -539,6 +542,7 @@ impl Tools {
     pub fn installed(launcher: impl Into<PathBuf>) -> Self {
         Self {
             launcher: launcher.into(),
+            workers: None,
             vips: "/usr/bin/vips".into(),
             vipsheader: "/usr/bin/vipsheader".into(),
             pdftoppm: "/usr/bin/pdftoppm".into(),
@@ -667,6 +671,9 @@ pub struct ThumbnailStatus {
     /// photos, and which older sound files can't play, and which packages
     /// would fix that.
     pub pictures: Option<String>,
+    /// A sentence saying the worker service runs without Landlock, which
+    /// isn't a problem, but is one layer fewer (decision 29).
+    pub sandbox: Option<String>,
     /// Files waiting for a thumbnail.
     pub waiting: u64,
     /// Files the worker couldn't make a thumbnail of.
@@ -1408,7 +1415,13 @@ impl Thumbnails {
                     .collect::<Result<HashMap<_, _>, _>>()
             })
             .await?;
-        let unavailable = unavailable(&tools);
+        let sandbox = Sandbox::new(&tools.launcher).with_workers(tools.workers.as_ref());
+        let unavailable = unavailable(&tools, &sandbox);
+        let layers = (sandbox.uses_service() && accordion_sandbox::check().is_err()).then(|| {
+            "The programs that read files run as users of their own, without Landlock, which \
+             this server's kernel doesn't have. Landlock would add one more layer around them."
+                .to_owned()
+        });
         let videos = videos_unavailable(&tools);
         let documents = documents_unavailable(&tools);
         let pictures = pictures_unavailable(&tools);
@@ -1421,13 +1434,14 @@ impl Thumbnails {
                 storage,
                 dir,
                 previews,
-                sandbox: Sandbox::new(&tools.launcher),
+                sandbox,
                 tools,
                 status: watch::Sender::new(ThumbnailStatus {
                     unavailable,
                     videos,
                     documents,
                     pictures,
+                    sandbox: layers,
                     ..ThumbnailStatus::default()
                 }),
                 office: tokio::sync::Mutex::new(None),
@@ -2057,7 +2071,7 @@ impl Thumbnails {
                 copy_sound: recipe.copy_sound && !recipe.webm,
             };
         }
-        let scratch = match self.scratch_dir() {
+        let scratch = match self.scratch_dir().await {
             Ok(scratch) => scratch,
             Err(problem) => return Outcome::Failed(problem),
         };
@@ -2090,7 +2104,7 @@ impl Thumbnails {
                 env: &[("MALLOC_ARENA_MAX", "2")],
                 input,
                 read: std::slice::from_ref(&file),
-                write: &[scratch.path().to_owned()],
+                folder: Some(&scratch),
                 sockets: None,
                 limits,
             })
@@ -2922,7 +2936,7 @@ impl Thumbnails {
                 env: &env,
                 input,
                 read,
-                write: &[],
+                folder: None,
                 sockets: None,
                 limits,
             })
@@ -3033,7 +3047,7 @@ impl Thumbnails {
             *profile = Some(self.office_profile().await?);
         }
         let profile = profile.as_ref().expect("made above").path().join("profile");
-        let scratch = self.scratch_dir()?;
+        let scratch = self.scratch_dir().await?;
         copy_folder(&profile, &scratch.path().join("profile"))
             .map_err(|err| format!("couldn't copy LibreOffice's settings: {err}"))?;
         let out = scratch.path().join("out");
@@ -3058,9 +3072,7 @@ impl Thumbnails {
             out.clone().into(),
             file.into(),
         ];
-        let messages = self
-            .office(scratch.path(), &args, &[file.to_owned()])
-            .await?;
+        let messages = self.office(&scratch, &args, &[file.to_owned()]).await?;
 
         // The worker named the PDF after the file. It could only make
         // folders and plain files there.
@@ -3097,9 +3109,9 @@ impl Thumbnails {
     /// through a link in a scratch folder, the only place it can write. The
     /// sandbox still lets it read only the file itself.
     async fn embedded(&self, file: &Path) -> Result<Option<(std::fs::File, bool)>, String> {
-        let scratch = self.scratch_dir()?;
-        let link = scratch.path().join("photo");
-        std::os::unix::fs::symlink(file, &link)
+        let scratch = self.scratch_dir().await?;
+        let link = scratch
+            .link(file, "photo")
             .map_err(|err| format!("couldn't link to the file: {err}"))?;
         let args = [OsString::from("-e"), link.into()];
         let input = std::fs::File::open("/dev/null").map_err(|err| err.to_string())?;
@@ -3111,7 +3123,7 @@ impl Thumbnails {
                 env: &[],
                 input,
                 read: &[file.to_owned()],
-                write: &[scratch.path().to_owned()],
+                folder: Some(&scratch),
                 sockets: None,
                 limits: LIMITS,
             })
@@ -3167,7 +3179,7 @@ impl Thumbnails {
                 env: &[],
                 input,
                 read: &read,
-                write: &[],
+                folder: None,
                 sockets: None,
                 limits: output.limits,
             })
@@ -3212,7 +3224,7 @@ impl Thumbnails {
                 env: &env,
                 input,
                 read: &read,
-                write: &[],
+                folder: None,
                 sockets: None,
                 // A whole picture as a PNG is larger than a thumbnail's
                 // output limit.
@@ -3231,7 +3243,7 @@ impl Thumbnails {
     /// at their own resolution, which is kept as its preview, as a
     /// document's is.
     async fn djvu(&self, hash: ContentHash, file: &Path) -> Result<Vec<u8>, String> {
-        let scratch = self.scratch_dir()?;
+        let scratch = self.scratch_dir().await?;
         let scratch_text = scratch
             .path()
             .to_str()
@@ -3255,7 +3267,7 @@ impl Thumbnails {
                 env: &env,
                 input,
                 read: &[file.to_owned()],
-                write: &[scratch.path().to_owned()],
+                folder: Some(&scratch),
                 sockets: None,
                 limits: DOCUMENT_LIMITS,
             })
@@ -3270,7 +3282,7 @@ impl Thumbnails {
     /// Makes LibreOffice's settings, once. On new settings, LibreOffice sets
     /// them up and stops, so each document gets a copy of these instead.
     async fn office_profile(&self) -> Result<tempfile::TempDir, String> {
-        let made = self.scratch_dir()?;
+        let made = self.scratch_dir().await?;
         let profile = made.path().join("profile");
         let args = [
             OsString::from(format!("-env:UserInstallation={}", file_url(&profile))),
@@ -3278,7 +3290,14 @@ impl Thumbnails {
             "--norestore".into(),
             "--terminate_after_init".into(),
         ];
-        self.office(made.path(), &args, &[]).await?;
+        self.office(&made, &args, &[]).await?;
+        // The server keeps its own copy, since a job's folder goes when its
+        // work is done.
+        let kept = tempfile::tempdir_in(self.inner.dir.join("partial"))
+            .map_err(|err| format!("couldn't make a folder for LibreOffice's settings: {err}"))?;
+        let profile = kept.path().join("profile");
+        copy_folder(&made.path().join("profile"), &profile)
+            .map_err(|err| format!("couldn't keep LibreOffice's settings: {err}"))?;
         let settings = profile.join("user").join("registrymodifications.xcu");
         let read = std::fs::read_to_string(&settings)
             .map_err(|err| format!("LibreOffice didn't make its settings: {err}"))?;
@@ -3288,18 +3307,19 @@ impl Thumbnails {
         let written = format!("{}{DOCUMENT_SETTINGS}{}", &read[..end], &read[end..]);
         std::fs::write(&settings, written)
             .map_err(|err| format!("couldn't change LibreOffice's settings: {err}"))?;
-        Ok(made)
+        Ok(kept)
     }
 
     /// Runs LibreOffice in the sandbox, with `scratch` to write in, and
     /// returns what it said on its error output.
     async fn office(
         &self,
-        scratch: &Path,
+        scratch: &Folder,
         args: &[OsString],
         files: &[PathBuf],
     ) -> Result<String, String> {
         let scratch_text = scratch
+            .path()
             .to_str()
             .ok_or("the data folder's name isn't UTF-8")?;
         let env = [("HOME", scratch_text), ("TMPDIR", scratch_text)];
@@ -3319,7 +3339,7 @@ impl Thumbnails {
                 env: &env,
                 input,
                 read: &read,
-                write: &[scratch.to_owned()],
+                folder: Some(scratch),
                 sockets: Some(Path::new(SOCKETS)),
                 limits: DOCUMENT_LIMITS,
             })
@@ -3350,8 +3370,11 @@ impl Thumbnails {
 
     /// A new, empty folder for a worker to write in, removed when it's
     /// dropped.
-    fn scratch_dir(&self) -> Result<tempfile::TempDir, String> {
-        tempfile::tempdir_in(self.inner.dir.join("partial"))
+    async fn scratch_dir(&self) -> Result<Folder, String> {
+        self.inner
+            .sandbox
+            .folder(&self.inner.dir.join("partial"))
+            .await
             .map_err(|err| format!("couldn't make a scratch folder: {err}"))
     }
 
@@ -3613,7 +3636,7 @@ impl Thumbnails {
     /// second past the longest sound that gets a preview, so a longer one
     /// takes no more room than that, and ffmpeg then finds it too long.
     async fn old_sound(&self, hash: ContentHash, file: &Path, format: Sox) -> Outcome {
-        let scratch = match self.scratch_dir() {
+        let scratch = match self.scratch_dir().await {
             Ok(scratch) => scratch,
             Err(problem) => return Outcome::Failed(problem),
         };
@@ -3641,7 +3664,7 @@ impl Thumbnails {
                 env: &[],
                 input,
                 read: &[file.to_owned()],
-                write: &[scratch.path().to_owned()],
+                folder: Some(&scratch),
                 sockets: None,
                 limits: SOUND_LIMITS,
             })
@@ -3705,8 +3728,8 @@ impl Thumbnails {
         demuxer: &str,
         decoders: &str,
         track: &Track,
-    ) -> Result<tempfile::TempDir, String> {
-        let scratch = self.scratch_dir()?;
+    ) -> Result<Folder, String> {
+        let scratch = self.scratch_dir().await?;
         let sound = scratch.path().join("sound.m4a");
         let rate = rate(track.rate).to_string();
         let mut args: Vec<OsString> = [
@@ -3759,7 +3782,7 @@ impl Thumbnails {
                 env: &[],
                 input,
                 read: &[file.to_owned()],
-                write: &[scratch.path().to_owned()],
+                folder: Some(&scratch),
                 sockets: None,
                 limits: SOUND_LIMITS,
             })
@@ -3864,7 +3887,7 @@ impl Thumbnails {
                 env: &[("FONTCONFIG_FILE", config_path), ("MALLOC_ARENA_MAX", "2")],
                 input,
                 read: &[file.to_owned(), config.clone()],
-                write: &[],
+                folder: None,
                 sockets: None,
                 limits,
             })
@@ -3958,8 +3981,8 @@ impl Thumbnails {
 }
 
 /// Why no thumbnails can be made here, if that's the case.
-fn unavailable(tools: &Tools) -> Option<String> {
-    if let Err(err) = accordion_sandbox::check() {
+fn unavailable(tools: &Tools, sandbox: &Sandbox) -> Option<String> {
+    if let Err(err) = sandbox.check() {
         return Some(format!("{err}."));
     }
     let missing: Vec<&str> = [

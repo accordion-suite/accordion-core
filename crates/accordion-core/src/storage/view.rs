@@ -35,9 +35,10 @@ impl View {
         &self.root
     }
 
-    /// Where `names` appears in `username`'s folder.
-    pub(crate) fn path(&self, username: &str, names: &[String]) -> PathBuf {
-        let mut path = self.root.join(username);
+    /// Where `names` appears in `username`'s folder for a place, such as
+    /// `My Drive`.
+    pub(crate) fn path(&self, username: &str, place: &str, names: &[String]) -> PathBuf {
+        let mut path = self.root.join(username).join(place);
         path.extend(names);
         path
     }
@@ -67,14 +68,16 @@ impl View {
 
     /// Recreates the whole view next to the old one, then swaps them, so the
     /// view is never half built.
-    pub(crate) fn rebuild(&self, users: Vec<(String, Vec<Entry>)>) -> io::Result<()> {
+    /// Each of `places` is a folder below the view, such as `alex/My Drive`,
+    /// and what's in it.
+    pub(crate) fn rebuild(&self, places: Vec<(PathBuf, Vec<Entry>)>) -> io::Result<()> {
         let fresh = self.root.with_extension("new");
         let old = self.root.with_extension("old");
         remove(&fresh)?;
         remove(&old)?;
         std::fs::create_dir(&fresh)?;
-        for (username, entries) in users {
-            write(&fresh.join(username), &entries)?;
+        for (folder, entries) in places {
+            write(&fresh.join(folder), &entries)?;
         }
         std::fs::rename(&self.root, &old)?;
         std::fs::rename(&fresh, &self.root)?;

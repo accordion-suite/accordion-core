@@ -83,6 +83,10 @@ pub struct RemoteItem {
     /// Everything inside it changed too, so list it again.
     #[serde(default)]
     pub whole: bool,
+    /// Which place a top folder is: "drive" for My Drive, or an app's,
+    /// such as "notes". Servers before places don't send it.
+    #[serde(default)]
+    pub place: Option<String>,
 }
 
 impl RemoteItem {

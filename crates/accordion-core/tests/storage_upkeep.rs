@@ -232,7 +232,7 @@ async fn resumes_uploads_after_a_dropped_connection_or_a_restart() {
         .await
         .unwrap();
     assert_eq!(read(&storage, item.id).await, "hello world");
-    let shown = server.dir().join("files/alex/greeting.txt");
+    let shown = server.dir().join("files/alex/My Drive/greeting.txt");
     assert_eq!(std::fs::read_to_string(shown).unwrap(), "hello world");
 
     let err = storage.upload(upload.id).await.unwrap_err();
@@ -516,7 +516,7 @@ async fn finds_damage_and_repairs_it_from_a_fresh_copy() {
         .await
         .unwrap();
     assert_eq!(read(storage, file.id).await, "hello");
-    let shown = server.dir().join("files/alex/a.txt");
+    let shown = server.dir().join("files/alex/My Drive/a.txt");
     assert_eq!(std::fs::read_to_string(shown).unwrap(), "hello");
     assert_eq!(storage.check_stored(u64::MAX).await.unwrap().damaged, 0);
     assert_eq!(storage.status().borrow().damaged, 0);
@@ -532,7 +532,7 @@ async fn upkeep_rebuilds_the_view_when_it_starts() {
         .write_file(top, "keep.txt", &b"keep"[..])
         .await
         .unwrap();
-    let shown = server.dir().join("files/alex/keep.txt");
+    let shown = server.dir().join("files/alex/My Drive/keep.txt");
     std::fs::remove_file(&shown).unwrap();
 
     let status = server.storage.status();

@@ -132,7 +132,7 @@ impl From<storage::Error> for ApiError {
             InvalidName | GiveToSelf | ShareWithOwner | ShareTopFolder | InvalidRetention => {
                 StatusCode::BAD_REQUEST
             }
-            NotFound | UserNotFound | UploadNotFound => StatusCode::NOT_FOUND,
+            NotFound | UserNotFound | UploadNotFound | UnknownPlace(_) => StatusCode::NOT_FOUND,
             NameTaken { .. }
             | NotAFolder
             | NotAFile

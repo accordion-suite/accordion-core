@@ -358,9 +358,13 @@ impl Engine {
                 let parent = self.state.get(parent).map_err(db)?.ok_or(Error::NotFound)?;
                 Ok(format!("{}/{name}", parent.path))
             }
-            // A root that's yours is your top folder. Anyone else's was
-            // shared with you on its own.
-            None if item.access == "owner" => Ok(MY_DRIVE.to_owned()),
+            // A root that's yours is My Drive, or an app's place, such as
+            // Notes, beside it. Anyone else's was shared with you on its
+            // own.
+            None if item.access == "owner" => Ok(match item.place.as_deref() {
+                None | Some("drive") => MY_DRIVE.to_owned(),
+                Some(_) => local_name(&item.name),
+            }),
             None => {
                 if let Some(known) = self.state.get(&item.id).map_err(db)?
                     && known.parent.is_none()
@@ -1087,11 +1091,18 @@ impl Engine {
 
     // ---- Local files -------------------------------------------------------
 
-    /// Everything in `My Drive` and `Shared with me`. Symbolic links and the
-    /// engine's own files are left out.
+    /// Everything in `My Drive`, `Shared with me`, and each app's place,
+    /// such as `Notes`. Symbolic links and the engine's own files are left
+    /// out.
     fn scan(&self) -> Result<Scan, Error> {
+        let mut tops = vec![MY_DRIVE.to_owned(), SHARED.to_owned()];
+        for known in self.state.all().map_err(db)? {
+            if known.parent.is_none() && !known.path.contains('/') && !tops.contains(&known.path) {
+                tops.push(known.path);
+            }
+        }
         let mut scan = Scan::default();
-        for top in [MY_DRIVE, SHARED] {
+        for top in &tops {
             let at = self.root.join(top);
             if at.is_dir() {
                 walk(&at, top, &mut scan)?;
@@ -1356,6 +1367,7 @@ fn remote_item(known: &Known) -> RemoteItem {
         modified_at: String::new(),
         access: known.access.clone(),
         whole: false,
+        place: None,
     }
 }
 

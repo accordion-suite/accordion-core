@@ -102,7 +102,9 @@ async fn stores_files_and_shows_them_by_name() {
     let children = server.storage.children(documents.id).await.unwrap();
     assert_eq!(children, std::slice::from_ref(&report));
 
-    let shown = server.view().join("alex/Documents/Report: 2026 ✓.txt");
+    let shown = server
+        .view()
+        .join("alex/My Drive/Documents/Report: 2026 ✓.txt");
     assert_eq!(std::fs::read_to_string(&shown).unwrap(), "hello");
 }
 
@@ -152,7 +154,7 @@ async fn stores_identical_contents_once() {
     }
     assert_eq!(blob_count(server.dir.path()), 1);
     // The stored contents and both names in the view are one file on disk.
-    let metadata = std::fs::metadata(server.view().join("alex/a.txt")).unwrap();
+    let metadata = std::fs::metadata(server.view().join("alex/My Drive/a.txt")).unwrap();
     assert_eq!(metadata.nlink(), 3);
 }
 
@@ -317,7 +319,7 @@ async fn keeps_every_version() {
         .unwrap();
     assert_eq!(read(&server.storage, first.id).await, "first");
     assert_eq!(server.storage.versions(first.id).await.unwrap().len(), 3);
-    let shown = server.view().join("alex/notes.md");
+    let shown = server.view().join("alex/My Drive/notes.md");
     assert_eq!(std::fs::read_to_string(shown).unwrap(), "first");
 }
 
@@ -417,9 +419,9 @@ async fn renames_and_moves() {
         .await
         .unwrap();
     let view = server.view();
-    assert!(!view.join("alex/Photos/Trip").exists());
+    assert!(!view.join("alex/My Drive/Photos/Trip").exists());
     assert_eq!(
-        std::fs::read(view.join("alex/Archive/Summer trip/beach.jpg")).unwrap(),
+        std::fs::read(view.join("alex/My Drive/Archive/Summer trip/beach.jpg")).unwrap(),
         b"jpeg"
     );
 
@@ -486,7 +488,7 @@ async fn deletes_to_the_trash_and_restores() {
         .unwrap();
 
     server.storage.delete(folder.id).await.unwrap();
-    assert!(!server.view().join("alex/Taxes").exists());
+    assert!(!server.view().join("alex/My Drive/Taxes").exists());
     assert!(server.storage.children(top).await.unwrap().is_empty());
     let trash = server.storage.trash(alex).await.unwrap();
     assert_eq!(trash.len(), 1);
@@ -507,7 +509,7 @@ async fn deletes_to_the_trash_and_restores() {
 
     server.storage.restore(folder.id).await.unwrap();
     assert_eq!(
-        std::fs::read(server.view().join("alex/Taxes/2025.pdf")).unwrap(),
+        std::fs::read(server.view().join("alex/My Drive/Taxes/2025.pdf")).unwrap(),
         b"pdf"
     );
 }
@@ -523,12 +525,15 @@ async fn rebuilds_the_view_from_the_database() {
         .await
         .unwrap();
     let view = server.view();
-    std::fs::remove_file(view.join("alex/keep.txt")).unwrap();
-    std::fs::write(view.join("alex/stray.txt"), b"stray").unwrap();
+    std::fs::remove_file(view.join("alex/My Drive/keep.txt")).unwrap();
+    std::fs::write(view.join("alex/My Drive/stray.txt"), b"stray").unwrap();
 
     server.storage.rebuild_view().await.unwrap();
-    assert_eq!(std::fs::read(view.join("alex/keep.txt")).unwrap(), b"keep");
-    assert!(!view.join("alex/stray.txt").exists());
+    assert_eq!(
+        std::fs::read(view.join("alex/My Drive/keep.txt")).unwrap(),
+        b"keep"
+    );
+    assert!(!view.join("alex/My Drive/stray.txt").exists());
 }
 
 #[tokio::test]
@@ -661,7 +666,12 @@ async fn gives_a_removed_users_files_to_someone_else() {
         alex_before + 14
     );
     assert_eq!(
-        std::fs::read(server.view().join("alex/Sam's files (2)/Photos/beach.jpg")).unwrap(),
+        std::fs::read(
+            server
+                .view()
+                .join("alex/My Drive/Sam's files (2)/Photos/beach.jpg")
+        )
+        .unwrap(),
         b"second"
     );
     assert!(!server.view().join("sam").exists());
@@ -771,7 +781,7 @@ async fn follows_a_new_username_after_a_rebuild() {
         .unwrap();
     server.storage.rebuild_view().await.unwrap();
     assert_eq!(
-        std::fs::read(server.view().join("alexander/keep.txt")).unwrap(),
+        std::fs::read(server.view().join("alexander/My Drive/keep.txt")).unwrap(),
         b"keep"
     );
     assert!(!server.view().join("alex").exists());
@@ -965,7 +975,7 @@ async fn copies_a_file() {
     assert_eq!(blob_count(server.dir.path()), 1);
     assert_eq!(server.storage.usage(alex).await.unwrap().used, 8);
     assert_eq!(
-        std::fs::read(server.view().join("alex/Photos/Copy of Beach.jpg")).unwrap(),
+        std::fs::read(server.view().join("alex/My Drive/Photos/Copy of Beach.jpg")).unwrap(),
         b"sand"
     );
 

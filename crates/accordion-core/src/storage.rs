@@ -256,7 +256,46 @@ static MIGRATIONS: &[Migration] = &[
         ALTER TABLE storage_versions ADD COLUMN edit_started_at TEXT;
     ",
     },
+    Migration {
+        version: 8,
+        name: "Give each app a place of its own beside My Drive",
+        sql: "
+        -- Which place a top folder is: 'drive' for My Drive, or an app's
+        -- name, such as 'notes'. Only top folders have one. Each person has
+        -- at most one top folder for each place (decision 32).
+        ALTER TABLE storage_items ADD COLUMN place TEXT
+            CHECK (place IS NULL OR (parent_id IS NULL AND length(place) BETWEEN 1 AND 32));
+        UPDATE storage_items SET place = 'drive' WHERE parent_id IS NULL;
+        DROP INDEX storage_items_one_root;
+        CREATE UNIQUE INDEX storage_items_one_root ON storage_items (owner_id, place)
+            WHERE parent_id IS NULL;
+    ",
+    },
 ];
+
+/// My Drive's place. Its top folder has an empty name.
+pub const MY_DRIVE: &str = "drive";
+
+/// A place an app keeps its files in, with a top folder of its own for each
+/// person, beside My Drive (decision 32). Drive shows each one as a tab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AppPlace {
+    /// Lowercase letters only, such as "notes". Usually the app's module
+    /// name.
+    pub id: &'static str,
+    /// What people see, such as "Notes". It names the top folder, and its
+    /// folder on computers and in the plain view.
+    pub name: &'static str,
+}
+
+/// Who a move would let open an item, and who couldn't open it anymore.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Reach {
+    /// People who can't open the item now, but could after the move.
+    pub gains: Vec<UserId>,
+    /// People who can open it now, but couldn't after the move.
+    pub loses: Vec<UserId>,
+}
 
 /// How long saves from one editing session replace the version the session
 /// started, before the next save starts a new one.
@@ -294,6 +333,9 @@ pub enum Error {
 
     #[error("Your top folder can't be renamed, moved, or deleted.")]
     TopFolder,
+
+    #[error("Accordion doesn't have an app called {0} that keeps files.")]
+    UnknownPlace(String),
 
     #[error("A folder can't be moved into itself, or into a folder inside it.")]
     MoveIntoItself,
@@ -393,6 +435,9 @@ pub struct Item {
     /// When it was deleted, if it's in the trash itself. Items inside a
     /// deleted folder don't have this set.
     pub trashed_at: Option<String>,
+    /// Which place a top folder is, such as [`MY_DRIVE`]. `None` for
+    /// everything else.
+    pub place: Option<String>,
 }
 
 impl Item {
@@ -471,7 +516,7 @@ pub enum Owner {
 /// Where a [`Search`] looks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Place {
-    /// The user's own top folder.
+    /// The user's My Drive. Apps' places aren't part of it.
     MyDrive,
     /// What others shared with the user.
     Shared,
@@ -506,6 +551,10 @@ pub struct Found {
     /// The names of the folders it's in, outermost first, not counting the
     /// top folder. Empty for an item in the top folder.
     pub folders: Vec<String>,
+    /// The place its top folder is, such as [`MY_DRIVE`], when the path in
+    /// `folders` starts there. `None` when it starts at something shared
+    /// with the person.
+    pub place: Option<String>,
 }
 
 /// How much space a user's files take, and their limit.
@@ -533,8 +582,9 @@ pub struct FileSpace {
 /// out of storage.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LeaveFiles {
-    /// Move them, with their versions and trash, into a new folder in
-    /// another user's top folder. If `folder_name` is taken, the folder gets
+    /// Move them, with their versions and trash, into a new folder in each
+    /// of another user's places: what was in My Drive into their My Drive,
+    /// what was in Notes into their Notes, and so on. If `folder_name` is taken, the folder gets
     /// a number after it, such as "Sam's files (2)". The other user's quota
     /// doesn't stop this, like a quota set below what someone already uses.
     GiveTo { owner: UserId, folder_name: String },
@@ -567,6 +617,8 @@ struct Inner {
     status: watch::Sender<StorageStatus>,
     /// Counts files saved, so services such as thumbnails know to look.
     saved: watch::Sender<u64>,
+    /// The apps that keep files in places of their own.
+    places: std::sync::Mutex<Vec<AppPlace>>,
     /// How many [`ContentsHold`]s there are.
     holds: AtomicUsize,
 }
@@ -607,6 +659,7 @@ impl Storage {
                 uploads: uploads::InProgress::default(),
                 status: watch::Sender::new(StorageStatus::default()),
                 saved: watch::Sender::new(0),
+                places: std::sync::Mutex::new(Vec::new()),
                 holds: AtomicUsize::new(0),
             }),
             actor: Actor::SERVER,
@@ -640,9 +693,69 @@ impl Storage {
         Path::new("blobs").join("sha256").join(blobs::shard(hash))
     }
 
-    /// `owner`'s top folder, created the first time it's needed.
+    /// `owner`'s top folder in My Drive, created the first time it's needed.
     pub async fn top_folder(&self, owner: UserId) -> Result<ItemId, Error> {
-        if let Some(id) = self.find_top_folder(owner).await? {
+        self.top_folder_in(owner, MY_DRIVE, "").await
+    }
+
+    /// Adds an app's place, so [`Storage::place_folder`] can make its top
+    /// folders and Drive shows it. Apps add theirs when the server starts.
+    pub fn add_place(&self, place: AppPlace) {
+        assert!(
+            !place.id.is_empty()
+                && place.id.len() <= 32
+                && place.id.bytes().all(|b| b.is_ascii_lowercase())
+                && place.id != MY_DRIVE,
+            "a place's id is up to 32 lowercase letters, and isn't My Drive's"
+        );
+        let mut places = self.inner.places.lock().expect("places lock");
+        if !places.iter().any(|known| known.id == place.id) {
+            places.push(place);
+        }
+    }
+
+    /// The apps' places, in the order they were added.
+    pub fn places(&self) -> Vec<AppPlace> {
+        self.inner.places.lock().expect("places lock").clone()
+    }
+
+    /// `owner`'s top folder in an app's place, such as Notes', created the
+    /// first time it's needed.
+    pub async fn place_folder(&self, owner: UserId, place: &str) -> Result<ItemId, Error> {
+        let known = self
+            .places()
+            .into_iter()
+            .find(|known| known.id == place)
+            .ok_or_else(|| Error::UnknownPlace(place.to_owned()))?;
+        self.top_folder_in(owner, known.id, known.name).await
+    }
+
+    /// `owner`'s top folders that exist, My Drive first, then the others in
+    /// the order they were made. An app that's gone keeps its place here,
+    /// so its files stay reachable.
+    pub async fn own_places(&self, owner: UserId) -> Result<Vec<Item>, Error> {
+        self.inner
+            .db
+            .read(move |conn| {
+                let mut statement = conn.prepare(&format!(
+                    "{ITEM_SELECT} WHERE i.owner_id = ?1 AND i.parent_id IS NULL
+                     ORDER BY i.place <> 'drive', i.created_at, i.place"
+                ))?;
+                let items = statement
+                    .query_map([owner.as_uuid()], item_from_row)?
+                    .collect::<Result<_, _>>()?;
+                Ok(items)
+            })
+            .await
+    }
+
+    async fn top_folder_in(
+        &self,
+        owner: UserId,
+        place: &'static str,
+        name: &'static str,
+    ) -> Result<ItemId, Error> {
+        if let Some(id) = self.find_top_folder(owner, place).await? {
             return Ok(id);
         }
         let _changes = self.inner.changes.lock().await;
@@ -653,35 +766,31 @@ impl Storage {
                 tx.execute(
                     concat!(
                         "INSERT OR IGNORE INTO storage_items
-                         (id, owner_id, parent_id, name, kind, created_at, modified_at)
-                         VALUES (?1, ?2, NULL, '', 'folder', ",
+                         (id, owner_id, parent_id, name, kind, created_at, modified_at, place)
+                         VALUES (?1, ?2, NULL, ?3, 'folder', ",
                         sql_now!(),
                         ", ",
                         sql_now!(),
-                        ")"
+                        ", ?4)"
                     ),
-                    (id.as_uuid(), owner.as_uuid()),
+                    (id.as_uuid(), owner.as_uuid(), name, place),
                 )
                 .map_err(Error::from)
             })
             .await?;
-        let id = self.find_top_folder(owner).await?.ok_or(Error::NotFound)?;
+        let id = self
+            .find_top_folder(owner, place)
+            .await?
+            .ok_or(Error::NotFound)?;
         self.update_view(Change::Show(id)).await;
         Ok(id)
     }
 
-    async fn find_top_folder(&self, owner: UserId) -> Result<Option<ItemId>, Error> {
+    async fn find_top_folder(&self, owner: UserId, place: &str) -> Result<Option<ItemId>, Error> {
+        let place = place.to_owned();
         self.inner
             .db
-            .read(move |conn| {
-                conn.query_row(
-                    "SELECT id FROM storage_items WHERE owner_id = ?1 AND parent_id IS NULL",
-                    [owner.as_uuid()],
-                    |row| Ok(ItemId::from_uuid(row.get(0)?)),
-                )
-                .optional()
-                .map_err(Error::from)
-            })
+            .read(move |conn| top_in(conn, owner, &place))
             .await
     }
 
@@ -733,26 +842,21 @@ impl Storage {
         self.inner
             .db
             .read(move |conn| {
-                let Some(top) = conn
-                    .query_row(
-                        "SELECT id FROM storage_items WHERE owner_id = ?1 AND parent_id IS NULL",
-                        [owner.as_uuid()],
-                        |row| row.get::<_, uuid::Uuid>(0),
-                    )
-                    .optional()?
-                else {
-                    return Ok(Vec::new());
-                };
                 let placeholders = vec!["?"; ids.len()].join(", ");
-                let found = conn
-                    .prepare(&format!("{FOUND_SELECT} WHERE i.id IN ({placeholders})"))?
-                    .query_map(
+                let mut statement =
+                    conn.prepare(&format!("{FOUND_SELECT} WHERE i.id IN ({placeholders})"))?;
+                let mut found = Vec::new();
+                for top in tops(conn, owner)? {
+                    let rows = statement.query_map(
                         rusqlite::params_from_iter(
-                            std::iter::once(top).chain(ids.iter().map(|id| id.as_uuid())),
+                            std::iter::once(top.as_uuid()).chain(ids.iter().map(|id| id.as_uuid())),
                         ),
                         found_from_row,
-                    )?
-                    .collect::<Result<Vec<_>, _>>()?;
+                    )?;
+                    for row in rows {
+                        found.push(row?);
+                    }
+                }
                 Ok(found)
             })
             .await
@@ -844,22 +948,23 @@ impl Storage {
         self.inner
             .db
             .read(move |conn| {
-                let Some(top) = conn
-                    .query_row(
-                        "SELECT id FROM storage_items WHERE owner_id = ?1 AND parent_id IS NULL",
-                        [owner.as_uuid()],
-                        |row| row.get::<_, uuid::Uuid>(0),
-                    )
-                    .optional()?
-                else {
-                    return Ok(Vec::new());
-                };
                 let mut statement = conn.prepare(&format!(
                     "{FOUND_SELECT} WHERE i.kind = 'file' ORDER BY b.size DESC, i.name LIMIT ?2"
                 ))?;
-                let found = statement
-                    .query_map((top, limit as i64), found_from_row)?
-                    .collect::<Result<Vec<_>, _>>()?;
+                let mut found = Vec::new();
+                for top in tops(conn, owner)? {
+                    let rows =
+                        statement.query_map((top.as_uuid(), limit as i64), found_from_row)?;
+                    for row in rows {
+                        found.push(row?);
+                    }
+                }
+                found.sort_by(|a, b| {
+                    size_of(&b.item)
+                        .cmp(&size_of(&a.item))
+                        .then_with(|| a.item.name.cmp(&b.item.name))
+                });
+                found.truncate(limit);
                 Ok(found)
             })
             .await
@@ -937,9 +1042,12 @@ impl Storage {
                         "{ITEM_SELECT} WHERE i.owner_id = ?1 AND i.trashed_at IS NOT NULL"
                     ))?;
                     for item in statement.query_map([user.as_uuid()], item_from_row)? {
+                        let item = item?;
+                        let place = location(conn, item.id)?.place;
                         let found = Found {
-                            item: item?,
+                            item,
                             folders: Vec::new(),
+                            place,
                         };
                         if let Some(hit) = matches(&found) {
                             hits.push(hit);
@@ -960,16 +1068,12 @@ impl Storage {
                        AND (?3 IS NULL OR i.modified_at < ?3)
                      ORDER BY i.modified_at DESC, i.name"
                 ))?;
-                let own: Vec<ItemId> = conn
-                    .prepare(
-                        "SELECT id FROM storage_items WHERE owner_id = ?1 AND parent_id IS NULL",
-                    )?
-                    .query_map([user.as_uuid()], |row| Ok(ItemId::from_uuid(row.get(0)?)))?
-                    .collect::<Result<_, _>>()?;
+                let own = tops(conn, user)?;
+                let my_drive = top_in(conn, user, MY_DRIVE)?;
                 for root in shares::roots(conn, user)? {
                     let mine = own.contains(&root);
                     match search.place {
-                        Some(Place::MyDrive) if !mine => continue,
+                        Some(Place::MyDrive) if my_drive != Some(root) => continue,
                         Some(Place::Shared) if mine => continue,
                         _ => {}
                     }
@@ -1019,6 +1123,7 @@ impl Storage {
                         found.push(Found {
                             item,
                             folders: location.names,
+                            place: location.place,
                         });
                     }
                 }
@@ -1416,6 +1521,40 @@ impl Storage {
         Ok(item)
     }
 
+    /// Who moving `id` into `folder` would let open it, and who couldn't
+    /// open it anymore, so an app can ask before a move shares something
+    /// (decision 32). The owner is never in either list. Shares on the item
+    /// itself go with it, so only the folders above it count.
+    pub async fn move_reach(&self, id: ItemId, folder: ItemId) -> Result<Reach, Error> {
+        self.inner
+            .db
+            .read(move |conn| {
+                let item = item(conn, id)?.ok_or(Error::NotFound)?;
+                let now: HashSet<UserId> = people_with_access(conn, id)?.into_iter().collect();
+                let own: HashSet<UserId> = conn
+                    .prepare("SELECT user_id FROM storage_shares WHERE item_id = ?1")?
+                    .query_map([id.as_uuid()], |row| Ok(UserId::from_uuid(row.get(0)?)))?
+                    .collect::<Result<_, _>>()?;
+                let mut after: HashSet<UserId> =
+                    people_with_access(conn, folder)?.into_iter().collect();
+                after.extend(own);
+                let mut gains: Vec<UserId> = after
+                    .difference(&now)
+                    .filter(|user| **user != item.owner)
+                    .copied()
+                    .collect();
+                let mut loses: Vec<UserId> = now
+                    .difference(&after)
+                    .filter(|user| **user != item.owner)
+                    .copied()
+                    .collect();
+                gains.sort();
+                loses.sort();
+                Ok(Reach { gains, loses })
+            })
+            .await
+    }
+
     /// Renames an item, moves it to another folder, or both.
     pub async fn move_item(
         &self,
@@ -1666,8 +1805,9 @@ impl Storage {
     /// Takes everything `owner` has out of storage, so their account can be
     /// deleted: their files and trash, their quota, their uploads in
     /// progress, and what others shared with them. What they shared stays
-    /// shared, now from whoever gets their files. Returns the folder their files went into, if they were
-    /// given to someone and had any.
+    /// shared, now from whoever gets their files. Returns the folder their
+    /// My Drive went into, if their files were given to someone and they
+    /// had a My Drive.
     ///
     /// Turn the account off first, so nothing new arrives while this runs.
     pub async fn remove_owner(
@@ -1688,7 +1828,9 @@ impl Storage {
                     .user(to)
                     .await?
                     .ok_or(Error::UserNotFound)?;
-                Some((to, self.top_folder(to).await?, folder_name))
+                // So their My Drive exists, and the folder there comes back.
+                self.top_folder(to).await?;
+                Some((to, folder_name))
             }
             LeaveFiles::Delete => None,
         };
@@ -1718,24 +1860,53 @@ impl Storage {
             .inner
             .db
             .write(move |tx| {
-                let top: Option<ItemId> = tx
-                    .query_row(
-                        "SELECT id FROM storage_items WHERE owner_id = ?1 AND parent_id IS NULL",
-                        [owner.as_uuid()],
-                        |row| Ok(ItemId::from_uuid(row.get(0)?)),
-                    )
-                    .optional()?;
+                let tops: Vec<(ItemId, String, String)> = tx
+                    .prepare(
+                        "SELECT id, place, name FROM storage_items
+                         WHERE owner_id = ?1 AND parent_id IS NULL",
+                    )?
+                    .query_map([owner.as_uuid()], |row| {
+                        Ok((ItemId::from_uuid(row.get(0)?), row.get(1)?, row.get(2)?))
+                    })?
+                    .collect::<Result<_, _>>()?;
                 let mut folder = None;
-                match (top, to) {
-                    (Some(top), Some((to, their_top, wanted))) => {
-                        let id = ItemId::generate();
-                        let name = free_name(tx, their_top, &wanted)?;
-                        insert_item(tx, id, to, their_top, &name, "folder")?;
-                        tx.execute(
-                            "UPDATE storage_items SET parent_id = ?2 WHERE parent_id = ?1",
-                            (top.as_uuid(), id.as_uuid()),
-                        )?;
-                        tx.execute("DELETE FROM storage_items WHERE id = ?1", [top.as_uuid()])?;
+                match to {
+                    Some(_) if tops.is_empty() => {}
+                    Some((to, wanted)) => {
+                        for (top, place, top_name) in &tops {
+                            let their_top = match top_in(tx, to, place)? {
+                                Some(top) => top,
+                                None => {
+                                    let id = ItemId::generate();
+                                    tx.execute(
+                                        concat!(
+                                            "INSERT INTO storage_items (id, owner_id, parent_id,
+                                                 name, kind, created_at, modified_at, place)
+                                             VALUES (?1, ?2, NULL, ?3, 'folder', ",
+                                            sql_now!(),
+                                            ", ",
+                                            sql_now!(),
+                                            ", ?4)"
+                                        ),
+                                        (id.as_uuid(), to.as_uuid(), top_name, place),
+                                    )?;
+                                    changes::note(tx, id, [(to, true)])?;
+                                    id
+                                }
+                            };
+                            let id = ItemId::generate();
+                            let name = free_name(tx, their_top, &wanted)?;
+                            insert_item(tx, id, to, their_top, &name, "folder")?;
+                            tx.execute(
+                                "UPDATE storage_items SET parent_id = ?2 WHERE parent_id = ?1",
+                                (top.as_uuid(), id.as_uuid()),
+                            )?;
+                            tx.execute("DELETE FROM storage_items WHERE id = ?1", [top.as_uuid()])?;
+                            changes::note(tx, id, [(to, true)])?;
+                            if place == MY_DRIVE {
+                                folder = Some(id);
+                            }
+                        }
                         tx.execute(
                             "UPDATE storage_items SET owner_id = ?2 WHERE owner_id = ?1",
                             (owner.as_uuid(), to.as_uuid()),
@@ -1748,15 +1919,16 @@ impl Storage {
                                  (SELECT id FROM storage_items WHERE owner_id = ?1)",
                             [to.as_uuid()],
                         )?;
-                        changes::note(tx, id, [(to, true)])?;
-                        folder = Some(item_or_missing(tx, id)?);
                     }
-                    (Some(top), None) => {
+                    None if tops.is_empty() => {}
+                    None => {
                         changes::record_owner_deleting(tx, owner)?;
-                        delete_subtree(tx, top)?;
+                        for (top, ..) in &tops {
+                            delete_subtree(tx, *top)?;
+                        }
                     }
-                    (None, _) => {}
                 }
+                let folder = folder.map(|id| item_or_missing(tx, id)).transpose()?;
                 tx.execute(
                     "DELETE FROM storage_quotas WHERE owner_id = ?1",
                     [owner.as_uuid()],
@@ -1858,17 +2030,21 @@ impl Storage {
     }
 
     async fn rebuild_view_locked(&self) -> Result<(), Error> {
-        let tops: Vec<(UserId, ItemId)> = self
+        let tops: Vec<(UserId, ItemId, String)> = self
             .inner
             .db
             .read(|conn| {
-                let mut statement =
-                    conn.prepare("SELECT owner_id, id FROM storage_items WHERE parent_id IS NULL")?;
+                let mut statement = conn.prepare(
+                    "SELECT owner_id, id, place, name FROM storage_items WHERE parent_id IS NULL",
+                )?;
                 let tops = statement
                     .query_map([], |row| {
+                        let place: Option<String> = row.get(2)?;
+                        let name: String = row.get(3)?;
                         Ok((
                             UserId::from_uuid(row.get(0)?),
                             ItemId::from_uuid(row.get(1)?),
+                            place_folder_name(place.as_deref(), &name),
                         ))
                     })?
                     .collect::<Result<_, _>>()?;
@@ -1876,9 +2052,12 @@ impl Storage {
             })
             .await?;
         let mut users = Vec::new();
-        for (owner, top) in tops {
+        for (owner, top, folder) in tops {
             let username = self.username(owner).await?;
-            users.push((username, self.entries(top).await?));
+            users.push((
+                PathBuf::from(username).join(folder),
+                self.entries(top).await?,
+            ));
         }
         let view = self.inner.view.clone();
         self.inner
@@ -1911,7 +2090,12 @@ impl Storage {
             return Ok(None);
         }
         let username = self.username(location.owner).await?;
-        Ok(Some(self.inner.view.path(&username, &location.names)))
+        let folder = place_folder_name(location.place.as_deref(), &location.top_name);
+        Ok(Some(self.inner.view.path(
+            &username,
+            &folder,
+            &location.names,
+        )))
     }
 
     /// Everything in a folder that isn't in the trash, for the plain view.
@@ -2032,7 +2216,7 @@ macro_rules! item_select {
             $with,
             "
     SELECT i.id, i.owner_id, i.parent_id, i.name, i.kind, i.created_at, i.modified_at,
-           i.trashed_at, v.id, v.blob, b.size",
+           i.trashed_at, v.id, v.blob, b.size, i.place",
             $extra,
             "
     FROM ",
@@ -2054,25 +2238,26 @@ const ITEM_SELECT: &str = item_select!("", "", "storage_items i");
 /// by "/", which names can't contain, and the path of the folder it's in:
 /// null for a top folder, and empty for what's in it. A shared item is the
 /// first folder in its own path, so what's inside it says where it is from
-/// there.
+/// there. Each also carries the place of the top folder it was reached
+/// from, or null when that's a shared item.
 const FOUND_SELECT: &str = item_select!(
     "
-    WITH RECURSIVE live (id, path, inside) AS (
+    WITH RECURSIVE live (id, path, inside, top) AS (
         SELECT id, CASE WHEN parent_id IS NULL THEN '' ELSE name END,
-               CASE WHEN parent_id IS NULL THEN NULL ELSE '' END
+               CASE WHEN parent_id IS NULL THEN NULL ELSE '' END, place
         FROM storage_items WHERE id = ?1
         UNION ALL
         SELECT i.id, CASE live.path WHEN '' THEN i.name ELSE live.path || '/' || i.name END,
-               live.path
+               live.path, live.top
         FROM storage_items i JOIN live ON i.parent_id = live.id
         WHERE i.trashed_at IS NULL
     )",
-    ", l.inside",
+    ", l.inside, l.top",
     "live l JOIN storage_items i ON i.id = l.id"
 );
 
 /// Shares joined to their items, for [`item_from_row`], with the share's
-/// columns from index 11 (see `shares::share_from_row`).
+/// columns from index 12 (see `shares::share_from_row`).
 const SHARED_SELECT: &str = item_select!(
     "",
     ", s.item_id, s.user_id, s.level, s.shared_by, s.created_at",
@@ -2249,13 +2434,14 @@ fn inside(conn: &Connection, folder: ItemId) -> Result<HashSet<ItemId>, Error> {
 }
 
 fn found_from_row(row: &Row<'_>) -> rusqlite::Result<Found> {
-    let inside: Option<String> = row.get(11)?;
+    let inside: Option<String> = row.get(12)?;
     Ok(Found {
         item: item_from_row(row)?,
         folders: match inside.as_deref() {
             None | Some("") => Vec::new(),
             Some(path) => path.split('/').map(str::to_owned).collect(),
         },
+        place: row.get(13)?,
     })
 }
 
@@ -2281,7 +2467,47 @@ fn item_from_row(row: &Row<'_>) -> rusqlite::Result<Item> {
         created_at: row.get(5)?,
         modified_at: row.get(6)?,
         trashed_at: row.get(7)?,
+        place: row.get(11)?,
     })
+}
+
+/// A file's size, or 0 for a folder.
+fn size_of(item: &Item) -> u64 {
+    match &item.kind {
+        ItemKind::File { blob, .. } => blob.size,
+        ItemKind::Folder => 0,
+    }
+}
+
+/// `owner`'s top folders: My Drive and each app's place they have.
+fn tops(conn: &Connection, owner: UserId) -> Result<Vec<ItemId>, Error> {
+    Ok(conn
+        .prepare(
+            "SELECT id FROM storage_items WHERE owner_id = ?1 AND parent_id IS NULL
+             ORDER BY place <> 'drive', created_at, place",
+        )?
+        .query_map([owner.as_uuid()], |row| Ok(ItemId::from_uuid(row.get(0)?)))?
+        .collect::<Result<_, _>>()?)
+}
+
+/// `owner`'s top folder in `place`, if they have one.
+fn top_in(conn: &Connection, owner: UserId, place: &str) -> Result<Option<ItemId>, Error> {
+    Ok(conn
+        .query_row(
+            "SELECT id FROM storage_items
+             WHERE owner_id = ?1 AND parent_id IS NULL AND place = ?2",
+            (owner.as_uuid(), place),
+            |row| Ok(ItemId::from_uuid(row.get(0)?)),
+        )
+        .optional()?)
+}
+
+/// The folder a top folder appears as in the plain view, and on computers.
+fn place_folder_name(place: Option<&str>, name: &str) -> String {
+    match place {
+        Some(MY_DRIVE) | None => "My Drive".to_owned(),
+        Some(_) => name.to_owned(),
+    }
 }
 
 fn hash_from(row: &Row<'_>, index: usize) -> rusqlite::Result<ContentHash> {
@@ -2661,11 +2887,14 @@ fn insert_version(conn: &Connection, item: ItemId, blob: Blob) -> Result<(), Err
 }
 
 /// Where an item sits: its owner, the names of the folders above it (not
-/// counting the top folder) and its own, and whether it's out of the trash.
+/// counting the top folder) and its own, whether it's out of the trash, and
+/// its top folder's place and name.
 struct Location {
     owner: UserId,
     names: Vec<String>,
     visible: bool,
+    place: Option<String>,
+    top_name: String,
 }
 
 fn location(conn: &Connection, id: ItemId) -> Result<Location, Error> {
@@ -2677,8 +2906,8 @@ fn location(conn: &Connection, id: ItemId) -> Result<Location, Error> {
              SELECT i.id, i.parent_id, i.owner_id, i.name, i.trashed_at, up.depth + 1
              FROM storage_items i JOIN up ON i.id = up.parent_id
          )
-         SELECT owner_id, name, parent_id IS NULL, trashed_at IS NOT NULL
-         FROM up ORDER BY depth DESC",
+         SELECT up.owner_id, up.name, up.parent_id IS NULL, up.trashed_at IS NOT NULL, i.place
+         FROM up JOIN storage_items i ON i.id = up.id ORDER BY depth DESC",
     )?;
     let rows = statement
         .query_map([id.as_uuid()], |row| {
@@ -2687,18 +2916,21 @@ fn location(conn: &Connection, id: ItemId) -> Result<Location, Error> {
                 row.get::<_, String>(1)?,
                 row.get::<_, bool>(2)?,
                 row.get::<_, bool>(3)?,
+                row.get::<_, Option<String>>(4)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    let (owner, ..) = *rows.first().ok_or(Error::NotFound)?;
+    let (owner, ref top_name, _, _, ref place) = *rows.first().ok_or(Error::NotFound)?;
     Ok(Location {
         owner,
         names: rows
             .iter()
-            .filter(|(_, _, top, _)| !top)
+            .filter(|(_, _, top, ..)| !top)
             .map(|(_, name, ..)| name.clone())
             .collect(),
-        visible: !rows.iter().any(|(.., trashed)| *trashed),
+        visible: !rows.iter().any(|(_, _, _, trashed, _)| *trashed),
+        place: place.clone(),
+        top_name: top_name.clone(),
     })
 }
 

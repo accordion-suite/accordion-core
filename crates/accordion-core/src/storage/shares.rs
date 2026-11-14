@@ -16,7 +16,7 @@ use rusqlite::{Connection, OptionalExtension, Row};
 
 use super::{
     Error, FOUND_SELECT, Found, Item, SHARED_SELECT, Storage, found_from_row, item, item_from_row,
-    location,
+    location, tops,
 };
 use crate::events::{self, Action, Actor, NewEvent};
 use crate::sql_now;
@@ -250,7 +250,7 @@ impl Storage {
                 let rows = statement.query_map([user.as_uuid()], |row| {
                     Ok(Shared {
                         item: item_from_row(row)?,
-                        share: share_from_row(row, 11)?,
+                        share: share_from_row(row, 12)?,
                     })
                 })?;
                 let mut shared = Vec::new();
@@ -272,22 +272,15 @@ impl Storage {
         self.inner
             .db
             .read(move |conn| {
-                let Some(top) = conn
-                    .query_row(
-                        "SELECT id FROM storage_items WHERE owner_id = ?1 AND parent_id IS NULL",
-                        [owner.as_uuid()],
-                        |row| row.get::<_, uuid::Uuid>(0),
-                    )
-                    .optional()?
-                else {
-                    return Ok(Vec::new());
-                };
-                let found = conn
-                    .prepare(&format!(
-                        "{FOUND_SELECT} WHERE i.id IN (SELECT item_id FROM storage_shares)"
-                    ))?
-                    .query_map([top], found_from_row)?
-                    .collect::<Result<Vec<_>, _>>()?;
+                let mut statement = conn.prepare(&format!(
+                    "{FOUND_SELECT} WHERE i.id IN (SELECT item_id FROM storage_shares)"
+                ))?;
+                let mut found = Vec::new();
+                for top in tops(conn, owner)? {
+                    for row in statement.query_map([top.as_uuid()], found_from_row)? {
+                        found.push(row?);
+                    }
+                }
                 let mut shares: HashMap<ItemId, Vec<Share>> = HashMap::new();
                 let mut statement = conn.prepare(&format!(
                     "SELECT {SHARE_COLUMNS} FROM storage_shares s
@@ -465,8 +458,8 @@ pub(crate) fn people_with_access(conn: &Connection, id: ItemId) -> Result<Vec<Us
     Ok(people)
 }
 
-/// Where everything `user` can reach starts: their top folder, if they have
-/// one, and each item shared with them that's outside the trash.
+/// Where everything `user` can reach starts: their top folders, My Drive
+/// first, and each item shared with them that's outside the trash.
 /// The items `owner` shared with `with` themselves, not counting what's
 /// inside shared folders.
 pub(super) fn shared_by_with(
@@ -500,10 +493,7 @@ pub(super) fn shared_by_anyone(conn: &Connection, owner: UserId) -> Result<HashS
 }
 
 pub(super) fn roots(conn: &Connection, user: UserId) -> Result<Vec<ItemId>, Error> {
-    let mut roots: Vec<ItemId> = conn
-        .prepare("SELECT id FROM storage_items WHERE owner_id = ?1 AND parent_id IS NULL")?
-        .query_map([user.as_uuid()], |row| Ok(ItemId::from_uuid(row.get(0)?)))?
-        .collect::<Result<_, _>>()?;
+    let mut roots = tops(conn, user)?;
     let shared: Vec<ItemId> = conn
         .prepare("SELECT item_id FROM storage_shares WHERE user_id = ?1")?
         .query_map([user.as_uuid()], |row| Ok(ItemId::from_uuid(row.get(0)?)))?

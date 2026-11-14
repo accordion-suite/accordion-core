@@ -19,6 +19,6 @@ tracing = "0.1.44"
 futures-util = "0.3.34"
 tempfile = "3.27.0"
 tokio = { version = "1.53.3", features = ["macros", "rt-multi-thread"] }
-tokio-tungstenite = "0.29.0"
+tokio-tungstenite = "0.30.0"
 tower = { version = "0.5.3", features = ["util"] }
 yrs = "0.28.1"

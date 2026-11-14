@@ -21,7 +21,7 @@ getrandom = "0.4.3"
 jiff = { version = "0.2.38", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 libc = "0.2.190"
 quick-xml = "0.42.0"
-rusqlite = { version = "0.41.1", features = ["backup", "bundled", "uuid"] }
+rusqlite = { version = "0.42.0", features = ["backup", "bundled", "uuid"] }
 # For reading a REST backup server's certificate, to pin it. The same versions
 # and features as the gateway, so the server builds one copy.
 rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }

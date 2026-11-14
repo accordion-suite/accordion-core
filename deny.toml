@@ -6,7 +6,12 @@ all-features = true
 
 [advisories]
 # To accept a specific advisory, add its ID here with a comment explaining why.
-ignore = []
+ignore = [
+    # smallstr is unmaintained, with no known vulnerability. Only yrs uses it,
+    # and yrs 0.28.1 is the newest release (November 2026). Drop this when
+    # yrs moves off it.
+    "RUSTSEC-2026-0215",
+]
 
 [licenses]
 # Licenses that can be combined with AGPL-3.0. Check compatibility before you

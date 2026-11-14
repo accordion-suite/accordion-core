@@ -7,6 +7,7 @@
 //! command-line tool or a sandboxed worker can use core without it.
 
 pub mod auth;
+pub mod coedit;
 mod error;
 
 pub use auth::{Authenticated, DavUser};

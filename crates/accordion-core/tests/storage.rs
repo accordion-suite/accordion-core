@@ -197,6 +197,86 @@ async fn replaces_an_empty_version_instead_of_keeping_it() {
 }
 
 #[tokio::test]
+async fn groups_an_editing_sessions_saves_into_one_version() {
+    let server = start().await;
+    let alex = server.user("alex").await;
+    let top = server.storage.top_folder(alex).await.unwrap();
+    let file = server
+        .storage
+        .write_file(top, "plan.txt", &b"plan"[..])
+        .await
+        .unwrap();
+    let hash = |item: &accordion_core::storage::Item| match item.kind {
+        ItemKind::File { blob, .. } => blob.hash,
+        ItemKind::Folder => panic!("a file"),
+    };
+    let versions = |storage: Storage| async move { storage.versions(file.id).await.unwrap() };
+    let session = uuid::Uuid::from_u128(1);
+
+    // A session's first save is a version, and its next saves replace it.
+    let saved = server
+        .storage
+        .write_edit(file.id, hash(&file), session, &b"plan A"[..])
+        .await
+        .unwrap();
+    let saved = server
+        .storage
+        .write_edit(file.id, hash(&saved), session, &b"plan AB"[..])
+        .await
+        .unwrap();
+    assert_eq!(read(&server.storage, file.id).await, "plan AB");
+    assert_eq!(versions(server.storage.clone()).await.len(), 2);
+
+    // A save from elsewhere is a version of its own, and the session's next
+    // save starts another.
+    let elsewhere = server
+        .storage
+        .write_version(file.id, hash(&saved), &b"plan ABC"[..])
+        .await
+        .unwrap();
+    let saved = server
+        .storage
+        .write_edit(file.id, hash(&elsewhere), session, &b"plan ABCD"[..])
+        .await
+        .unwrap();
+    assert_eq!(versions(server.storage.clone()).await.len(), 4);
+
+    // Another session starts its own.
+    let other = uuid::Uuid::from_u128(2);
+    let saved = server
+        .storage
+        .write_edit(file.id, hash(&saved), other, &b"plan ABCDE"[..])
+        .await
+        .unwrap();
+    assert_eq!(versions(server.storage.clone()).await.len(), 5);
+
+    // After 30 minutes, the same session starts a new version.
+    let db = rusqlite::Connection::open(server.dir.path().join("accordion.db")).unwrap();
+    db.execute(
+        "UPDATE storage_versions SET edit_started_at = '2020-01-01T00:00:00.000Z'",
+        [],
+    )
+    .unwrap();
+    let saved = server
+        .storage
+        .write_edit(file.id, hash(&saved), other, &b"plan ABCDEF"[..])
+        .await
+        .unwrap();
+    assert_eq!(versions(server.storage.clone()).await.len(), 6);
+
+    // A stale base is refused, as with any version.
+    let stale = server
+        .storage
+        .write_edit(file.id, hash(&file), other, &b"old"[..])
+        .await;
+    assert!(matches!(stale, Err(Error::Changed)));
+    assert_eq!(
+        hash(&server.storage.item(file.id).await.unwrap().unwrap()),
+        hash(&saved)
+    );
+}
+
+#[tokio::test]
 async fn keeps_every_version() {
     let server = start().await;
     let alex = server.user("alex").await;

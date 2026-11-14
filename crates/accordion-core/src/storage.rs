@@ -44,6 +44,7 @@ use accordion_types::{ItemId, UploadId, UserId, VersionId};
 use rusqlite::{Connection, OptionalExtension, Row};
 use tokio::io::AsyncRead;
 use tokio::sync::watch;
+use uuid::Uuid;
 
 use crate::db::{self, Database, Migration};
 use crate::events::{self, Action, Actor, NewEvent};
@@ -244,7 +245,22 @@ static MIGRATIONS: &[Migration] = &[
         INSERT INTO storage_settings VALUES (1, 30, 30);
     ",
     },
+    Migration {
+        version: 7,
+        name: "Group an editing session's saves into one version",
+        sql: "
+        -- The co-editing session that saved the version, and when its first
+        -- save was. Later saves from the same session replace the version
+        -- for 30 minutes, so typing doesn't make a version every 30 seconds.
+        ALTER TABLE storage_versions ADD COLUMN edit_id BLOB CHECK (length(edit_id) = 16);
+        ALTER TABLE storage_versions ADD COLUMN edit_started_at TEXT;
+    ",
+    },
 ];
+
+/// How long saves from one editing session replace the version the session
+/// started, before the next save starts a new one.
+pub const EDIT_VERSION_MINUTES: u32 = 30;
 
 /// The longest name, in bytes of UTF-8. Most file systems allow 255, so the
 /// plain view can show every name exactly.
@@ -1075,8 +1091,37 @@ impl Storage {
             return Err(Error::InTrash);
         }
         let parent = file.parent.ok_or(Error::NotAFile)?;
-        self.receive_and_save(parent, file.name, contents, Over::File(id, base))
+        self.receive_and_save(parent, file.name, contents, Over::File(id, base, None))
             .await
+    }
+
+    /// Saves `contents` as the file's new version, as
+    /// [`Storage::write_version`] does, for a co-editing session (decision
+    /// 30). When the file's current version came from the same `edit` less
+    /// than [`EDIT_VERSION_MINUTES`] after that session's first save to it,
+    /// this replaces that version, so a session's saves become one version.
+    pub async fn write_edit(
+        &self,
+        id: ItemId,
+        base: ContentHash,
+        edit: Uuid,
+        contents: impl AsyncRead + Unpin,
+    ) -> Result<Item, Error> {
+        let file = self.item(id).await?.ok_or(Error::NotFound)?;
+        if file.kind == ItemKind::Folder {
+            return Err(Error::NotAFile);
+        }
+        if file.trashed_at.is_some() {
+            return Err(Error::InTrash);
+        }
+        let parent = file.parent.ok_or(Error::NotAFile)?;
+        self.receive_and_save(
+            parent,
+            file.name,
+            contents,
+            Over::File(id, base, Some(edit)),
+        )
+        .await
     }
 
     async fn receive_and_save(
@@ -1136,7 +1181,11 @@ impl Storage {
                         new_id
                     }
                 };
-                add_version(tx, id, blob)?;
+                let edit = match over {
+                    Over::File(_, _, edit) => edit,
+                    Over::Any | Over::Nothing => None,
+                };
+                add_version(tx, id, blob, edit)?;
                 if let Some(upload) = upload {
                     tx.execute(
                         "DELETE FROM storage_uploads WHERE id = ?1",
@@ -1210,6 +1259,20 @@ impl Storage {
         Ok(tokio::task::spawn_blocking(move || f(&inner.blobs))
             .await
             .expect("a storage task on the disk panicked")?)
+    }
+
+    /// Whether the item exists and is outside the trash, counting a folder
+    /// above it that's in the trash.
+    pub async fn outside_trash(&self, id: ItemId) -> Result<bool, Error> {
+        self.inner
+            .db
+            .read(move |conn| {
+                if item(conn, id)?.is_none() {
+                    return Ok(false);
+                }
+                Ok(location(conn, id)?.visible)
+            })
+            .await
     }
 
     /// Opens the current version of a file.
@@ -1303,7 +1366,7 @@ impl Storage {
                     .optional()?
                     .ok_or(Error::NotFound)?;
                 check_space(tx, item.owner, blob.size, None)?;
-                add_version(tx, id, blob)?;
+                add_version(tx, id, blob, None)?;
                 record(
                     tx,
                     actor,
@@ -1344,7 +1407,7 @@ impl Storage {
                 }
                 check_space(tx, parent.owner, blob.size, None)?;
                 insert_item(tx, new_id, parent.owner, parent.id, &name, "file")?;
-                add_version(tx, new_id, blob)?;
+                add_version(tx, new_id, blob, None)?;
                 record(tx, actor, added(new_id, parent.owner, "copied"))?;
                 item_or_missing(tx, new_id)
             })
@@ -2348,8 +2411,9 @@ enum Over {
     Nothing,
     /// This file, and only while its contents are still these. Contents
     /// rather than a version ID, because a save over an empty version
-    /// keeps its ID.
-    File(ItemId, ContentHash),
+    /// keeps its ID. With an editing session's ID, a recent version from
+    /// the same session is replaced.
+    File(ItemId, ContentHash, Option<Uuid>),
 }
 
 /// Checks that `name` in `parent` can take a new file or version of
@@ -2375,7 +2439,7 @@ fn check_save(
                 kind: ItemKind::File { blob, .. },
                 ..
             }),
-            Over::File(file, base),
+            Over::File(file, base, _),
         ) if id == file && blob.hash == base => Some(id),
         (_, Over::File(..)) => return Err(Error::Changed),
         (existing, _) => existing.map(|existing| existing.id),
@@ -2509,21 +2573,62 @@ fn added(id: ItemId, owner: UserId, how: &str) -> NewEvent {
 /// is replaced instead of kept, because there's nothing in it to go back to.
 /// File Explorer on Windows, for example, saves every new file empty first,
 /// then saves its contents over it.
-fn add_version(conn: &Connection, item: ItemId, blob: Blob) -> Result<(), Error> {
-    let replaced = conn.execute(
-        concat!(
-            "UPDATE storage_versions SET blob = ?2, created_at = ",
-            sql_now!(),
-            " WHERE id = (SELECT v.id FROM storage_versions v
+fn add_version(
+    conn: &Connection,
+    item: ItemId,
+    blob: Blob,
+    edit: Option<Uuid>,
+) -> Result<(), Error> {
+    let mut replaced = 0;
+    if let Some(edit) = edit {
+        replaced = conn.execute(
+            concat!(
+                "UPDATE storage_versions SET blob = ?2, created_at = ",
+                sql_now!(),
+                " WHERE id = (SELECT id FROM storage_versions WHERE item_id = ?1
+                              ORDER BY number DESC LIMIT 1)
+                    AND edit_id = ?3
+                    AND edit_started_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?4)"
+            ),
+            (
+                item.as_uuid(),
+                &blob.hash.0[..],
+                edit,
+                format!("-{EDIT_VERSION_MINUTES} minutes"),
+            ),
+        )?;
+    }
+    if replaced == 0 {
+        replaced = conn.execute(
+            concat!(
+                "UPDATE storage_versions SET blob = ?2, created_at = ",
+                sql_now!(),
+                " WHERE id = (SELECT v.id FROM storage_versions v
                           JOIN storage_blobs b ON b.hash = v.blob
                           WHERE v.item_id = ?1 AND b.size = 0
                             AND v.number = (SELECT max(number) FROM storage_versions
                                             WHERE item_id = ?1))"
-        ),
-        (item.as_uuid(), &blob.hash.0[..]),
-    )?;
+            ),
+            (item.as_uuid(), &blob.hash.0[..]),
+        )?;
+    }
     if replaced == 0 {
         insert_version(conn, item, blob)?;
+    }
+    if let Some(edit) = edit {
+        // A version this session started, or one it took over from an empty
+        // file, starts the 30 minutes now. A replaced one keeps its start.
+        conn.execute(
+            concat!(
+                "UPDATE storage_versions SET edit_started_at = ",
+                sql_now!(),
+                ", edit_id = ?2
+                 WHERE id = (SELECT id FROM storage_versions WHERE item_id = ?1
+                             ORDER BY number DESC LIMIT 1)
+                   AND (edit_id IS NOT ?2 OR edit_started_at IS NULL)"
+            ),
+            (item.as_uuid(), edit),
+        )?;
     }
     conn.execute(
         concat!(

@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use accordion_core::{events, identity, storage, texts, thumbnails};
+use accordion_core::{coedit, events, identity, storage, texts, thumbnails};
 use axum::Json;
 use axum::http::StatusCode;
 use axum::http::header::RETRY_AFTER;
@@ -169,6 +169,20 @@ impl From<events::Error> for ApiError {
                 Self::server_problem()
             }
         }
+    }
+}
+
+impl From<coedit::JoinError> for ApiError {
+    fn from(err: coedit::JoinError) -> Self {
+        use coedit::JoinError;
+        let status = match err {
+            JoinError::NotFound => return Self::not_found(),
+            JoinError::Full | JoinError::Stopping => StatusCode::SERVICE_UNAVAILABLE,
+            JoinError::TooBig => StatusCode::PAYLOAD_TOO_LARGE,
+            JoinError::OtherFormat => StatusCode::CONFLICT,
+            JoinError::Unreadable => StatusCode::INTERNAL_SERVER_ERROR,
+        };
+        Self::new(status, err.to_string())
     }
 }
 

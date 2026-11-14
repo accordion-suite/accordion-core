@@ -249,7 +249,7 @@ impl Storage {
             return Err(Error::InTrash);
         }
         let parent = item.parent.ok_or(Error::NotAFile)?;
-        self.finish(id, parent, &item.name, Over::File(file, base))
+        self.finish(id, parent, &item.name, Over::File(file, base, None))
             .await
     }
 

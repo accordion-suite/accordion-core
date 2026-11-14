@@ -49,6 +49,14 @@ pub trait Module: Send + Sync + 'static {
         &[]
     }
 
+    /// How much space the module's data takes, for the **Modules** page, or
+    /// `None` if it keeps none of its own or can't tell. The server asks
+    /// while the module is off too, since turning it off keeps its data.
+    fn data_size(&self, services: &Services) -> BoxFuture<Option<u64>> {
+        let _ = services;
+        Box::pin(async { None })
+    }
+
     /// Starts the module: runs its migrations, then returns its routes and
     /// its background work. The server calls it again each time the module
     /// is turned back on.

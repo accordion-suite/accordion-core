@@ -6,7 +6,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use accordion_core::db::Database;
 use accordion_core::events::{Action, Actor, Event, Events, NewEvent, Via};
 use accordion_core::identity::{AppPasswordUse, AuthMethod, Client, Identity, NewUser, SignInFrom};
-use accordion_core::storage::{LeaveFiles, ShareLevel, Storage};
+use accordion_core::storage::{AppPlace, LeaveFiles, ShareLevel, Storage};
 use accordion_types::{ItemId, Role, UserId};
 use serde_json::json;
 
@@ -585,4 +585,119 @@ async fn notifications_can_be_removed_one_at_a_time_or_all_at_once() {
     let left = s.events.notifications(sam, 50).await.unwrap();
     assert_eq!(left.len(), 1);
     assert_eq!(left[0].event.item, Some(four.id));
+}
+
+#[tokio::test]
+async fn a_repeated_edit_moves_to_the_top() {
+    let s = start().await;
+    let alex = s.user("alex").await;
+    let sam = s.user("sam").await;
+    let top = s.storage.top_folder(alex).await.unwrap();
+    let storage = s.by(alex);
+
+    let list = storage
+        .write_file(top, "list.txt", &b"milk"[..])
+        .await
+        .unwrap();
+    let plan = storage
+        .write_file(top, "plan.txt", &b"a"[..])
+        .await
+        .unwrap();
+    // Editing the list again folds into its addition, which is now the
+    // newest thing in the folder.
+    storage
+        .write_file(top, "list.txt", &b"milk, eggs"[..])
+        .await
+        .unwrap();
+    let items: Vec<_> = s
+        .activity(alex, top)
+        .await
+        .iter()
+        .map(|event| event.item)
+        .collect();
+    assert_eq!(items, [Some(list.id), Some(plan.id)]);
+
+    // Someone else's repeated edit moves the owner's notification up with
+    // it, still seen, so they aren't told twice.
+    let folder = storage.create_folder(top, "Shared").await.unwrap();
+    storage
+        .share(folder.id, sam, ShareLevel::Editor, alex)
+        .await
+        .unwrap();
+    let recipe = storage
+        .write_file(folder.id, "recipe.txt", &b"a"[..])
+        .await
+        .unwrap();
+    s.by(sam)
+        .write_file(folder.id, "recipe.txt", &b"b"[..])
+        .await
+        .unwrap();
+    let notices = s.events.notifications(alex, 10).await.unwrap();
+    assert_eq!(notices.len(), 1);
+    s.events.mark_seen(alex, notices[0].event.id).await.unwrap();
+    storage
+        .write_file(folder.id, "notes.txt", &b"x"[..])
+        .await
+        .unwrap();
+    s.by(sam)
+        .write_file(folder.id, "recipe.txt", &b"c"[..])
+        .await
+        .unwrap();
+    let newest = s.activity(alex, folder.id).await[0].clone();
+    assert_eq!(newest.item, Some(recipe.id));
+    assert_eq!(newest.action, Action::Edited);
+    assert_eq!(s.notified(alex).await, [(Action::Edited, true, false)]);
+    let notices = s.events.notifications(alex, 10).await.unwrap();
+    assert_eq!(notices[0].event.id, newest.id);
+}
+
+#[tokio::test]
+async fn my_drive_and_each_place_have_their_own_activity() {
+    let s = start().await;
+    s.storage.add_place(AppPlace {
+        id: "notes",
+        name: "Notes",
+    });
+    let alex = s.user("alex").await;
+    let top = s.storage.top_folder(alex).await.unwrap();
+    let notes = s.storage.place_folder(alex, "notes").await.unwrap();
+    let storage = s.by(alex);
+
+    let photo = storage
+        .write_file(top, "photo.jpg", &b"jpg"[..])
+        .await
+        .unwrap();
+    let note = storage
+        .write_file(notes, "Shopping.md", &b"- [ ] Milk"[..])
+        .await
+        .unwrap();
+    let folder = storage.create_folder(notes, "Garden").await.unwrap();
+    let inner = storage
+        .write_file(folder.id, "Seeds.md", &b"Tomatoes"[..])
+        .await
+        .unwrap();
+    let items = |events: Vec<Event>| -> Vec<Option<ItemId>> {
+        events.iter().map(|event| event.item).collect()
+    };
+    assert_eq!(items(s.activity(alex, top).await), [Some(photo.id)]);
+    assert_eq!(
+        items(s.activity(alex, notes).await),
+        [Some(inner.id), Some(folder.id), Some(note.id)]
+    );
+
+    // A note moved into My Drive takes its history along.
+    storage.move_item(inner.id, top, "Seeds.md").await.unwrap();
+    let mine = s.activity(alex, top).await;
+    assert_eq!(
+        actions(&mine),
+        [Action::Moved, Action::Added, Action::Added]
+    );
+    assert_eq!(
+        items(mine),
+        [Some(inner.id), Some(inner.id), Some(photo.id)]
+    );
+    assert_eq!(
+        items(s.activity(alex, notes).await),
+        [Some(folder.id), Some(note.id)]
+    );
 }

@@ -546,11 +546,27 @@ impl Events {
             .read(move |conn| {
                 let access = storage::access(conn, reader, id)?.ok_or(Error::NotFound)?;
                 let owner = access == Access::Owner;
-                let item = storage::item_parent(conn, id)?.ok_or(Error::NotFound)?;
-                // Everything in someone's Drive is theirs, so their own
-                // events are quicker to find than walking every folder.
-                let inside = if item.is_none() {
-                    "SELECT item_id FROM events_log WHERE owner_id = ?3"
+                let parent = storage::item_parent(conn, id)?.ok_or(Error::NotFound)?;
+                let my_drive = parent.is_none()
+                    && storage::place_of(conn, id)?.as_deref() == Some(storage::MY_DRIVE);
+                // Everything in someone's My Drive is theirs, so their own
+                // events, less those in their other places (decision 32),
+                // are quicker to find than walking every folder. The other
+                // places, such as Notes, are small, so walking them is
+                // quick, and their own activity walks them too.
+                let inside = if my_drive {
+                    "SELECT item_id FROM events_log WHERE owner_id = ?3
+                     EXCEPT
+                     SELECT id FROM (
+                         WITH RECURSIVE elsewhere (id) AS (
+                             SELECT id FROM storage_items
+                             WHERE owner_id = ?3 AND parent_id IS NULL AND id != ?1
+                             UNION ALL
+                             SELECT i.id FROM storage_items i
+                             JOIN elsewhere ON i.parent_id = elsewhere.id
+                         )
+                         SELECT id FROM elsewhere
+                     )"
                 } else {
                     "WITH RECURSIVE inside (id) AS (
                          SELECT ?1
@@ -963,14 +979,27 @@ fn hint(conn: &Connection, event: &NewEvent) -> rusqlite::Result<()> {
             folders.push(item);
         }
     }
+    let mut moved = Vec::new();
     for end in ["from", "to"] {
-        let moved = event.details.get(end).cloned();
-        folders.extend(moved.and_then(|id| serde_json::from_value::<ItemId>(id).ok()));
+        let folder = event.details.get(end).cloned();
+        moved.extend(folder.and_then(|id| serde_json::from_value::<ItemId>(id).ok()));
     }
+    folders.extend_from_slice(&moved);
     folders.sort_unstable();
     folders.dedup();
     for folder in folders {
         db::hint(Hint::item(live::DRIVE_ITEMS, folder));
+    }
+    // Activity reaches every folder above the item, and above where a move
+    // took it from.
+    let mut changed = Vec::new();
+    for start in std::iter::once(item).chain(moved) {
+        changed.extend(storage::with_ancestors(conn, start)?);
+    }
+    changed.sort_unstable();
+    changed.dedup();
+    for id in changed {
+        db::hint(Hint::item(live::DRIVE_ACTIVITY, id));
     }
     if let (Action::Shared | Action::ShareChanged | Action::Unshared, Some(other)) =
         (event.action, event.other)
@@ -984,6 +1013,11 @@ fn hint(conn: &Connection, event: &NewEvent) -> rusqlite::Result<()> {
 /// if it was recent, by moving that event's time up. A desktop app saving
 /// every few seconds, or File Explorer saving a new file empty and then
 /// again with its contents, makes one event.
+///
+/// The event also gets a new ID, since lists are in ID order: an event
+/// keeping its old ID would show below things that happened before its new
+/// time. Its notifications move with it, as they are, so the person isn't
+/// told again about something they've seen.
 fn merge_edit(conn: &Connection, user: UserId, item: ItemId) -> rusqlite::Result<bool> {
     let recent: Option<i64> = conn
         .query_row(
@@ -997,13 +1031,34 @@ fn merge_edit(conn: &Connection, user: UserId, item: ItemId) -> rusqlite::Result
             |row| row.get(0),
         )
         .optional()?;
-    let Some(id) = recent else {
+    let Some(old) = recent else {
         return Ok(false);
     };
     conn.execute(
-        concat!("UPDATE events_log SET at = ", sql_now!(), " WHERE id = ?1"),
-        [id],
+        concat!(
+            "INSERT INTO events_log
+             (at, actor_id, via, action, item_id, owner_id, other_id, details)
+             SELECT ",
+            sql_now!(),
+            ", actor_id, via, action, item_id, owner_id, other_id, details
+             FROM events_log WHERE id = ?1"
+        ),
+        [old],
     )?;
+    let new = conn.last_insert_rowid();
+    let notified = conn
+        .prepare("SELECT user_id FROM events_notices WHERE event_id = ?1")?
+        .query_map([old], |row| row.get::<_, uuid::Uuid>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    conn.execute(
+        "UPDATE events_notices SET event_id = ?2 WHERE event_id = ?1",
+        (old, new),
+    )?;
+    conn.execute("DELETE FROM events_log WHERE id = ?1", [old])?;
+    // The bell's list changes order.
+    for user in notified {
+        db::hint(Hint::person(live::NOTIFICATIONS, UserId::from_uuid(user)));
+    }
     Ok(true)
 }
 

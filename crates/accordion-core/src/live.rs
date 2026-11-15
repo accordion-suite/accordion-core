@@ -26,6 +26,11 @@ use crate::storage;
 /// The lists of these folders changed: items were added, changed, moved,
 /// or removed, or a thumbnail is ready.
 pub const DRIVE_ITEMS: &str = "drive.items";
+/// The activity of these items changed: something happened to the item, or
+/// to something inside it, at any depth. Sent for the item and every folder
+/// above it, so an open Activity tab reloads without folder lists reloading
+/// for a change deep inside them.
+pub const DRIVE_ACTIVITY: &str = "drive.activity";
 /// What's shared with this person changed.
 pub const DRIVE_SHARED: &str = "drive.shared";
 /// This person's notifications changed: one arrived, or they read or

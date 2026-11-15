@@ -82,6 +82,16 @@ fn items(folders: &[ItemId]) -> Message {
     }
 }
 
+fn activity(items: &[ItemId]) -> Message {
+    let mut ids: Vec<String> = items.iter().map(ToString::to_string).collect();
+    ids.sort();
+    ids.dedup();
+    Message {
+        kind: live::DRIVE_ACTIVITY,
+        ids,
+    }
+}
+
 fn person(kind: &'static str) -> Message {
     Message {
         kind,
@@ -110,17 +120,33 @@ async fn changes_reach_everyone_who_can_open_the_folder_and_nobody_else() {
     let mut sam_stream = s.live.open(sam, None);
     let mut kim_stream = s.live.open(kim, None);
     // Hints close together become one message, naming the folder once.
+    let mut files = Vec::new();
     for name in ["one.jpg", "two.jpg", "three.jpg"] {
-        s.by(sam)
+        let file = s
+            .by(sam)
             .write_file(inside.id, name, &b"sand"[..])
             .await
             .unwrap();
+        files.push(file.id);
     }
+    // Activity reaches every folder above the files, each for whoever can
+    // open it: Sam can't open Alex's top folder.
+    let mut sams = files.clone();
+    sams.extend([inside.id, holiday.id]);
+    let mut alexs = sams.clone();
+    alexs.push(top);
     assert_eq!(
         received(&mut alex_stream).await,
-        [items(&[inside.id]), person(live::NOTIFICATIONS)]
+        [
+            activity(&alexs),
+            items(&[inside.id]),
+            person(live::NOTIFICATIONS)
+        ]
     );
-    assert_eq!(received(&mut sam_stream).await, [items(&[inside.id])]);
+    assert_eq!(
+        received(&mut sam_stream).await,
+        [activity(&sams), items(&[inside.id])]
+    );
     assert_eq!(received(&mut kim_stream).await, []);
 }
 
@@ -151,9 +177,15 @@ async fn moves_name_both_folders_each_to_who_can_open_it() {
         .unwrap();
     assert_eq!(
         received(&mut alex_stream).await,
-        [items(&[shared.id, private.id])]
+        [
+            activity(&[file.id, shared.id, private.id, top]),
+            items(&[shared.id, private.id])
+        ]
     );
-    assert_eq!(received(&mut sam_stream).await, [items(&[shared.id])]);
+    assert_eq!(
+        received(&mut sam_stream).await,
+        [activity(&[shared.id]), items(&[shared.id])]
+    );
 }
 
 #[tokio::test]
@@ -176,6 +208,7 @@ async fn sharing_tells_the_other_person_even_when_it_stops() {
     assert_eq!(
         received(&mut sam_stream).await,
         [
+            activity(&[folder.id]),
             items(&[folder.id]),
             person(live::DRIVE_SHARED),
             person(live::NOTIFICATIONS)

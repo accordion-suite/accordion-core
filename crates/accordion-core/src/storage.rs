@@ -2551,6 +2551,37 @@ pub(crate) fn item_parent(
     .optional()
 }
 
+/// The item and every folder above it, up to its top folder. Just the item
+/// if it doesn't exist.
+pub(crate) fn with_ancestors(conn: &Connection, id: ItemId) -> rusqlite::Result<Vec<ItemId>> {
+    conn.prepare(
+        "WITH RECURSIVE up (id) AS (
+             SELECT ?1
+             UNION ALL
+             SELECT i.parent_id FROM storage_items i JOIN up ON i.id = up.id
+             WHERE i.parent_id IS NOT NULL
+         )
+         SELECT id FROM up",
+    )?
+    .query_map([id.as_uuid()], |row| {
+        Ok(ItemId::from_uuid(row.get::<_, uuid::Uuid>(0)?))
+    })?
+    .collect()
+}
+
+/// Which place a top folder is, such as [`MY_DRIVE`]. `None` for any other
+/// item.
+pub(crate) fn place_of(conn: &Connection, id: ItemId) -> rusqlite::Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT place FROM storage_items WHERE id = ?1",
+            [id.as_uuid()],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten())
+}
+
 fn item_or_missing(conn: &Connection, id: ItemId) -> Result<Item, Error> {
     item(conn, id)?.ok_or(Error::NotFound)
 }

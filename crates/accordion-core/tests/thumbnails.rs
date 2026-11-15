@@ -1732,6 +1732,20 @@ impl Server {
         .expect("the worker should make each video's preview");
     }
 
+    /// Waits until the worker's list of videos waiting for a preview says
+    /// `waiting` for the video with `hash`. The worker updates that list
+    /// just after the database, so a test that has seen the database change
+    /// can still find the list a moment behind.
+    async fn wait_for_waiting(&self, hash: ContentHash, waiting: bool) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while self.thumbnails.video_waiting(hash) != waiting {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the worker's waiting list should match the database");
+    }
+
     /// Waits until the worker has decided how each video's preview is made.
     async fn wait_for_plans(&self, hashes: &[ContentHash]) {
         tokio::time::timeout(Duration::from_secs(60), async {
@@ -1906,7 +1920,7 @@ async fn converts_a_video_when_someone_opens_it_or_never() {
     server.wait_for_videos(&[film]).await;
     assert!(server.thumbnails.video(film).is_some());
     assert_eq!(server.preview_state(old).await.as_deref(), Some("waiting"));
-    assert!(server.thumbnails.video_waiting(old));
+    server.wait_for_waiting(old, true).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(server.thumbnails.video(old).is_none());
 
@@ -1978,7 +1992,7 @@ async fn makes_a_lost_video_preview_again_when_someone_opens_it() {
     assert!(server.thumbnails.want(film).await.unwrap());
     server.wait_for_videos(&[film]).await;
     assert!(server.thumbnails.video(film).is_some());
-    assert!(!server.thumbnails.video_waiting(film));
+    server.wait_for_waiting(film, false).await;
     stop.send(()).unwrap();
     worker.await.unwrap();
 }

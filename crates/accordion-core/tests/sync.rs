@@ -501,8 +501,8 @@ async fn changes_older_than_90_days_are_pruned() {
     f.server
         .sql("UPDATE storage_changes SET at = '2000-01-01T00:00:00.000Z'")
         .await;
-    // The family's folders and photo, and a.txt.
-    assert_eq!(f.server.storage.prune_changes().await.unwrap(), 4);
+    // Alex's My Drive, the family's folders and photo, and a.txt.
+    assert_eq!(f.server.storage.prune_changes().await.unwrap(), 5);
     assert!(matches!(
         f.server.storage.changes(f.alex, &old).await,
         Err(Error::StartOver)

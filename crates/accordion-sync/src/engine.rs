@@ -48,6 +48,12 @@ const SETTLE: Duration = Duration::from_secs(2);
 /// progress, and are never synced.
 const OWN_PREFIX: &str = ".accordion-";
 
+/// Set in the state once the device has listed everything with an engine
+/// that knows about places, such as Notes beside My Drive. A device that
+/// synced before then never heard of a place made since, so it lists
+/// everything again once.
+const KNOWS_PLACES: &str = "knows_places";
+
 /// What a pass did, for showing.
 #[derive(Debug, Default)]
 pub struct Report {
@@ -156,20 +162,24 @@ impl Engine {
     async fn pull(&mut self, report: &mut Report) -> Result<(), Error> {
         let mut changed: Vec<RemoteItem> = Vec::new();
         let mut gone: Vec<String> = Vec::new();
+        let knows_places = self.state.meta(KNOWS_PLACES).map_err(db)?.is_some();
         let cursor = match self.state.cursor().map_err(db)? {
-            Some(cursor) => match self.follow(&cursor, &mut changed, &mut gone).await {
-                Ok(cursor) => cursor,
-                Err(Error::StartOver) => {
-                    changed.clear();
-                    gone.clear();
-                    report
-                        .notices
-                        .push("Comparing everything with Accordion again.".into());
-                    self.start(&mut changed, &mut gone).await?
+            Some(cursor) if knows_places => {
+                match self.follow(&cursor, &mut changed, &mut gone).await {
+                    Ok(cursor) => cursor,
+                    Err(Error::StartOver) => {
+                        changed.clear();
+                        gone.clear();
+                        report
+                            .notices
+                            .push("Comparing everything with Accordion again.".into());
+                        self.start(&mut changed, &mut gone).await?
+                    }
+                    Err(err) => return Err(err),
                 }
-                Err(err) => return Err(err),
-            },
-            None => self.start(&mut changed, &mut gone).await?,
+            }
+            // Listed before places, or never.
+            Some(_) | None => self.start(&mut changed, &mut gone).await?,
         };
         self.expand(&mut changed, &mut gone).await?;
 
@@ -260,6 +270,9 @@ impl Engine {
         // stays where it was.
         if !failed {
             self.state.set_cursor(Some(&cursor)).map_err(db)?;
+            if !knows_places {
+                self.state.set_meta(KNOWS_PLACES, "1").map_err(db)?;
+            }
         }
         Ok(())
     }

@@ -763,7 +763,7 @@ impl Storage {
         self.inner
             .db
             .write(move |tx| {
-                tx.execute(
+                let made = tx.execute(
                     concat!(
                         "INSERT OR IGNORE INTO storage_items
                          (id, owner_id, parent_id, name, kind, created_at, modified_at, place)
@@ -774,8 +774,13 @@ impl Storage {
                         ", ?4)"
                     ),
                     (id.as_uuid(), owner.as_uuid(), name, place),
-                )
-                .map_err(Error::from)
+                )?;
+                // Devices already syncing hear of a new place, such as
+                // Notes, only through the list of changes.
+                if made == 1 {
+                    changes::note(tx, id, [(owner, false)])?;
+                }
+                Ok::<_, Error>(())
             })
             .await?;
         let id = self

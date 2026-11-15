@@ -16,6 +16,7 @@ pub use error::{ApiError, PASSWORD_NEEDED};
 use std::error::Error as StdError;
 use std::pin::Pin;
 
+use accordion_core::coedit::CoEditing;
 use accordion_core::db::Database;
 use accordion_core::events::Events;
 use accordion_core::identity::Identity;
@@ -86,6 +87,9 @@ pub struct Services {
     /// Live updates, for hints about the module's own changes. Changes made
     /// through storage and the event log send their own.
     pub live: Live,
+    /// Co-editing, for files people edit together, such as shared notes
+    /// (decision 30). [`coedit::upgrade`] carries it over a WebSocket.
+    pub coediting: CoEditing,
     /// Where link pages are, such as `https://f8q2m.ourhome.dedyn.io`, while
     /// an admin has link sharing on (decision 22).
     pub link_origin: watch::Receiver<Option<String>>,

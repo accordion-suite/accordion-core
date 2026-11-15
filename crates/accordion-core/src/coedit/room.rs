@@ -50,6 +50,10 @@ pub(super) enum Inbound {
         from: u64,
         bytes: Vec<u8>,
     },
+    /// Writes the file now, if anything's unsaved.
+    Save {
+        done: oneshot::Sender<()>,
+    },
     Stop {
         done: oneshot::Sender<()>,
     },
@@ -247,6 +251,10 @@ impl Room {
                 let _ = reply.send(joined);
             }
             Inbound::Message { from, bytes } => self.receive(from, bytes).await,
+            Inbound::Save { done } => {
+                self.save().await;
+                let _ = done.send(());
+            }
             Inbound::Stop { done } => return Some(done),
         }
         None
@@ -361,7 +369,7 @@ impl Room {
                 Inbound::Join { reply, .. } => {
                     let _ = reply.send(Err(err.clone()));
                 }
-                Inbound::Stop { done } => {
+                Inbound::Save { done } | Inbound::Stop { done } => {
                     let _ = done.send(());
                 }
                 Inbound::Message { .. } => {}
@@ -945,7 +953,7 @@ impl Room {
         self.service.forget(self.item, self.id);
         self.inbound.close();
         while let Some(message) = self.inbound.recv().await {
-            if let Inbound::Stop { done } = message {
+            if let Inbound::Save { done } | Inbound::Stop { done } = message {
                 let _ = done.send(());
             }
         }

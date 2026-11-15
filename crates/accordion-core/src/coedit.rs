@@ -18,9 +18,10 @@
 //! - **The file is written** 30 seconds after the last edit, at least every
 //!   5 minutes while editing goes on, and when the last person leaves. One
 //!   session's saves become one version (see [`Storage::write_edit`]).
-//! - **A file changed outside the editor,** through WebDAV, sync, or a
-//!   restored version, wins: the document changes to match it, as edits
-//!   everyone sees.
+//! - **A file changed outside the editor,** through WebDAV, sync, a
+//!   restored version, or a module's own API, is merged in: the change from
+//!   the last saved state lands amid edits made since, as a three-way merge
+//!   would, and everyone sees it as edits. Unsaved typing isn't lost.
 //! - **Access follows storage.** Viewers see edits but can't make them.
 //!   Losing access, or signing out, closes the connection.
 
@@ -246,6 +247,26 @@ impl CoEditing {
             }
         }
         Err(JoinError::Unreadable)
+    }
+
+    /// Writes `item`'s file now if it's open with unsaved edits, and waits
+    /// until it's written. A module calls this before changing the file
+    /// through its own API, so the change goes on top of everyone's edits.
+    /// Does nothing if the file isn't open.
+    pub async fn save_now(&self, item: ItemId) {
+        let room = self.rooms().open.get(&item).cloned();
+        let Some(room) = room else {
+            return;
+        };
+        let (done, saved) = oneshot::channel();
+        if room
+            .inbound
+            .send(room::Inbound::Save { done })
+            .await
+            .is_ok()
+        {
+            let _ = saved.await;
+        }
     }
 
     /// How many documents are open, for tests and the health page.

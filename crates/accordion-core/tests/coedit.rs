@@ -878,3 +878,27 @@ async fn random_and_mangled_messages_never_break_the_document() {
     let saved = s.contents(item).await;
     assert!(saved.ends_with(", still here"), "{saved:?}");
 }
+
+#[tokio::test]
+async fn saving_now_writes_unsaved_edits_at_once() {
+    let s = start(SLOW).await;
+    let alex = s.user("alex").await;
+    let item = s.file(alex, "note.txt", "Hi").await;
+    // Nothing to do while the file isn't open.
+    s.coediting.save_now(item).await;
+
+    let mut a = s.join(item, alex).await;
+    a.type_at_end(" there").await;
+    a.settle().await;
+    assert_eq!(s.contents(item).await, "Hi");
+    s.coediting.save_now(item).await;
+    assert_eq!(s.contents(item).await, "Hi there");
+
+    // A change through a module's API then goes on top, and the document
+    // takes it in.
+    s.change_outside(item, "Hi there, Sam").await;
+    a.settle().await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    a.settle().await;
+    assert_eq!(a.text(), "Hi there, Sam");
+}

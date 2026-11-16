@@ -701,3 +701,43 @@ async fn my_drive_and_each_place_have_their_own_activity() {
         [Some(folder.id), Some(note.id)]
     );
 }
+
+#[tokio::test]
+async fn a_reminder_rings_only_its_persons_bell_and_stays_out_of_activity() {
+    let s = start().await;
+    let alex = s.user("alex").await;
+    let sam = s.user("sam").await;
+    let top = s.storage.top_folder(alex).await.unwrap();
+    let note = s
+        .by(alex)
+        .write_file(top, "Groceries.md", &b"Milk"[..])
+        .await
+        .unwrap();
+    s.by(alex)
+        .share(note.id, sam, ShareLevel::Editor, alex)
+        .await
+        .unwrap();
+    let before = s.activity(alex, note.id).await;
+
+    // Sam's own reminder on Alex's note.
+    s.events
+        .record(
+            Actor::SERVER,
+            NewEvent::about(Action::ReminderDue, note.id, alex)
+                .other(sam)
+                .details(json!({"local": "2026-11-20T09:00", "repeat": null})),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        s.notified(sam).await,
+        [
+            (Action::ReminderDue, false, false),
+            (Action::Shared, false, false)
+        ]
+    );
+    assert!(s.notified(alex).await.is_empty());
+    assert_eq!(s.activity(alex, note.id).await, before);
+    assert_eq!(s.activity(alex, top).await.len(), before.len());
+    assert!(!actions(&s.activity(sam, note.id).await).contains(&Action::ReminderDue));
+}

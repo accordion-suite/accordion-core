@@ -315,6 +315,11 @@ pub enum Action {
     /// Details: `convert_videos`, or null to follow the server's hardware,
     /// and `space_percent`.
     PreviewsChanged,
+    /// A reminder someone set on a note went off (decision 31). There's no
+    /// actor, and `other` is whose reminder it is, the only one who hears
+    /// about it. A reminder is personal, so it's never in anyone's
+    /// activity. Details: `local`, the time it was set for, and `repeat`.
+    ReminderDue,
 }
 
 impl Action {
@@ -355,10 +360,11 @@ impl Action {
             Self::UpdateInstalled => "update_installed",
             Self::RetentionChanged => "retention_changed",
             Self::PreviewsChanged => "previews_changed",
+            Self::ReminderDue => "reminder_due",
         }
     }
 
-    const ALL: [Self; 35] = [
+    const ALL: [Self; 36] = [
         Self::Added,
         Self::Edited,
         Self::Renamed,
@@ -394,6 +400,7 @@ impl Action {
         Self::UpdateInstalled,
         Self::RetentionChanged,
         Self::PreviewsChanged,
+        Self::ReminderDue,
     ];
 
     fn from_column(row: &Row<'_>, index: usize) -> rusqlite::Result<Self> {
@@ -580,6 +587,7 @@ impl Events {
                     .prepare(&format!(
                         "SELECT {EVENT_COLUMNS} FROM events_log e
                          WHERE e.item_id IN ({inside})
+                           AND e.action != 'reminder_due'
                            AND (?2 OR (e.action NOT IN ({SHARE_ACTIONS}, 'deleted')
                                        OR e.other_id = ?3))
                            AND (?4 IS NULL OR e.id < ?4)
@@ -932,7 +940,7 @@ pub(crate) fn record(conn: &Connection, actor: Actor, event: &NewEvent) -> rusql
         Action::Shared | Action::ShareChanged => {
             event.other.filter(|&other| Some(other) != actor.user)
         }
-        Action::LinkOpened => event.other,
+        Action::LinkOpened | Action::ReminderDue => event.other,
         action if action.changes_files() => match (actor.user, event.owner) {
             (Some(user), Some(owner)) if user != owner => Some(owner),
             _ => None,
@@ -964,6 +972,10 @@ fn hint(conn: &Connection, event: &NewEvent) -> rusqlite::Result<()> {
     let Some(item) = event.item else {
         return Ok(());
     };
+    // A reminder changes nothing, and only rings its owner's bell.
+    if event.action == Action::ReminderDue {
+        return Ok(());
+    }
     let mut folders = Vec::new();
     let found: Option<(Option<uuid::Uuid>, bool)> = conn
         .query_row(

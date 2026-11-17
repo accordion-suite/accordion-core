@@ -23,7 +23,11 @@ pub fn workers(data: &Path) -> Option<Workers> {
         jobs: jobs.clone(),
         uids: None,
         launcher: PathBuf::from(LAUNCHER),
-        programs: vec![PathBuf::from("/usr"), PathBuf::from(LAUNCHER)],
+        // The transcript test's whisper.cpp isn't installed in /usr.
+        programs: [PathBuf::from("/usr"), PathBuf::from(LAUNCHER)]
+            .into_iter()
+            .chain(std::env::var_os("ACCORDION_TEST_WHISPER").map(PathBuf::from))
+            .collect(),
     };
     std::thread::spawn(move || service::serve(config));
     Some(Workers { socket, jobs })

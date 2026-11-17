@@ -24,6 +24,7 @@ use accordion_core::live::Live;
 use accordion_core::storage::Storage;
 use accordion_core::texts::Texts;
 use accordion_core::thumbnails::Thumbnails;
+use accordion_core::transcripts::Transcripts;
 use axum::Router;
 use tokio::sync::watch;
 
@@ -84,6 +85,9 @@ pub struct Services {
     pub thumbnails: Thumbnails,
     /// The text inside stored files, for searching it.
     pub texts: Texts,
+    /// The words in voice memos, once an admin turns transcribing on
+    /// (decision 33).
+    pub transcripts: Transcripts,
     /// Live updates, for hints about the module's own changes. Changes made
     /// through storage and the event log send their own.
     pub live: Live,

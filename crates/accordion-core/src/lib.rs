@@ -16,3 +16,4 @@ pub mod storage;
 pub mod texts;
 pub mod thumbnails;
 mod time;
+pub mod transcripts;

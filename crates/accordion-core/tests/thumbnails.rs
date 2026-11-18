@@ -376,13 +376,21 @@ async fn shows_a_pages_text_not_its_markup() {
     let hash = server.save("Trip.html", page.as_bytes()).await;
     assert!(server.thumbnails.make_now(hash).await.unwrap());
     let found = server.thumbnails.find(hash).unwrap();
-    assert_eq!(found.kind, ThumbnailKind::Text);
-    let text = std::fs::read_to_string(found.path).unwrap();
-    assert!(
-        text.starts_with("Trip to Lisbon\n☑ Book flights\n☐ Pack\nDay 1\nDay 2\n"),
-        "{text}"
+    assert_eq!(found.kind, ThumbnailKind::Page);
+    assert_eq!(found.kind.content_type(), "application/json");
+    let page: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(found.path).unwrap()).unwrap();
+    let lines = page["lines"].as_array().unwrap();
+    assert_eq!(lines.len(), 40);
+    assert_eq!(
+        lines[..4],
+        [
+            serde_json::json!({"kind": "heading", "level": 1, "runs": [{"text": "Trip to Lisbon"}]}),
+            serde_json::json!({"kind": "check", "checked": true, "runs": [{"text": "Book flights"}]}),
+            serde_json::json!({"kind": "check", "checked": false, "runs": [{"text": "Pack"}]}),
+            serde_json::json!({"kind": "paragraph", "runs": [{"text": "Day 1"}]}),
+        ]
     );
-    assert_eq!(text.lines().count(), 40);
 }
 
 #[tokio::test]
@@ -777,14 +785,14 @@ async fn reads_a_document_only_as_what_its_name_says() {
     assert!(server.thumbnails.preview(hash).is_none());
 
     // A web page named as a document never reaches LibreOffice, and shows
-    // as text, as it is.
+    // as the page it is.
     let hash = server
         .save("invoice.docx", b"<html><body>Pay now</body></html>")
         .await;
     assert!(server.thumbnails.make_now(hash).await.unwrap());
     assert_eq!(
         server.thumbnails.find(hash).unwrap().kind,
-        ThumbnailKind::Text
+        ThumbnailKind::Page
     );
     assert!(server.thumbnails.preview(hash).is_none());
 }

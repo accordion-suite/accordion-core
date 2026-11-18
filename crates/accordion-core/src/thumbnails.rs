@@ -5,8 +5,9 @@
 //!
 //! A picture is a WebP, at most 480 pixels on its longer side. Text is the
 //! file's first lines as UTF-8, which apps draw themselves, so it follows
-//! their light or dark look. An HTML page's are the first lines of the text
-//! a browser shows ([`crate::html`]), not its markup. Each is named by the hash of the contents it
+//! their light or dark look. An HTML page's are the first lines a browser
+//! shows, not its markup, as JSON that keeps headings, lists, and bold and
+//! other styles ([`crate::html`]), so a document's card looks like it. Each is named by the hash of the contents it
 //! shows, so copies and unchanged versions share one. They're kept in
 //! `cache/thumbnails/` in the data folder, which backups leave out, because
 //! they can be made again. After a restore, the worker finds them missing
@@ -219,7 +220,8 @@ static MIGRATIONS: &[Migration] = &[
         name: "Show HTML pages' text",
         sql: "
     -- Pages' thumbnails showed their markup, and Docs documents' showed
-    -- their styles. Now they show the text a browser shows.
+    -- their styles. Now they show the lines a browser shows, with headings,
+    -- lists, and styles.
     DELETE FROM thumbnails WHERE hash IN (
         SELECT v.blob FROM storage_versions v
         JOIN storage_items i ON i.id = v.item_id
@@ -625,6 +627,11 @@ pub enum ThumbnailKind {
     Picture,
     /// A text file's first lines, as UTF-8 with `\n` between lines.
     Text,
+    /// An HTML page's first lines, as JSON with each line's kind, such as a
+    /// heading or a list item, and its text's styles, such as bold
+    /// (`crate::html`'s `Page::thumbnail`). Apps draw it with their own
+    /// styles, so a document's card looks like the document.
+    Page,
 }
 
 impl ThumbnailKind {
@@ -633,6 +640,7 @@ impl ThumbnailKind {
         match self {
             Self::Picture => "image/webp",
             Self::Text => "text/plain; charset=utf-8",
+            Self::Page => "application/json",
         }
     }
 
@@ -640,9 +648,17 @@ impl ThumbnailKind {
         match self {
             Self::Picture => "webp",
             Self::Text => "txt",
+            Self::Page => "json",
         }
     }
 }
+
+/// Every kind of thumbnail, in the order they're looked for.
+const THUMBNAIL_KINDS: [ThumbnailKind; 3] = [
+    ThumbnailKind::Picture,
+    ThumbnailKind::Text,
+    ThumbnailKind::Page,
+];
 
 /// A document's preview: a PDF of its first pages.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1478,19 +1494,17 @@ impl Thumbnails {
 
     /// The thumbnail of the contents with `hash`, if there is one yet.
     pub fn find(&self, hash: ContentHash) -> Option<Thumbnail> {
-        [ThumbnailKind::Picture, ThumbnailKind::Text]
-            .into_iter()
-            .find_map(|kind| {
-                let path = self.path(hash, kind);
-                let found = std::fs::metadata(&path)
-                    .ok()
-                    .filter(|found| found.is_file())?;
-                Some(Thumbnail {
-                    kind,
-                    made: found.modified().ok()?,
-                    path,
-                })
+        THUMBNAIL_KINDS.into_iter().find_map(|kind| {
+            let path = self.path(hash, kind);
+            let found = std::fs::metadata(&path)
+                .ok()
+                .filter(|found| found.is_file())?;
+            Some(Thumbnail {
+                kind,
+                made: found.modified().ok()?,
+                path,
             })
+        })
     }
 
     /// The preview of the document with `hash`, if there is one yet.
@@ -2500,6 +2514,7 @@ impl Thumbnails {
             let paths = [
                 self.path(hash, ThumbnailKind::Picture),
                 self.path(hash, ThumbnailKind::Text),
+                self.path(hash, ThumbnailKind::Page),
                 self.preview_path(hash, false),
                 self.preview_path(hash, true),
                 self.picture_path(hash),
@@ -2565,16 +2580,16 @@ impl Thumbnails {
             _ => false,
         };
         let kind = match kind {
-            // A page shows its text, not its markup. Only its first lines
-            // are read, so pages of any size have one.
+            // A page shows its lines as a browser does, not its markup.
+            // Only its first lines are read, so pages of any size have one.
             Some(Kind::Text) if page => {
                 let read = tokio::task::spawn_blocking(move || {
                     let opened = std::fs::File::open(&file)?;
-                    html::text(opened, MAX_FILE, HEAD, TEXT_LINES)
+                    html::read(opened, MAX_FILE, HEAD, TEXT_LINES)
                 })
                 .await;
                 return match read {
-                    Ok(Ok(page)) => self.done(hash, ThumbnailKind::Text, page.as_bytes()),
+                    Ok(Ok(page)) => self.done(hash, ThumbnailKind::Page, &page.thumbnail()),
                     Ok(Err(err)) => Outcome::Failed(format!("couldn't read the file: {err}")),
                     Err(err) => Outcome::Failed(format!("couldn't read the page: {err}")),
                 };
@@ -2913,17 +2928,16 @@ impl Thumbnails {
 
     /// Keeps a thumbnail that's been made.
     fn done(&self, hash: ContentHash, kind: ThumbnailKind, thumbnail: &[u8]) -> Outcome {
-        // A thumbnail of the other kind, from before a newer worker knew
+        // A thumbnail of another kind, from before a newer worker knew
         // better, such as text for an XPM picture, goes.
-        let other = match kind {
-            ThumbnailKind::Picture => ThumbnailKind::Text,
-            ThumbnailKind::Text => ThumbnailKind::Picture,
-        };
         let kept = self.keep(self.path(hash, kind), thumbnail).and_then(|()| {
-            match std::fs::remove_file(self.path(hash, other)) {
-                Err(err) if err.kind() != io::ErrorKind::NotFound => Err(err),
-                _ => Ok(()),
+            for other in THUMBNAIL_KINDS.into_iter().filter(|other| *other != kind) {
+                match std::fs::remove_file(self.path(hash, other)) {
+                    Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(err),
+                    _ => {}
+                }
             }
+            Ok(())
         });
         match kept {
             Ok(()) => Outcome::Ready,

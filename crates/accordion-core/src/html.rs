@@ -10,6 +10,7 @@
 //! Only html5ever's tokenizer runs, which is memory-safe Rust and builds no
 //! tree, so it reads untrusted pages in the server as plain text is read.
 
+use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::io::{self, Read};
 
@@ -19,6 +20,7 @@ use html5ever::tokenizer::states::RawKind;
 use html5ever::tokenizer::{
     BufferQueue, Tag, TagKind, Token, TokenSink, TokenSinkResult, Tokenizer, TokenizerOpts,
 };
+use serde_json::{Map, Value, json};
 
 /// How much of the file is read at a time.
 const CHUNK: usize = 64 * 1024;
@@ -51,15 +53,19 @@ pub(crate) fn is_html_name(name: &str) -> bool {
     })
 }
 
-/// The visible text of the page `file`, reading at most `max_read` bytes of
-/// it. Reading stops once the text has `max_text` bytes or `max_lines`
+/// The version of the page thumbnails [`Page::thumbnail`] writes. Raise it
+/// when what they hold changes in a way apps must know about.
+pub(crate) const PAGE_VERSION: u32 = 1;
+
+/// The page `file` as a browser shows it, reading at most `max_read` bytes
+/// of it. Reading stops once its text has `max_text` bytes or `max_lines`
 /// lines.
-pub(crate) fn text(
+pub(crate) fn read(
     file: impl Read,
     max_read: u64,
     max_text: usize,
     max_lines: usize,
-) -> io::Result<String> {
+) -> io::Result<Page> {
     let tokenizer = Tokenizer::new(
         Sink {
             out: RefCell::new(Out::new(max_text, max_lines)),
@@ -102,9 +108,176 @@ pub(crate) fn text(
     Ok(tokenizer.sink.out.borrow_mut().finish())
 }
 
+/// The visible text of the page `file`, as [`read`] reads it.
+pub(crate) fn text(
+    file: impl Read,
+    max_read: u64,
+    max_text: usize,
+    max_lines: usize,
+) -> io::Result<String> {
+    read(file, max_read, max_text, max_lines).map(|page| page.text())
+}
+
 /// Tokenizes everything in `queue`.
 fn feed(tokenizer: &Tokenizer<Sink>, queue: &BufferQueue) {
     while !matches!(tokenizer.feed(queue), TokenizerResult::Done) {}
+}
+
+/// A page's lines as a browser shows them.
+#[derive(Debug)]
+pub(crate) struct Page {
+    lines: Vec<Line>,
+}
+
+impl Page {
+    /// The page as plain text, a line for each line, with list items'
+    /// bullets and numbers and checklists' boxes.
+    pub(crate) fn text(&self) -> String {
+        let lines: Vec<String> = self.lines.iter().map(Line::text).collect();
+        lines.join("\n")
+    }
+
+    /// The page as a page thumbnail: JSON with each line's kind and styled
+    /// text, which apps draw with their own styles, so it follows their
+    /// light or dark look.
+    pub(crate) fn thumbnail(&self) -> Vec<u8> {
+        let lines: Vec<Value> = self.lines.iter().map(Line::json).collect();
+        serde_json::to_vec(&json!({ "version": PAGE_VERSION, "lines": lines }))
+            .expect("JSON values always write")
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+enum LineKind {
+    #[default]
+    Paragraph,
+    /// A heading, from 1 to 6.
+    Heading(u8),
+    /// A list item, with a bullet or a number.
+    Item,
+    /// A checklist item, and whether it's checked.
+    Check(bool),
+    /// A line of preformatted text, such as code.
+    Code,
+    /// A table row.
+    Row,
+}
+
+#[derive(Debug, Default)]
+struct Line {
+    kind: LineKind,
+    /// How many lists the item is inside, past the first.
+    depth: usize,
+    /// A list item's bullet or number, such as "•" or "3.".
+    mark: Option<String>,
+    /// Whether it's quoted.
+    quote: bool,
+    /// The text: a row's cells, or a single cell.
+    cells: Vec<Vec<Run>>,
+}
+
+impl Line {
+    fn is_empty(&self) -> bool {
+        self.cells.iter().all(Vec::is_empty)
+    }
+
+    fn text(&self) -> String {
+        let mut text = "  ".repeat(self.depth);
+        match (self.kind, &self.mark) {
+            (LineKind::Item, Some(mark)) => {
+                text.push_str(mark);
+                text.push(' ');
+            }
+            (LineKind::Check(true), _) => text.push_str("☑ "),
+            (LineKind::Check(false), _) => text.push_str("☐ "),
+            _ => {}
+        }
+        let cells: Vec<String> = self
+            .cells
+            .iter()
+            .map(|cell| cell.iter().map(|run| run.text.as_str()).collect())
+            .collect();
+        text.push_str(&cells.join(" "));
+        text
+    }
+
+    fn json(&self) -> Value {
+        let mut line = Map::new();
+        let kind = match self.kind {
+            LineKind::Paragraph => "paragraph",
+            LineKind::Heading(_) => "heading",
+            LineKind::Item => "item",
+            LineKind::Check(_) => "check",
+            LineKind::Code => "code",
+            LineKind::Row => "row",
+        };
+        line.insert("kind".into(), kind.into());
+        match self.kind {
+            LineKind::Heading(level) => {
+                line.insert("level".into(), level.into());
+            }
+            LineKind::Check(checked) => {
+                line.insert("checked".into(), checked.into());
+            }
+            LineKind::Item => {
+                line.insert("mark".into(), self.mark.clone().unwrap_or_default().into());
+            }
+            _ => {}
+        }
+        if self.depth > 0 {
+            line.insert("depth".into(), self.depth.into());
+        }
+        if self.quote {
+            line.insert("quote".into(), true.into());
+        }
+        let runs = |cell: &Vec<Run>| Value::Array(cell.iter().map(Run::json).collect());
+        if self.kind == LineKind::Row {
+            line.insert(
+                "cells".into(),
+                Value::Array(self.cells.iter().map(runs).collect()),
+            );
+        } else {
+            let cell = self.cells.first().map(runs);
+            line.insert("runs".into(), cell.unwrap_or(Value::Array(Vec::new())));
+        }
+        Value::Object(line)
+    }
+}
+
+/// Text with the same styles.
+#[derive(Debug)]
+struct Run {
+    text: String,
+    /// The styles, as bits for each of [`STYLES`].
+    styles: u8,
+}
+
+/// The styles a run can have, by their names in a page thumbnail, and the
+/// elements that give them.
+const STYLES: [(&str, &[&str]); 6] = [
+    ("bold", &["b", "strong", "th"]),
+    ("italic", &["i", "em", "cite"]),
+    ("underline", &["u", "ins"]),
+    ("strike", &["s", "strike", "del"]),
+    ("code", &["code", "kbd", "samp"]),
+    ("link", &["a"]),
+];
+
+/// The styles that draw a line under or through text: underline, strike,
+/// and link.
+const LINED: u8 = 1 << 2 | 1 << 3 | 1 << 5;
+
+impl Run {
+    fn json(&self) -> Value {
+        let mut run = Map::new();
+        run.insert("text".into(), self.text.clone().into());
+        for (index, (name, _)) in STYLES.iter().enumerate() {
+            if self.styles & (1 << index) != 0 {
+                run.insert((*name).into(), true.into());
+            }
+        }
+        Value::Object(run)
+    }
 }
 
 struct Sink {
@@ -183,7 +356,23 @@ impl Sink {
             return TokenSinkResult::Continue;
         }
         let mut out = self.out.borrow_mut();
+        // A link only looks like one with an address.
+        let styled = name != "a" || !start || attribute(tag, "href").is_some();
+        if let Some(index) = STYLES
+            .iter()
+            .position(|(_, elements)| elements.contains(&name))
+            && styled
+            && !tag.self_closing
+        {
+            let open = &mut out.styles[index];
+            *open = if start {
+                *open + 1
+            } else {
+                open.saturating_sub(1)
+            };
+        }
         match (name, start) {
+            ("br", _) if out.row => out.space = true,
             ("br", _) => out.line_break(),
             ("pre", true) => {
                 out.block();
@@ -193,6 +382,18 @@ impl Sink {
             ("pre", false) => {
                 out.pre = out.pre.saturating_sub(1);
                 out.block();
+            }
+            ("h1" | "h2" | "h3" | "h4" | "h5" | "h6", _) => {
+                out.block();
+                out.heading = start.then(|| name.as_bytes()[1] - b'0');
+            }
+            ("blockquote", _) => {
+                out.block();
+                out.quote = if start {
+                    out.quote + 1
+                } else {
+                    out.quote.saturating_sub(1)
+                };
             }
             ("ul", true) => {
                 out.block();
@@ -218,50 +419,64 @@ impl Sink {
                 out.block();
                 let mark = match out.lists.last_mut() {
                     Some(Some(number)) => {
-                        let mark = format!("{number}. ");
+                        let mark = format!("{number}.");
                         *number += 1;
                         mark
                     }
-                    _ => "• ".to_owned(),
+                    _ => "•".to_owned(),
                 };
-                out.mark = Some(mark);
+                out.mark = Some(Pending::Item(mark));
             }
             ("input", true) if attribute(tag, "type").is_some_and(is_checkbox) => {
-                let mark = if attribute(tag, "checked").is_some() {
-                    "☑ "
-                } else {
-                    "☐ "
-                };
+                let checked = attribute(tag, "checked").is_some();
                 // A checklist's item shows its box instead of a bullet.
-                if out.line.is_empty() {
-                    out.mark = Some(mark.to_owned());
+                if out.line.cells.is_empty() {
+                    out.mark = Some(Pending::Check(checked));
                 } else {
-                    out.push(mark);
+                    out.push(if checked { "☑ " } else { "☐ " });
                 }
             }
-            ("td" | "th", false) => out.space = true,
-            (name, _) if is_block(name) => out.block(),
+            ("tr", _) => {
+                out.block();
+                out.row = start;
+            }
+            ("td" | "th", true) if out.row => out.cell(),
+            (name, _) if is_block(name) => {
+                // A paragraph in a table cell stays in its row.
+                if out.row {
+                    out.space = true;
+                } else {
+                    out.block();
+                }
+            }
             _ => {}
         }
         TokenSinkResult::Continue
     }
 }
 
-/// The text so far.
+/// What the next line starts with, once it has text.
+enum Pending {
+    Item(String),
+    Check(bool),
+}
+
+/// The page so far.
 #[derive(Default)]
 struct Out {
-    text: String,
-    /// The line being written, whitespace collapsed, added to `text` when it
-    /// ends.
-    line: String,
-    lines: usize,
+    lines: Vec<Line>,
+    /// The line being written, whitespace collapsed. It has no cells until
+    /// it has text.
+    line: Line,
+    /// The bytes of text so far, counting a newline between lines.
+    size: usize,
     max_text: usize,
     max_lines: usize,
     full: bool,
     /// Whether a space goes before the next word on the line.
     space: bool,
-    /// A bullet, number, or checkbox for the line's first word.
-    mark: Option<String>,
+    /// A bullet, number, or checkbox for the next line.
+    mark: Option<Pending>,
     /// For each open list, the next number, or `None` for bullets.
     lists: Vec<Option<u64>>,
     /// How many `<pre>` elements are open, which keep their whitespace.
@@ -269,6 +484,14 @@ struct Out {
     /// Whether nothing came yet after `<pre>`, whose first newline isn't
     /// shown.
     pre_started: bool,
+    /// The level of the heading the text is in.
+    heading: Option<u8>,
+    /// How many quotes are open.
+    quote: usize,
+    /// Whether the text is in a table row.
+    row: bool,
+    /// How many elements giving each of [`STYLES`] are open.
+    styles: [usize; STYLES.len()],
 }
 
 impl Out {
@@ -297,48 +520,121 @@ impl Out {
             }
             return;
         }
-        let mut words = text.split(|c: char| c.is_whitespace() && c != '\u{a0}');
-        if text.starts_with(|c: char| c.is_whitespace() && c != '\u{a0}') {
+        let collapses = |c: char| c.is_whitespace() && c != '\u{a0}';
+        if text.starts_with(collapses) {
             self.space = true;
         }
-        let ends_with_space = text.ends_with(|c: char| c.is_whitespace() && c != '\u{a0}');
         let mut first = true;
-        for word in words.by_ref().filter(|word| !word.is_empty()) {
+        for word in text.split(collapses).filter(|word| !word.is_empty()) {
             if !first {
                 self.space = true;
             }
             self.word(word);
             first = false;
         }
-        if ends_with_space {
+        if text.ends_with(collapses) {
             self.space = true;
         }
+    }
+
+    /// The styles the text has now, as bits for each of [`STYLES`].
+    fn styles(&self) -> u8 {
+        let mut styles = 0;
+        for (index, open) in self.styles.iter().enumerate() {
+            // Preformatted text is a code line already.
+            let code = STYLES[index].0 == "code";
+            if *open > 0 && !(code && self.pre > 0) {
+                styles |= 1 << index;
+            }
+        }
+        styles
+    }
+
+    /// Starts the line, once it has text, taking its kind from where the
+    /// text is.
+    fn start_line(&mut self) {
+        let mut line = Line {
+            cells: vec![Vec::new()],
+            quote: self.quote > 0,
+            ..Line::default()
+        };
+        line.kind = match (self.pre, self.heading, self.mark.take()) {
+            (1.., _, _) => LineKind::Code,
+            (_, Some(level), _) => LineKind::Heading(level),
+            (_, _, Some(Pending::Item(mark))) => {
+                line.mark = Some(mark);
+                LineKind::Item
+            }
+            (_, _, Some(Pending::Check(checked))) => LineKind::Check(checked),
+            _ if self.row => LineKind::Row,
+            _ => LineKind::Paragraph,
+        };
+        if matches!(line.kind, LineKind::Item | LineKind::Check(_)) {
+            line.depth = self.lists.len().saturating_sub(1);
+        }
+        self.line = line;
+    }
+
+    /// Starts a table cell.
+    fn cell(&mut self) {
+        if self.line.cells.is_empty() {
+            self.start_line();
+        } else {
+            self.line.cells.push(Vec::new());
+        }
+        self.space = false;
     }
 
     fn word(&mut self, word: &str) {
         if self.full {
             return;
         }
-        if self.line.is_empty() {
-            if let Some(mark) = self.mark.take() {
-                let depth = self.lists.len().saturating_sub(1);
-                self.line.push_str(&"  ".repeat(depth));
-                self.line.push_str(&mark);
-            }
-        } else if self.space {
-            self.line.push(' ');
+        if self.line.cells.is_empty() {
+            self.start_line();
         }
-        self.space = false;
-        self.line.push_str(word);
-        if self.text.len() + self.line.len() >= self.max_text {
+        let styles = self.styles();
+        let cell = self
+            .line
+            .cells
+            .last_mut()
+            .expect("a started line has a cell");
+        let mut word = Cow::Borrowed(word);
+        if std::mem::take(&mut self.space)
+            && let Some(last) = cell.last_mut()
+        {
+            // A space shows no line under or through it, so it goes with
+            // text that has none.
+            if last.styles == styles || last.styles & LINED == 0 {
+                last.text.push(' ');
+            } else if styles & LINED == 0 {
+                word = Cow::Owned(format!(" {word}"));
+            } else {
+                cell.push(Run {
+                    text: " ".to_owned(),
+                    styles: 0,
+                });
+            }
+            self.size += 1;
+        }
+        self.size += word.len();
+        match cell.last_mut() {
+            Some(last) if last.styles == styles => last.text.push_str(&word),
+            _ => cell.push(Run {
+                text: word.into_owned(),
+                styles,
+            }),
+        }
+        if self.size >= self.max_text {
             self.end_line();
             self.full = true;
         }
     }
 
-    /// Ends the line, if it has anything on it, as a block element does.
+    /// Ends the line, if it has text, as a block element does.
     fn block(&mut self) {
-        if !self.line.is_empty() {
+        if self.line.is_empty() {
+            self.line = Line::default();
+        } else {
             self.end_line();
         }
         self.space = false;
@@ -351,28 +647,30 @@ impl Out {
     }
 
     fn end_line(&mut self) {
+        let line = std::mem::take(&mut self.line);
         // Nothing shows before the first line with text.
-        if self.full || (self.lines == 0 && self.line.is_empty()) {
+        if self.full || (self.lines.is_empty() && line.is_empty()) {
             return;
         }
-        if self.lines > 0 {
-            self.text.push('\n');
+        if !self.lines.is_empty() {
+            self.size += 1;
         }
-        self.text.push_str(&self.line);
-        self.line.clear();
-        self.lines += 1;
-        if self.lines >= self.max_lines || self.text.len() >= self.max_text {
+        self.lines.push(line);
+        if self.lines.len() >= self.max_lines || self.size >= self.max_text {
             self.full = true;
         }
     }
 
-    /// The text, once the last line ends.
-    fn finish(&mut self) -> String {
+    /// The page, once the last line ends.
+    fn finish(&mut self) -> Page {
         self.block();
         // Blank lines at the end, such as from a final `<br>`, show nothing.
-        let trimmed = self.text.trim_end_matches('\n').len();
-        self.text.truncate(trimmed);
-        std::mem::take(&mut self.text)
+        while self.lines.last().is_some_and(Line::is_empty) {
+            self.lines.pop();
+        }
+        Page {
+            lines: std::mem::take(&mut self.lines),
+        }
     }
 }
 
@@ -489,6 +787,45 @@ mod tests {
         assert_eq!(
             read(page),
             "• Bread\n• Milk\n  • Oat\n3. Third\n4. Fourth\n☑ Done\n☐ To do\nDay Who\nMon Sam"
+        );
+    }
+
+    #[test]
+    fn keeps_each_lines_kind_and_styles() {
+        let page = "<!DOCTYPE html>\n<html><body><main>\
+            <h2>Trip to <em>Lisbon</em></h2>\
+            <p>Fly <b>on   Friday</b>, see <a href=\"https://example.com\">the plan</a> and \
+            <code>gate 4</code>.<br>Back <s>Monday</s> <u>Sunday</u>.</p>\
+            <ol start=\"2\"><li><p>Pack</p><ul><li>Shoes</li></ul></li></ol>\
+            <ul class=\"checklist\"><li data-checked=\"true\"><input type=\"checkbox\" checked>\n<p>Book</p></li></ul>\
+            <blockquote><p>Quoted</p></blockquote>\
+            <table><tr><th><p>Day</p></th><td><p>Mon</p><p>Tue</p></td></tr></table>\
+            <pre><code>x = 1</code></pre></main></body></html>";
+        let page = super::read(page.as_bytes(), u64::MAX, usize::MAX, usize::MAX).unwrap();
+        let json: Value = serde_json::from_slice(&page.thumbnail()).unwrap();
+        assert_eq!(
+            json,
+            json!({
+                "version": 1,
+                "lines": [
+                    {"kind": "heading", "level": 2, "runs": [
+                        {"text": "Trip to "}, {"text": "Lisbon", "italic": true}]},
+                    {"kind": "paragraph", "runs": [
+                        {"text": "Fly "}, {"text": "on Friday", "bold": true}, {"text": ", see "},
+                        {"text": "the plan", "link": true}, {"text": " and "},
+                        {"text": "gate 4", "code": true}, {"text": "."}]},
+                    {"kind": "paragraph", "runs": [
+                        {"text": "Back "}, {"text": "Monday", "strike": true}, {"text": " "},
+                        {"text": "Sunday", "underline": true}, {"text": "."}]},
+                    {"kind": "item", "mark": "2.", "runs": [{"text": "Pack"}]},
+                    {"kind": "item", "mark": "•", "depth": 1, "runs": [{"text": "Shoes"}]},
+                    {"kind": "check", "checked": true, "runs": [{"text": "Book"}]},
+                    {"kind": "paragraph", "quote": true, "runs": [{"text": "Quoted"}]},
+                    {"kind": "row", "cells": [
+                        [{"text": "Day", "bold": true}], [{"text": "Mon Tue"}]]},
+                    {"kind": "code", "runs": [{"text": "x = 1"}]},
+                ]
+            })
         );
     }
 

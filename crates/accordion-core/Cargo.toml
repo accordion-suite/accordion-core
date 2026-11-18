@@ -18,6 +18,9 @@ accordion-types = { version = "0.1.0", path = "../accordion-types" }
 argon2 = "0.6.0"
 base64ct = { version = "1.8.3", features = ["alloc"] }
 getrandom = "0.4.3"
+# Its tokenizer, for the text of HTML pages. The version Docs uses, through
+# scraper, so the server builds one copy.
+html5ever = "0.40.1"
 jiff = { version = "0.2.38", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"] }
 libc = "0.2.190"
 quick-xml = "0.42.0"

@@ -353,6 +353,53 @@ async fn keeps_the_first_megabyte_of_text() {
 }
 
 #[tokio::test]
+async fn reads_only_the_text_of_a_page() {
+    let s = start().await;
+    // A Docs document: a large picture before its text, and co-editing
+    // state in a data block after it, both longer than the text kept.
+    let picture = "A".repeat(2 * texts::MAX_TEXT);
+    let page = format!(
+        "<!DOCTYPE html>\n<html data-accordion-docs=\"1\">\n<head><title>Ignored</title>\
+         <style>.marigold{{color:red}}</style></head>\n<body>\n<main>\n\
+         <p><img src=\"data:image/png;base64,{picture}\"></p>\n<h1>Spring</h1>\n\
+         <p>Plant the tulips &amp; water the garden.</p>\n</main>\n\
+         <script type=\"application/x-accordion-docs\">{{\"state\":\"sunflower {picture}\"}}</script>\n\
+         </body>\n</html>\n"
+    );
+    assert!(s.read("Spring.html", page.as_bytes()).await);
+    assert_eq!(
+        s.find(s.alex, s.anywhere("tulips garden").await).await,
+        ["Spring.html"]
+    );
+    // A fragment someone saved, known as a page by its name.
+    assert!(
+        s.read(
+            "Info.html",
+            b"Welcome, <b>friends</b><br>\n<span class=\"warning\">Rules</span>"
+        )
+        .await
+    );
+    assert_eq!(
+        s.find(s.alex, s.anywhere("friends rules").await).await,
+        ["Info.html"]
+    );
+    for hidden in [
+        "marigold",
+        "sunflower",
+        "ignored",
+        "accordion",
+        "script",
+        "span",
+        "warning",
+    ] {
+        assert!(
+            s.find(s.alex, s.anywhere(hidden).await).await.is_empty(),
+            "{hidden}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn shows_where_the_words_matched() {
     let s = start().await;
     let hash = s

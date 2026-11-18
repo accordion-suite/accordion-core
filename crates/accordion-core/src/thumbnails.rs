@@ -5,7 +5,8 @@
 //!
 //! A picture is a WebP, at most 480 pixels on its longer side. Text is the
 //! file's first lines as UTF-8, which apps draw themselves, so it follows
-//! their light or dark look. Each is named by the hash of the contents it
+//! their light or dark look. An HTML page's are the first lines of the text
+//! a browser shows ([`crate::html`]), not its markup. Each is named by the hash of the contents it
 //! shows, so copies and unchanged versions share one. They're kept in
 //! `cache/thumbnails/` in the data folder, which backups leave out, because
 //! they can be made again. After a restore, the worker finds them missing
@@ -50,6 +51,7 @@ use rusqlite::{OptionalExtension, Row};
 use tokio::sync::watch;
 
 use crate::db::{self, Database, Migration};
+use crate::html;
 use crate::live::{self, Hint};
 use crate::sql_now;
 use crate::storage::{ContentHash, Storage, blobs};
@@ -210,6 +212,18 @@ static MIGRATIONS: &[Migration] = &[
     ALTER TABLE thumbnails ADD COLUMN more_pages INTEGER NOT NULL DEFAULT 0
         CHECK (more_pages IN (0, 1));
     CREATE INDEX thumbnails_facts ON thumbnails (facts);
+",
+    },
+    Migration {
+        version: 7,
+        name: "Show HTML pages' text",
+        sql: "
+    -- Pages' thumbnails showed their markup, and Docs documents' showed
+    -- their styles. Now they show the text a browser shows.
+    DELETE FROM thumbnails WHERE hash IN (
+        SELECT v.blob FROM storage_versions v
+        JOIN storage_items i ON i.id = v.item_id
+        WHERE i.name LIKE '%.htm' OR i.name LIKE '%.html' OR i.name LIKE '%.xhtml');
 ",
     },
 ];
@@ -2540,7 +2554,31 @@ impl Thumbnails {
             Ok(identified) => identified,
             Err(problem) => return Outcome::Failed(problem),
         };
+        let page = match kind {
+            Some(Kind::Text) if !html::is_html(&head) => match self.name(hash).await {
+                Ok(name) => name.is_some_and(|name| html::is_html_name(&name)),
+                Err(err) => {
+                    return Outcome::Failed(format!("couldn't read the file's name: {err}"));
+                }
+            },
+            Some(Kind::Text) => true,
+            _ => false,
+        };
         let kind = match kind {
+            // A page shows its text, not its markup. Only its first lines
+            // are read, so pages of any size have one.
+            Some(Kind::Text) if page => {
+                let read = tokio::task::spawn_blocking(move || {
+                    let opened = std::fs::File::open(&file)?;
+                    html::text(opened, MAX_FILE, HEAD, TEXT_LINES)
+                })
+                .await;
+                return match read {
+                    Ok(Ok(page)) => self.done(hash, ThumbnailKind::Text, page.as_bytes()),
+                    Ok(Err(err)) => Outcome::Failed(format!("couldn't read the file: {err}")),
+                    Err(err) => Outcome::Failed(format!("couldn't read the page: {err}")),
+                };
+            }
             // Only the first lines are kept, so text files of any size have one.
             Some(Kind::Text) => return self.done(hash, ThumbnailKind::Text, &text(&head)),
             Some(Kind::Document(_)) if size > MAX_DOCUMENT => {

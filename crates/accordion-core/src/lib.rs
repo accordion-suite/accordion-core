@@ -9,6 +9,7 @@ pub mod backup;
 pub mod coedit;
 pub mod db;
 pub mod events;
+mod html;
 pub mod identity;
 pub mod live;
 mod random;

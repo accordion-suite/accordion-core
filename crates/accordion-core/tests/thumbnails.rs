@@ -357,6 +357,35 @@ async fn keeps_a_text_files_first_lines() {
 }
 
 #[tokio::test]
+async fn shows_a_pages_text_not_its_markup() {
+    let server = start().await;
+    // Styles longer than the start of a file that text thumbnails read.
+    let style = "p{margin:0}".repeat(500);
+    let mut page = format!(
+        "<!DOCTYPE html>\n<html data-accordion-docs=\"1\">\n<head><title>Trip</title>\
+         <style>{style}</style></head>\n<body>\n<main>\n<h1>Trip to Lisbon</h1>\n\
+         <ul class=\"checklist\"><li><input type=\"checkbox\" checked>\n<p>Book flights</p></li>\
+         <li><input type=\"checkbox\">\n<p>Pack</p></li></ul>\n"
+    );
+    for n in 1..=100 {
+        page.push_str(&format!("<p>Day {n}</p>\n"));
+    }
+    page.push_str(
+        "</main>\n<script type=\"application/x-accordion-docs\">{}</script>\n</body>\n</html>\n",
+    );
+    let hash = server.save("Trip.html", page.as_bytes()).await;
+    assert!(server.thumbnails.make_now(hash).await.unwrap());
+    let found = server.thumbnails.find(hash).unwrap();
+    assert_eq!(found.kind, ThumbnailKind::Text);
+    let text = std::fs::read_to_string(found.path).unwrap();
+    assert!(
+        text.starts_with("Trip to Lisbon\n☑ Book flights\n☐ Pack\nDay 1\nDay 2\n"),
+        "{text}"
+    );
+    assert_eq!(text.lines().count(), 40);
+}
+
+#[tokio::test]
 async fn makes_none_for_other_files_and_huge_heic_and_avif() {
     let server = start().await;
     // The start of a ZIP file, such as a Word document.

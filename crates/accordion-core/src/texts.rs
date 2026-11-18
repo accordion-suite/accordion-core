@@ -10,7 +10,8 @@
 //! can open. Backups leave the cache out, so after a restore the index is
 //! made again.
 //!
-//! Plain text is read by the server itself, which needs no decoder. Other
+//! Plain text is read by the server itself, which needs no decoder, and so
+//! is an HTML page's, by [`crate::html`], without its markup. Other
 //! files are untrusted, so they're read in the sandbox ([`accordion_sandbox`]):
 //! poppler's `pdftotext` for PDFs, and a sandboxed copy of the server for
 //! Word, Excel, PowerPoint, and OpenDocument files. Older Office files are
@@ -32,16 +33,18 @@ use rusqlite::{OptionalExtension, Row};
 use tokio::sync::watch;
 
 use crate::db::{self, Database, Migration};
+use crate::html;
 use crate::sql_now;
 use crate::storage::{ContentHash, Storage};
 use crate::thumbnails::{self, Kind, Thumbnails};
 
 const OWNER: &str = "texts";
 
-static MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "Create texts",
-    sql: "
+static MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "Create texts",
+        sql: "
     -- What happened to each stored file's contents. Contents with no row
     -- are waiting to be read.
     CREATE TABLE texts (
@@ -58,7 +61,20 @@ static MIGRATIONS: &[Migration] = &[Migration {
 
     CREATE INDEX texts_failed ON texts (state) WHERE state = 'failed';
 ",
-}];
+    },
+    Migration {
+        version: 2,
+        name: "Read HTML pages again",
+        sql: "
+    -- Pages were read with their markup, and Docs documents with their
+    -- co-editing state. Now only the text a browser shows is kept.
+    DELETE FROM texts WHERE hash IN (
+        SELECT v.blob FROM storage_versions v
+        JOIN storage_items i ON i.id = v.item_id
+        WHERE i.name LIKE '%.htm' OR i.name LIKE '%.html' OR i.name LIKE '%.xhtml');
+",
+    },
+];
 
 const INDEX_OWNER: &str = "index";
 
@@ -729,8 +745,29 @@ impl Texts {
         } else {
             kind
         };
+        let page = match kind {
+            Some(Kind::Text) if !html::is_html(&head) => {
+                let name = self
+                    .inner
+                    .db
+                    .read(move |conn| thumbnails::newest_name(conn, hash))
+                    .await;
+                match name {
+                    Ok(name) => name.is_some_and(|name| html::is_html_name(&name)),
+                    Err(err) => {
+                        return Outcome::Failed(format!("couldn't read the file's name: {err}"));
+                    }
+                }
+            }
+            Some(Kind::Text) => true,
+            _ => false,
+        };
         let available = self.inner.status.borrow().unavailable.is_none();
         let text = match kind {
+            // Only the text is read, so pages of any size have text.
+            Some(Kind::Text) if page => tokio::task::spawn_blocking(move || page_text(&file))
+                .await
+                .unwrap_or_else(|err| Err(format!("couldn't read the page: {err}"))),
             // Only the start is read, so text files of any size have text.
             Some(Kind::Text) => plain_text(&file),
             Some(Kind::Pdf | Kind::Document(_)) if !available => {
@@ -849,6 +886,15 @@ fn plain_text(file: &Path) -> Result<String, String> {
         .and_then(|opened| opened.take(MAX_TEXT as u64).read_to_end(&mut bytes))
         .map_err(|err| format!("couldn't read the file: {err}"))?;
     Ok(lossy(&bytes))
+}
+
+/// The text a browser shows of the HTML page `file`, up to [`MAX_TEXT`]
+/// bytes, from at most [`MAX_FILE`] bytes of the page.
+fn page_text(file: &Path) -> Result<String, String> {
+    let opened =
+        std::fs::File::open(file).map_err(|err| format!("couldn't open the file: {err}"))?;
+    html::text(opened, MAX_FILE, MAX_TEXT, usize::MAX)
+        .map_err(|err| format!("couldn't read the file: {err}"))
 }
 
 /// `bytes` as text, without a character cut off at the end, and with any

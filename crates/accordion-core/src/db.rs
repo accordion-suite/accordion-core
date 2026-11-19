@@ -261,6 +261,29 @@ impl Database {
         .await
     }
 
+    /// The same as [`Database::read`], for code that can't wait on a
+    /// future, such as a co-editing format's `write`. It blocks the thread
+    /// until the read is done, so keep it to quick lookups by key.
+    pub fn read_blocking<T, E, F>(&self, f: F) -> Result<T, E>
+    where
+        F: FnOnce(&Connection) -> Result<T, E> + Send + 'static,
+        T: Send + 'static,
+        E: From<rusqlite::Error> + Send + 'static,
+    {
+        let (reply, result) = mpsc::sync_channel(1);
+        let job: Job = Box::new(move |conn| {
+            let read = (|| {
+                let tx = conn.transaction()?;
+                let value = f(&tx)?;
+                tx.commit()?;
+                Ok(value)
+            })();
+            let _ = reply.send(read);
+        });
+        self.readers.send(job).expect("database thread stopped");
+        result.recv().expect("database job panicked")
+    }
+
     /// Copies the whole database into a new file at `path` with SQLite's
     /// online backup API, for backups and before updates. Writes carry on
     /// while it runs, and the copy holds every commit up to when it started.
@@ -596,6 +619,22 @@ mod tests {
             .read(|conn| conn.execute("INSERT INTO pets_pets (name) VALUES ('Rex')", []))
             .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn code_that_cant_wait_can_still_read() {
+        let (_dir, db) = open();
+        db.migrate("pets", PETS).await.unwrap();
+        db.write(|tx| tx.execute("INSERT INTO pets_pets (name) VALUES ('Rex')", []))
+            .await
+            .unwrap();
+        // Inside a task, as a co-editing format's write is.
+        let name: String = db
+            .read_blocking(|conn| {
+                conn.query_row("SELECT name FROM pets_pets", [], |row| row.get(0))
+            })
+            .unwrap();
+        assert_eq!(name, "Rex");
     }
 
     #[tokio::test]

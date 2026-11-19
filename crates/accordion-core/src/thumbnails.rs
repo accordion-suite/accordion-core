@@ -725,6 +725,25 @@ pub enum Error {
     Io(#[from] io::Error),
 }
 
+/// A picture from [`Thumbnails::shrink_picture`].
+#[derive(Clone, Debug)]
+pub struct ShrunkPicture {
+    pub contents: Vec<u8>,
+    /// `image/jpeg` or `image/png`.
+    pub content_type: &'static str,
+}
+
+/// Why [`Thumbnails::shrink_picture`] couldn't make a picture.
+#[derive(Debug, thiserror::Error)]
+pub enum PictureError {
+    /// It isn't a JPEG, PNG, GIF, or WebP.
+    #[error("not a JPEG, PNG, GIF, or WebP picture")]
+    NotAPicture,
+    /// libvips couldn't read it, or the sandbox couldn't run.
+    #[error("couldn't shrink the picture: {0}")]
+    Failed(String),
+}
+
 /// The thumbnail service. Cloning it is cheap.
 #[derive(Clone)]
 pub struct Thumbnails {
@@ -1522,6 +1541,74 @@ impl Thumbnails {
     /// picture the browser can't show itself, if there is one yet.
     pub fn picture(&self, hash: ContentHash) -> Option<PathBuf> {
         Some(self.picture_path(hash)).filter(|path| path.is_file())
+    }
+
+    /// A picture someone adds to a document, made at most `longest` pixels
+    /// on its longer side by libvips in the sandbox, which also checks it's
+    /// a picture (decision 30). It's turned upright and keeps no metadata,
+    /// such as where a photo was taken. Photos become JPEG; PNGs and GIFs,
+    /// often screenshots and drawings, stay sharp as PNG. A picture already
+    /// smaller keeps its size.
+    pub async fn shrink_picture(
+        &self,
+        contents: &[u8],
+        longest: u32,
+    ) -> Result<ShrunkPicture, PictureError> {
+        let png = match contents {
+            [0x89, b'P', b'N', b'G', ..] | [b'G', b'I', b'F', b'8', ..] => true,
+            [0xff, 0xd8, 0xff, ..] => false,
+            [
+                b'R',
+                b'I',
+                b'F',
+                b'F',
+                _,
+                _,
+                _,
+                _,
+                b'W',
+                b'E',
+                b'B',
+                b'P',
+                ..,
+            ] => false,
+            _ => return Err(PictureError::NotAPicture),
+        };
+        let input = self.scratch(contents).map_err(PictureError::Failed)?;
+        let size = longest.to_string();
+        // A see-through WebP turned JPEG goes on white, as on a page.
+        let format = if png {
+            ".png[strip]"
+        } else {
+            ".jpg[Q=85,strip,background=255]"
+        };
+        let args = [
+            "thumbnail_source",
+            "[descriptor=0]",
+            format,
+            &size,
+            "--height",
+            &size,
+            "--size",
+            "down",
+        ]
+        .map(OsString::from);
+        let shrunk = self
+            .work_within(&self.inner.tools.vips, &args, input, &[], PREVIEW_LIMITS)
+            .await
+            .map_err(PictureError::Failed)?;
+        let (made, content_type) = if png {
+            (shrunk.starts_with(b"\x89PNG"), "image/png")
+        } else {
+            (shrunk.starts_with(&[0xff, 0xd8, 0xff]), "image/jpeg")
+        };
+        if !made {
+            return Err(PictureError::Failed("libvips didn't make a picture".into()));
+        }
+        Ok(ShrunkPicture {
+            contents: shrunk,
+            content_type,
+        })
     }
 
     fn picture_path(&self, hash: ContentHash) -> PathBuf {

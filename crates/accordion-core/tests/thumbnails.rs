@@ -14,7 +14,8 @@ use accordion_core::db::Database;
 use accordion_core::identity::{Identity, NewUser};
 use accordion_core::storage::{ContentHash, ItemKind, Storage};
 use accordion_core::thumbnails::{
-    Facts, PREVIEW_PAGES, PreviewSettings, ThumbnailKind, Thumbnails, Tools, VideoConversion,
+    Facts, PREVIEW_PAGES, PictureError, PreviewSettings, ThumbnailKind, Thumbnails, Tools,
+    VideoConversion,
 };
 use accordion_types::{ItemId, Role};
 use rusqlite::OptionalExtension;
@@ -312,6 +313,48 @@ async fn makes_thumbnails_no_larger_than_480_pixels() {
         let (width, height, _) = describe(&path);
         assert_eq!((width, height), expected, "{name}");
     }
+}
+
+#[tokio::test]
+async fn shrinks_pictures_people_add_to_documents() {
+    let server = start().await;
+    for (name, width, height, expected, content_type) in [
+        ("photo.jpg", 4000, 3000, (2560, 1920), "image/jpeg"),
+        ("screenshot.png", 1500, 3000, (1280, 2560), "image/png"),
+        ("small.webp", 200, 100, (200, 100), "image/jpeg"),
+    ] {
+        let shrunk = server
+            .thumbnails
+            .shrink_picture(&server.image(name, width, height), 2560)
+            .await
+            .unwrap();
+        assert_eq!(shrunk.content_type, content_type, "{name}");
+        let path = server.dir.path().join(format!("shrunk-{name}"));
+        std::fs::write(&path, &shrunk.contents).unwrap();
+        let (width, height, _) = describe(&path);
+        assert_eq!((width, height), expected, "{name}");
+    }
+    let photo = with_metadata(&server.image("plain.jpg", 800, 600));
+    let shrunk = server
+        .thumbnails
+        .shrink_picture(&photo, 2560)
+        .await
+        .unwrap();
+    let path = server.dir.path().join("shrunk-plain.jpg");
+    std::fs::write(&path, &shrunk.contents).unwrap();
+    let (_, _, fields) = describe(&path);
+    assert!(!fields.contains("GPSLatitudeRef"), "{fields}");
+    assert!(matches!(
+        server.thumbnails.shrink_picture(b"<svg></svg>", 2560).await,
+        Err(PictureError::NotAPicture)
+    ));
+    assert!(matches!(
+        server
+            .thumbnails
+            .shrink_picture(b"\x89PNG broken", 2560)
+            .await,
+        Err(PictureError::Failed(_))
+    ));
 }
 
 #[tokio::test]

@@ -1630,8 +1630,14 @@ impl Thumbnails {
     pub async fn run_command(&self, args: &[&str], contents: &[u8]) -> Result<Vec<u8>, String> {
         let input = self.scratch(contents)?;
         let args: Vec<OsString> = args.iter().map(OsString::from).collect();
-        self.work_within(&self.inner.tools.launcher, &args, input, &[], COMMAND_LIMITS)
-            .await
+        self.work_within(
+            &self.inner.tools.launcher,
+            &args,
+            input,
+            &[],
+            COMMAND_LIMITS,
+        )
+        .await
     }
 
     fn picture_path(&self, hash: ContentHash) -> PathBuf {

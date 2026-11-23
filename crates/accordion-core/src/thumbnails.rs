@@ -502,6 +502,16 @@ const BOOK_LIMITS: Limits = Limits {
     output: 40 * 1024 * 1024,
 };
 
+/// What a module's own command may use ([`Thumbnails::run_command`]): enough
+/// for Docs to read a Word file with 50 MB of pictures and write them out
+/// again as text, which takes a third more room.
+const COMMAND_LIMITS: Limits = Limits {
+    memory: 1024 * 1024 * 1024,
+    cpu: Duration::from_secs(30),
+    time: Duration::from_secs(45),
+    output: 96 * 1024 * 1024,
+};
+
 /// How every MNG file starts.
 const MNG: &[u8] = b"\x8aMNG\r\n\x1a\n";
 
@@ -1609,6 +1619,19 @@ impl Thumbnails {
             contents: shrunk,
             content_type,
         })
+    }
+
+    /// Runs one of a module's own commands in the sandbox, with `contents`
+    /// on its standard input, and returns what it writes, such as Docs
+    /// reading a Word file someone opens with Docs (decision 30). The
+    /// command is one the server's own program answers, as it answers
+    /// `office-text`, so the module's reader runs where a hostile file can't
+    /// reach anything else (decision 1).
+    pub async fn run_command(&self, args: &[&str], contents: &[u8]) -> Result<Vec<u8>, String> {
+        let input = self.scratch(contents)?;
+        let args: Vec<OsString> = args.iter().map(OsString::from).collect();
+        self.work_within(&self.inner.tools.launcher, &args, input, &[], COMMAND_LIMITS)
+            .await
     }
 
     fn picture_path(&self, hash: ContentHash) -> PathBuf {

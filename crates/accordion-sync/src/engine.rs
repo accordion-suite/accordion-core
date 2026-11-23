@@ -1533,7 +1533,7 @@ pub fn hash_file(at: &Path) -> Result<String, Error> {
 
 /// Today's date here, such as "November 5, 2026".
 fn today() -> String {
-    let today = jiff::Zoned::now().date();
+    let today = jiff::ZonedDateTime::now().date();
     let (year, month, day) = (
         i64::from(today.year()),
         u32::try_from(today.month()).unwrap_or(1),

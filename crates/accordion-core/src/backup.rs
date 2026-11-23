@@ -1085,10 +1085,10 @@ impl Backup {
     /// How long until the next backup hour, in the server's time zone.
     fn until_next_backup(&self) -> Duration {
         let hour = self.inner.status.borrow().hour;
-        let now = jiff::Zoned::now();
+        let now = jiff::ZonedDateTime::now();
         let next = |date: jiff::civil::Date| {
             date.at(hour as i8, 0, 0, 0)
-                .to_zoned(now.time_zone().clone())
+                .to_zoned_datetime(now.time_zone().clone())
         };
         let today = next(now.date());
         let next = match today {
@@ -2868,7 +2868,7 @@ fn parse_snapshots(stdout: &str) -> Option<Vec<Snapshot>> {
             let time: jiff::Timestamp = snapshot["time"].as_str()?.parse().ok()?;
             Some(Snapshot {
                 id: snapshot["id"].as_str()?.to_owned(),
-                time: SystemTime::from(time),
+                time: SystemTime::try_from(time).ok()?,
                 size: snapshot["summary"]["total_bytes_processed"].as_u64(),
             })
         })

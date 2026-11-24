@@ -39,6 +39,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use accordion_types::{ItemId, UploadId, UserId, VersionId};
 use rusqlite::{Connection, OptionalExtension, Row};
@@ -51,6 +52,7 @@ use crate::events::{self, Action, Actor, NewEvent};
 use crate::identity::{self, Identity};
 use crate::sql_now;
 use crate::texts::{Matched, Words};
+use crate::time;
 use blobs::{Blobs, Received};
 use view::{Entry, View};
 
@@ -467,6 +469,29 @@ pub struct Version {
     pub number: u32,
     pub blob: Blob,
     pub created_at: String,
+}
+
+/// When an item was made and last changed somewhere else, such as in
+/// Google Drive before a Takeout import (decision 34), for saves that keep
+/// those dates rather than taking the time of the save.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Dates {
+    pub created: SystemTime,
+    pub modified: SystemTime,
+}
+
+impl Dates {
+    /// The dates in the database's format. A date in the future becomes
+    /// now, so an item doesn't stay at the top of recent files, and one
+    /// before 1970 becomes 1970.
+    fn stored(self) -> (String, String) {
+        let now = SystemTime::now();
+        let format = |at: SystemTime| {
+            let at = at.min(now);
+            time::format(at.duration_since(UNIX_EPOCH).unwrap_or_default())
+        };
+        (format(self.created), format(self.modified))
+    }
 }
 
 /// What [`Storage::search`] looks for. Every part that's set has to match.
@@ -1138,6 +1163,26 @@ impl Storage {
     }
 
     pub async fn create_folder(&self, parent: ItemId, name: &str) -> Result<Item, Error> {
+        self.make_folder(parent, name, None).await
+    }
+
+    /// Makes a folder as [`Storage::create_folder`] does, with the dates it
+    /// had somewhere else.
+    pub async fn create_folder_dated(
+        &self,
+        parent: ItemId,
+        name: &str,
+        dates: Dates,
+    ) -> Result<Item, Error> {
+        self.make_folder(parent, name, Some(dates)).await
+    }
+
+    async fn make_folder(
+        &self,
+        parent: ItemId,
+        name: &str,
+        dates: Option<Dates>,
+    ) -> Result<Item, Error> {
         let name = check_name(name)?;
         let _changes = self.inner.changes.lock().await;
         let id = ItemId::generate();
@@ -1150,7 +1195,7 @@ impl Storage {
                 if let Some(other) = child_named(tx, parent.id, &name)? {
                     return Err(other.name_taken());
                 }
-                insert_item(tx, id, parent.owner, parent.id, &name, "folder")?;
+                insert_item(tx, id, parent.owner, parent.id, &name, "folder", dates)?;
                 record(tx, actor, added(id, parent.owner, "created"))?;
                 item(tx, id)?.ok_or(Error::NotFound)
             })
@@ -1168,7 +1213,23 @@ impl Storage {
         contents: impl AsyncRead + Unpin,
     ) -> Result<Item, Error> {
         let name = check_name(name)?;
-        self.receive_and_save(parent, name, contents, Over::Any)
+        self.receive_and_save(parent, name, contents, Over::Any, None)
+            .await
+    }
+
+    /// Saves `contents` as [`Storage::write_file`] does, with the dates
+    /// they had somewhere else. A new file takes both dates. When a file
+    /// with that name is already there, this is its new version, made at
+    /// `dates.modified`, which lets an import bring older versions first.
+    pub async fn write_file_dated(
+        &self,
+        parent: ItemId,
+        name: &str,
+        contents: impl AsyncRead + Unpin,
+        dates: Dates,
+    ) -> Result<Item, Error> {
+        let name = check_name(name)?;
+        self.receive_and_save(parent, name, contents, Over::Any, Some(dates))
             .await
     }
 
@@ -1181,7 +1242,21 @@ impl Storage {
         contents: impl AsyncRead + Unpin,
     ) -> Result<Item, Error> {
         let name = check_name(name)?;
-        self.receive_and_save(parent, name, contents, Over::Nothing)
+        self.receive_and_save(parent, name, contents, Over::Nothing, None)
+            .await
+    }
+
+    /// Saves a new file as [`Storage::create_file`] does, with the dates it
+    /// had somewhere else.
+    pub async fn create_file_dated(
+        &self,
+        parent: ItemId,
+        name: &str,
+        contents: impl AsyncRead + Unpin,
+        dates: Dates,
+    ) -> Result<Item, Error> {
+        let name = check_name(name)?;
+        self.receive_and_save(parent, name, contents, Over::Nothing, Some(dates))
             .await
     }
 
@@ -1201,8 +1276,14 @@ impl Storage {
             return Err(Error::InTrash);
         }
         let parent = file.parent.ok_or(Error::NotAFile)?;
-        self.receive_and_save(parent, file.name, contents, Over::File(id, base, None))
-            .await
+        self.receive_and_save(
+            parent,
+            file.name,
+            contents,
+            Over::File(id, base, None),
+            None,
+        )
+        .await
     }
 
     /// Saves `contents` as the file's new version, as
@@ -1230,6 +1311,7 @@ impl Storage {
             file.name,
             contents,
             Over::File(id, base, Some(edit)),
+            None,
         )
         .await
     }
@@ -1240,11 +1322,12 @@ impl Storage {
         name: String,
         contents: impl AsyncRead + Unpin,
         over: Over,
+        dates: Option<Dates>,
     ) -> Result<Item, Error> {
         // Receiving the contents is the slow part, so it happens before
         // taking the lock.
         let received = self.inner.blobs.receive(contents).await?;
-        let result = self.save(parent, name, &received, None, over).await;
+        let result = self.save(parent, name, &received, None, over, dates).await;
         // Gone already if it was stored. Otherwise nothing uses it.
         let _ = tokio::fs::remove_file(&received.path).await;
         result
@@ -1260,6 +1343,7 @@ impl Storage {
         received: &Received,
         upload: Option<UploadId>,
         over: Over,
+        dates: Option<Dates>,
     ) -> Result<Item, Error> {
         let blob = received.blob;
         let _changes = self.inner.changes.lock().await;
@@ -1286,7 +1370,7 @@ impl Storage {
                         id
                     }
                     None => {
-                        insert_item(tx, new_id, parent.owner, parent.id, &name, "file")?;
+                        insert_item(tx, new_id, parent.owner, parent.id, &name, "file", dates)?;
                         record(tx, actor, added(new_id, parent.owner, "uploaded"))?;
                         new_id
                     }
@@ -1295,7 +1379,7 @@ impl Storage {
                     Over::File(_, _, edit) => edit,
                     Over::Any | Over::Nothing => None,
                 };
-                add_version(tx, id, blob, edit)?;
+                add_version(tx, id, blob, edit, dates.map(|dates| dates.modified))?;
                 if let Some(upload) = upload {
                     tx.execute(
                         "DELETE FROM storage_uploads WHERE id = ?1",
@@ -1476,7 +1560,7 @@ impl Storage {
                     .optional()?
                     .ok_or(Error::NotFound)?;
                 check_space(tx, item.owner, blob.size, None)?;
-                add_version(tx, id, blob, None)?;
+                add_version(tx, id, blob, None, None)?;
                 record(
                     tx,
                     actor,
@@ -1516,8 +1600,8 @@ impl Storage {
                     return Err(other.name_taken());
                 }
                 check_space(tx, parent.owner, blob.size, None)?;
-                insert_item(tx, new_id, parent.owner, parent.id, &name, "file")?;
-                add_version(tx, new_id, blob, None)?;
+                insert_item(tx, new_id, parent.owner, parent.id, &name, "file", None)?;
+                add_version(tx, new_id, blob, None, None)?;
                 record(tx, actor, added(new_id, parent.owner, "copied"))?;
                 item_or_missing(tx, new_id)
             })
@@ -1901,7 +1985,7 @@ impl Storage {
                             };
                             let id = ItemId::generate();
                             let name = free_name(tx, their_top, &wanted)?;
-                            insert_item(tx, id, to, their_top, &name, "folder")?;
+                            insert_item(tx, id, to, their_top, &name, "folder", None)?;
                             tx.execute(
                                 "UPDATE storage_items SET parent_id = ?2 WHERE parent_id = ?1",
                                 (top.as_uuid(), id.as_uuid()),
@@ -2623,18 +2707,28 @@ fn insert_item(
     parent: ItemId,
     name: &str,
     kind: &str,
+    dates: Option<Dates>,
 ) -> Result<(), Error> {
+    let (created, modified) = dates.map(Dates::stored).unzip();
     conn.execute(
         concat!(
             "INSERT INTO storage_items
              (id, owner_id, parent_id, name, kind, created_at, modified_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ",
+             VALUES (?1, ?2, ?3, ?4, ?5, coalesce(?6, ",
             sql_now!(),
-            ", ",
+            "), coalesce(?7, ",
             sql_now!(),
-            ")"
+            "))"
         ),
-        (id.as_uuid(), owner.as_uuid(), parent.as_uuid(), name, kind),
+        (
+            id.as_uuid(),
+            owner.as_uuid(),
+            parent.as_uuid(),
+            name,
+            kind,
+            created,
+            modified,
+        ),
     )?;
     Ok(())
 }
@@ -2840,7 +2934,17 @@ fn add_version(
     item: ItemId,
     blob: Blob,
     edit: Option<Uuid>,
+    at: Option<SystemTime>,
 ) -> Result<(), Error> {
+    // A dated version, from somewhere else, says when it was made there.
+    let at = at.map(|at| {
+        Dates {
+            created: at,
+            modified: at,
+        }
+        .stored()
+        .1
+    });
     let mut replaced = 0;
     if let Some(edit) = edit {
         replaced = conn.execute(
@@ -2863,19 +2967,19 @@ fn add_version(
     if replaced == 0 {
         replaced = conn.execute(
             concat!(
-                "UPDATE storage_versions SET blob = ?2, created_at = ",
+                "UPDATE storage_versions SET blob = ?2, created_at = coalesce(?3, ",
                 sql_now!(),
-                " WHERE id = (SELECT v.id FROM storage_versions v
+                ") WHERE id = (SELECT v.id FROM storage_versions v
                           JOIN storage_blobs b ON b.hash = v.blob
                           WHERE v.item_id = ?1 AND b.size = 0
                             AND v.number = (SELECT max(number) FROM storage_versions
                                             WHERE item_id = ?1))"
             ),
-            (item.as_uuid(), &blob.hash.0[..]),
+            (item.as_uuid(), &blob.hash.0[..], &at),
         )?;
     }
     if replaced == 0 {
-        insert_version(conn, item, blob)?;
+        insert_version(conn, item, blob, at.as_deref())?;
     }
     if let Some(edit) = edit {
         // A version this session started, or one it took over from an empty
@@ -2894,29 +2998,35 @@ fn add_version(
     }
     conn.execute(
         concat!(
-            "UPDATE storage_items SET modified_at = ",
+            "UPDATE storage_items SET modified_at = coalesce(?2, ",
             sql_now!(),
-            " WHERE id = ?1"
+            ") WHERE id = ?1"
         ),
-        [item.as_uuid()],
+        (item.as_uuid(), &at),
     )?;
     Ok(())
 }
 
-fn insert_version(conn: &Connection, item: ItemId, blob: Blob) -> Result<(), Error> {
+fn insert_version(
+    conn: &Connection,
+    item: ItemId,
+    blob: Blob,
+    at: Option<&str>,
+) -> Result<(), Error> {
     conn.execute(
         concat!(
             "INSERT INTO storage_versions (id, item_id, number, blob, created_at)
              VALUES (?1, ?2,
                      (SELECT coalesce(max(number), 0) + 1 FROM storage_versions WHERE item_id = ?2),
-                     ?3, ",
+                     ?3, coalesce(?4, ",
             sql_now!(),
-            ")"
+            "))"
         ),
         (
             VersionId::generate().as_uuid(),
             item.as_uuid(),
             &blob.hash.0[..],
+            at,
         ),
     )?;
     Ok(())

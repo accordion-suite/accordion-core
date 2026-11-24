@@ -2,10 +2,13 @@
 
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use accordion_core::db::Database;
 use accordion_core::identity::{Identity, NewUser};
-use accordion_core::storage::{Error, Found, Hit, ItemKind, LeaveFiles, Only, Search, Storage};
+use accordion_core::storage::{
+    Dates, Error, Found, Hit, ItemKind, LeaveFiles, Only, Search, Storage,
+};
 use accordion_core::texts::Words;
 use accordion_types::{Role, UserId};
 use tokio::io::AsyncReadExt;
@@ -321,6 +324,121 @@ async fn keeps_every_version() {
     assert_eq!(server.storage.versions(first.id).await.unwrap().len(), 3);
     let shown = server.view().join("alex/My Drive/notes.md");
     assert_eq!(std::fs::read_to_string(shown).unwrap(), "first");
+}
+
+/// A time `days` after January 1, 2020, as an import would read it.
+fn day(days: u64) -> SystemTime {
+    UNIX_EPOCH + Duration::from_secs(1_577_836_800 + days * 86_400)
+}
+
+#[tokio::test]
+async fn keeps_dates_from_somewhere_else() {
+    let server = start().await;
+    let alex = server.user("alex").await;
+    let top = server.storage.top_folder(alex).await.unwrap();
+
+    let folder = server
+        .storage
+        .create_folder_dated(
+            top,
+            "From Google Drive",
+            Dates {
+                created: day(1),
+                modified: day(2),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(folder.created_at, "2020-01-02T00:00:00.000Z");
+    assert_eq!(folder.modified_at, "2020-01-03T00:00:00.000Z");
+
+    // An older version first, then the current one, as an import brings a
+    // file whose earlier version Google kept.
+    let old = server
+        .storage
+        .create_file_dated(
+            folder.id,
+            "Budget.xlsx",
+            &b"old"[..],
+            Dates {
+                created: day(10),
+                modified: day(20),
+            },
+        )
+        .await
+        .unwrap();
+    let file = server
+        .storage
+        .write_file_dated(
+            folder.id,
+            "Budget.xlsx",
+            &b"new"[..],
+            Dates {
+                created: day(10),
+                modified: day(30),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(file.id, old.id);
+    assert_eq!(file.created_at, "2020-01-11T00:00:00.000Z");
+    assert_eq!(file.modified_at, "2020-01-31T00:00:00.000Z");
+    let versions = server.storage.versions(file.id).await.unwrap();
+    assert_eq!(
+        versions
+            .iter()
+            .map(|v| (v.number, v.created_at.as_str()))
+            .collect::<Vec<_>>(),
+        [
+            (2, "2020-01-31T00:00:00.000Z"),
+            (1, "2020-01-21T00:00:00.000Z")
+        ]
+    );
+    assert_eq!(read(&server.storage, file.id).await, "new");
+
+    // A name that's taken is refused, as a plain new file's is.
+    let taken = server
+        .storage
+        .create_file_dated(
+            folder.id,
+            "Budget.xlsx",
+            &b"other"[..],
+            Dates {
+                created: day(1),
+                modified: day(1),
+            },
+        )
+        .await;
+    assert!(matches!(taken, Err(Error::NameTaken { folder: false })));
+
+    // A date in the future becomes now, so it doesn't stay at the top of
+    // recent files. Saves without dates take the time of the save.
+    let later = SystemTime::now() + Duration::from_secs(86_400 * 365);
+    let before = server
+        .storage
+        .write_file(folder.id, "Before.txt", &b"1"[..])
+        .await
+        .unwrap();
+    let future = server
+        .storage
+        .create_file_dated(
+            folder.id,
+            "Future.txt",
+            &b"2"[..],
+            Dates {
+                created: later,
+                modified: later,
+            },
+        )
+        .await
+        .unwrap();
+    let after = server
+        .storage
+        .write_file(folder.id, "After.txt", &b"3"[..])
+        .await
+        .unwrap();
+    assert!(before.modified_at <= future.modified_at && future.modified_at <= after.modified_at);
+    assert!(before.created_at <= future.created_at && future.created_at <= after.created_at);
 }
 
 #[tokio::test]

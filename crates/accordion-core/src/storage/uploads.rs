@@ -281,7 +281,9 @@ impl Storage {
                 size: upload.size,
             },
         };
-        let result = self.save(parent, name, &received, Some(id), over).await;
+        let result = self
+            .save(parent, name, &received, Some(id), over, None)
+            .await;
         match result {
             Ok(_) => self.forget(id),
             // The upload stays, so the client can try again, such as with

@@ -36,6 +36,9 @@ pub const DRIVE_SHARED: &str = "drive.shared";
 /// This person's notifications changed: one arrived, or they read or
 /// removed some in another tab.
 pub const NOTIFICATIONS: &str = "notifications";
+/// This person's imports from Google Takeout changed: one started, moved
+/// on, or ended (decision 34).
+pub const TAKEOUT_IMPORTS: &str = "takeout.imports";
 
 /// How long hints are gathered before they're sent.
 pub const COMBINE_FOR: Duration = Duration::from_millis(500);

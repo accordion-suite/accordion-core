@@ -113,6 +113,8 @@ const ACCOUNT_ACTIONS: &str = "'signed_in', 'sign_in_failed', 'signed_out', 'ses
     'password_changed', 'app_password_created', 'app_password_removed'";
 
 const SHARE_ACTIONS: &str = "'shared', 'share_changed', 'unshared'";
+/// Notices about an item for one person only, which activity leaves out.
+const PERSONAL_ACTIONS: &str = "'reminder_due', 'import_finished'";
 
 /// Edits to one file by one person this close together become one event,
 /// and a restore this soon after the same person trashed it undoes it.
@@ -320,6 +322,13 @@ pub enum Action {
     /// about it. A reminder is personal, so it's never in anyone's
     /// activity. Details: `local`, the time it was set for, and `repeat`.
     ReminderDue,
+    /// An import from Google Takeout finished, stopped, or was canceled
+    /// (decision 34). There's no actor, and `other` is who imported, the
+    /// only one who hears about it. The item is its report, when one was
+    /// saved. Like a reminder, it's never in anyone's activity. Details:
+    /// `state` (`done`, `canceled`, or `failed`), `brought`, and `error`
+    /// when it stopped.
+    ImportFinished,
 }
 
 impl Action {
@@ -361,10 +370,11 @@ impl Action {
             Self::RetentionChanged => "retention_changed",
             Self::PreviewsChanged => "previews_changed",
             Self::ReminderDue => "reminder_due",
+            Self::ImportFinished => "import_finished",
         }
     }
 
-    const ALL: [Self; 36] = [
+    const ALL: [Self; 37] = [
         Self::Added,
         Self::Edited,
         Self::Renamed,
@@ -401,6 +411,7 @@ impl Action {
         Self::RetentionChanged,
         Self::PreviewsChanged,
         Self::ReminderDue,
+        Self::ImportFinished,
     ];
 
     fn from_column(row: &Row<'_>, index: usize) -> rusqlite::Result<Self> {
@@ -587,7 +598,7 @@ impl Events {
                     .prepare(&format!(
                         "SELECT {EVENT_COLUMNS} FROM events_log e
                          WHERE e.item_id IN ({inside})
-                           AND e.action != 'reminder_due'
+                           AND e.action NOT IN ({PERSONAL_ACTIONS})
                            AND (?2 OR (e.action NOT IN ({SHARE_ACTIONS}, 'deleted')
                                        OR e.other_id = ?3))
                            AND (?4 IS NULL OR e.id < ?4)
@@ -940,7 +951,7 @@ pub(crate) fn record(conn: &Connection, actor: Actor, event: &NewEvent) -> rusql
         Action::Shared | Action::ShareChanged => {
             event.other.filter(|&other| Some(other) != actor.user)
         }
-        Action::LinkOpened | Action::ReminderDue => event.other,
+        Action::LinkOpened | Action::ReminderDue | Action::ImportFinished => event.other,
         action if action.changes_files() => match (actor.user, event.owner) {
             (Some(user), Some(owner)) if user != owner => Some(owner),
             _ => None,
@@ -972,8 +983,9 @@ fn hint(conn: &Connection, event: &NewEvent) -> rusqlite::Result<()> {
     let Some(item) = event.item else {
         return Ok(());
     };
-    // A reminder changes nothing, and only rings its owner's bell.
-    if event.action == Action::ReminderDue {
+    // A reminder or an import's end changes nothing, and only rings its
+    // owner's bell.
+    if matches!(event.action, Action::ReminderDue | Action::ImportFinished) {
         return Ok(());
     }
     let mut folders = Vec::new();

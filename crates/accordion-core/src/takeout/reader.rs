@@ -1,13 +1,18 @@
 //! The reader: a copy of the server, run in the sandbox as
 //! `<server> takeout-read`, that reads an export's parts (decision 34).
 //!
-//! - `takeout-read plan <part>...` writes one line of JSON: the parts, each
-//!   top-level folder with the product that claimed it, its items, and
-//!   their size, and the entries left out.
-//! - `takeout-read unpack <take> <from> <budget> <folder> <part>...` unpacks
+//! - `takeout-read plan <products> <part>...` writes one line of JSON: the
+//!   parts, each top-level folder with the product that claimed it, its
+//!   items, and their size, and the entries left out.
+//! - `takeout-read unpack <products> <take> <from> <budget> <folder>
+//!   <part>...` unpacks
 //!   the items `take` names (a JSON list of `{"product": id}` and
 //!   `{"other": folder}`), from item `from`, up to `budget` bytes, into
 //!   `folder`. It writes one line of JSON per item, then `{"next": …}`.
+//!
+//! `<products>` names the products that may claim folders, separated by
+//! commas, so every pass of one import plans the same way even after a
+//! module is turned on or off. Products it doesn't know are ignored.
 //!
 //! When it can't read the parts, it says why on its error output, in words
 //! the import's report can show, and stops with status 1.
@@ -27,16 +32,28 @@ pub const COMMAND: &str = "takeout-read";
 /// How many skipped entries a plan lists by name. The rest are counted.
 pub const MAX_SKIPPED_LISTED: usize = 1000;
 
+const PLAN_USAGE: &str = "plan <products> <part>...";
+const UNPACK_USAGE: &str = "unpack <products> <take> <from> <budget> <folder> <part>...";
+
+/// The products `chosen` names, a list separated by commas.
+fn chosen<'a>(list: &OsString, products: &[&'a dyn Product]) -> Option<Vec<&'a dyn Product>> {
+    let chosen: Vec<&str> = list.to_str()?.split(',').collect();
+    Some(
+        products
+            .iter()
+            .copied()
+            .filter(|product| chosen.contains(&product.id()))
+            .collect(),
+    )
+}
+
 pub fn main(args: impl Iterator<Item = OsString>, products: &[&dyn Product]) -> i32 {
     let args: Vec<OsString> = args.collect();
     let mut out = std::io::stdout().lock();
     let result = match args.first().and_then(|command| command.to_str()) {
         Some("plan") => plan(&args[1..], products, &mut out),
         Some("unpack") => unpack(&args[1..], products, &mut out),
-        _ => Err(
-            "Usage: takeout-read plan <part>... | unpack <take> <from> <budget> <folder> <part>..."
-                .to_owned(),
-        ),
+        _ => Err(format!("Usage: takeout-read {PLAN_USAGE} | {UNPACK_USAGE}")),
     };
     match result.and_then(|()| out.flush().map_err(|err| err.to_string())) {
         Ok(()) => 0,
@@ -180,7 +197,12 @@ fn item_bytes(export: &Export, item: &Planned) -> u64 {
 }
 
 fn plan(args: &[OsString], products: &[&dyn Product], out: &mut impl Write) -> Result<(), String> {
-    let read = read(args, products)?;
+    let usage = || format!("Usage: takeout-read {PLAN_USAGE}");
+    let [products_arg, parts @ ..] = args else {
+        return Err(usage());
+    };
+    let products = chosen(products_arg, products).ok_or_else(usage)?;
+    let read = read(parts, &products)?;
     let folders: Vec<Value> = read
         .folders
         .iter()
@@ -218,11 +240,11 @@ fn unpack(
     products: &[&dyn Product],
     out: &mut impl Write,
 ) -> Result<(), String> {
-    let usage =
-        || "Usage: takeout-read unpack <take> <from> <budget> <folder> <part>...".to_owned();
-    let [take, from, budget, folder, parts @ ..] = args else {
+    let usage = || format!("Usage: takeout-read {UNPACK_USAGE}");
+    let [products_arg, take, from, budget, folder, parts @ ..] = args else {
         return Err(usage());
     };
+    let products = chosen(products_arg, products).ok_or_else(usage)?;
     let take: Value = take
         .to_str()
         .and_then(|take| serde_json::from_str(take).ok())
@@ -242,7 +264,7 @@ fn unpack(
         })
     };
 
-    let mut read = read(parts, products)?;
+    let mut read = read(parts, &products)?;
     let all: Vec<(&Planning, &Planned)> = read
         .folders
         .iter()

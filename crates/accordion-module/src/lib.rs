@@ -22,6 +22,7 @@ use accordion_core::events::Events;
 use accordion_core::identity::Identity;
 use accordion_core::live::Live;
 use accordion_core::storage::Storage;
+use accordion_core::takeout::{Imports, Product};
 use accordion_core::texts::Texts;
 use accordion_core::thumbnails::Thumbnails;
 use accordion_core::transcripts::Transcripts;
@@ -60,6 +61,16 @@ pub trait Module: Send + Sync + 'static {
         Box::pin(async { None })
     }
 
+    /// The Google Takeout products the module converts, such as Keep for
+    /// Notes (decision 34). They find the product's items in the sandbox,
+    /// where the server runs them whether the module is on or not, so they
+    /// use nothing of the module's. A module that has any adds an
+    /// [`accordion_core::takeout::Importer`] for each when it starts, to
+    /// store their items.
+    fn takeout_products(&self) -> &'static [&'static dyn Product] {
+        &[]
+    }
+
     /// Starts the module: runs its migrations, then returns its routes and
     /// its background work. The server calls it again each time the module
     /// is turned back on.
@@ -94,6 +105,10 @@ pub struct Services {
     /// Co-editing, for files people edit together, such as shared notes
     /// (decision 30). [`coedit::upgrade`] carries it over a WebSocket.
     pub coediting: CoEditing,
+    /// Imports from Google Takeout (decision 34). A module that converts a
+    /// product adds its importer here when it starts, and keeps the guard
+    /// until it stops.
+    pub takeout: Imports,
     /// Where link pages are, such as `https://f8q2m.ourhome.dedyn.io`, while
     /// an admin has link sharing on (decision 22).
     pub link_origin: watch::Receiver<Option<String>>,

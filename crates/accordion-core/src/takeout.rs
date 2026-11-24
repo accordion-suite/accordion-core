@@ -18,6 +18,7 @@
 //! for **Unconverted**.
 
 pub mod archive;
+pub mod imports;
 pub mod reader;
 
 use std::collections::HashMap;
@@ -29,6 +30,7 @@ use std::time::Duration;
 use accordion_sandbox::{Folder, Job, Limits, Sandbox, Workers};
 use serde_json::{Value, json};
 
+pub use imports::{Importer, Importing, Imports, ItemError, Registered, escape};
 pub use reader::COMMAND;
 
 /// A product a module converts, such as Keep. It runs in the sandbox, on
@@ -245,8 +247,9 @@ impl Takeout {
 
     /// Lists what the export's `parts` hold, without unpacking anything.
     /// The parts are stored files, in the order the export numbered them.
-    pub async fn plan(&self, parts: &[PathBuf]) -> Result<Plan, Error> {
-        let mut args = vec![OsString::from(COMMAND), "plan".into()];
+    /// Only `products` may claim folders.
+    pub async fn plan(&self, products: &[&str], parts: &[PathBuf]) -> Result<Plan, Error> {
+        let mut args = vec![OsString::from(COMMAND), "plan".into(), list(products)];
         args.extend(parts.iter().map(|part| part.as_os_str().to_owned()));
         let output = self.run(&args, parts, None).await?;
         let line = output
@@ -259,9 +262,11 @@ impl Takeout {
     }
 
     /// Unpacks the items of `take` from item `from` on, up to `budget`
-    /// bytes, but always at least one item.
+    /// bytes, but always at least one item. `products` must be the ones the
+    /// plan used, so the items come in the same order.
     pub async fn unpack(
         &self,
+        products: &[&str],
         parts: &[PathBuf],
         take: &[Take],
         from: u64,
@@ -279,6 +284,7 @@ impl Takeout {
         let mut args = vec![
             OsString::from(COMMAND),
             "unpack".into(),
+            list(products),
             take.to_string().into(),
             from.to_string().into(),
             budget.to_string().into(),
@@ -350,6 +356,17 @@ impl Takeout {
                 err => Error::Failed(err.to_string()),
             })
     }
+}
+
+/// Products' IDs for the reader, separated by commas.
+fn list(products: &[&str]) -> OsString {
+    assert!(
+        products
+            .iter()
+            .all(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_lowercase())),
+        "a product's ID is lowercase letters"
+    );
+    products.join(",").into()
 }
 
 fn text(value: &Value, key: &str) -> Option<String> {

@@ -1358,10 +1358,7 @@ impl Importing {
                 Err(storage::Error::NameTaken { .. }) => continue,
                 Ok(item) => {
                     if cut {
-                        self.report(
-                            SHORTENED,
-                            format!("`{}` became `{}`", code(&name), code(&fitted)),
-                        );
+                        self.shortened(&name, &fitted);
                     }
                     return Ok(item);
                 }
@@ -1382,8 +1379,19 @@ impl Importing {
         Ok(())
     }
 
-    /// Keeps `file` in **Unconverted**, without a line in the report.
-    async fn keep(&self, file: &UnpackedFile) -> Result<(), ItemError> {
+    /// Lists a name that was shortened to fit, such as a title cut to
+    /// make a file's name, under "Names that were shortened".
+    pub fn shortened(&self, name: &str, fitted: &str) {
+        self.report(
+            SHORTENED,
+            format!("`{}` became `{}`", code(name), code(fitted)),
+        );
+    }
+
+    /// Keeps `file` in **Unconverted**, in its folder from the archive,
+    /// without a line in the report, such as the original of a file that
+    /// was converted.
+    pub async fn keep(&self, file: &UnpackedFile) -> Result<(), ItemError> {
         let mut names = inside_export(&file.path);
         let Some(name) = names.pop() else {
             return Err(ItemError::NotConverted("its path is empty".to_owned()));

@@ -263,6 +263,15 @@ const SOUND_LIMITS: Limits = Limits {
     output: 1024 * 1024,
 };
 
+/// What ffmpeg may use to convert a voice recording to Opus
+/// ([`Thumbnails::voice_to_opus`]). Three hours at 32 kbit/s is about 43 MB.
+const VOICE_LIMITS: Limits = Limits {
+    memory: 512 * 1024 * 1024,
+    cpu: Duration::from_secs(10 * 60),
+    time: Duration::from_secs(15 * 60),
+    output: 64 * 1024 * 1024,
+};
+
 /// Longer sounds get no converted preview, so one can't keep the worker
 /// busy for long. Three hours at 128 kbit/s is about 170 MB.
 const MAX_SOUND_SECONDS: f64 = 3.0 * 60.0 * 60.0;
@@ -1638,6 +1647,58 @@ impl Thumbnails {
             COMMAND_LIMITS,
         )
         .await
+    }
+
+    /// A phone's voice recording in AMR, as Google Keep exports them, as
+    /// Opus in Ogg, which browsers play (decision 34). ffmpeg converts it in
+    /// the sandbox, reading only AMR. A recording that isn't AMR is refused
+    /// before anything runs.
+    pub async fn voice_to_opus(&self, contents: &[u8]) -> Result<Vec<u8>, String> {
+        if !(contents.starts_with(b"#!AMR\n") || contents.starts_with(b"#!AMR-WB\n")) {
+            return Err("it isn't an AMR recording".to_owned());
+        }
+        let input = self.scratch(contents)?;
+        let args = [
+            "-nostdin",
+            "-v",
+            "error",
+            "-threads",
+            "2",
+            "-protocol_whitelist",
+            "pipe",
+            "-f",
+            "amr",
+            "-codec_whitelist",
+            "amrnb,amrwb",
+            "-i",
+            "pipe:0",
+            "-map",
+            "0:a:0",
+            "-vn",
+            "-sn",
+            "-dn",
+            "-map_metadata",
+            "-1",
+            "-ac",
+            "1",
+            "-c:a",
+            "libopus",
+            "-b:a",
+            "32k",
+            "-application",
+            "voip",
+            "-f",
+            "ogg",
+            "pipe:1",
+        ]
+        .map(OsString::from);
+        let converted = self
+            .work_within(&self.inner.tools.ffmpeg, &args, input, &[], VOICE_LIMITS)
+            .await?;
+        if !converted.starts_with(b"OggS") {
+            return Err("ffmpeg didn't make a sound file".to_owned());
+        }
+        Ok(converted)
     }
 
     fn picture_path(&self, hash: ContentHash) -> PathBuf {

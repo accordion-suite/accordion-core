@@ -358,6 +358,30 @@ async fn shrinks_pictures_people_add_to_documents() {
 }
 
 #[tokio::test]
+async fn converts_voice_recordings_to_opus() {
+    let server = start().await;
+    // Three seconds of AMR-NB at 12.2 kbit/s, as Keep exports recordings:
+    // each frame a one-byte header and 31 bytes of sound.
+    let mut amr = b"#!AMR\n".to_vec();
+    for _ in 0..150 {
+        amr.push(0x3c);
+        amr.extend([0; 31]);
+    }
+    let opus = server.thumbnails.voice_to_opus(&amr).await.unwrap();
+    assert!(opus.starts_with(b"OggS"));
+    assert!(opus.windows(8).any(|bytes| bytes == b"OpusHead"));
+    let refused = server.thumbnails.voice_to_opus(b"OggS not amr").await;
+    assert_eq!(refused, Err("it isn't an AMR recording".to_owned()));
+    assert!(
+        server
+            .thumbnails
+            .voice_to_opus(b"#!AMR\n\xff\xff")
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn shows_a_pdfs_first_page() {
     let server = start().await;
     let hash = server.save("letter.pdf", &pdf()).await;

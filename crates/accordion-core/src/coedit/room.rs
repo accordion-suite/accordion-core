@@ -301,6 +301,8 @@ impl Room {
             state_matches = state.file_hash == blob.hash;
             if !state.unsaved {
                 self.base = Some(state.state.clone());
+            } else if let Some(base) = &state.base {
+                self.base = Some(base.clone());
             }
         } else if let Some(state) = guarded(|| self.format.state_in(&contents)).flatten() {
             self.load_update(&state)?;
@@ -629,7 +631,7 @@ impl Room {
             }
         }
         self.file_hash = file_hash;
-        match self.keep(false).await {
+        match self.keep(None).await {
             Ok(state) => {
                 self.base = Some(state);
                 self.unsaved = None;
@@ -663,8 +665,10 @@ impl Room {
     }
 
     /// Keeps the document's state, with the file it has taken in, and lets
-    /// go of the logged edits it holds. Returns the state.
-    async fn keep(&self, unsaved: bool) -> Result<Vec<u8>, crate::db::Error> {
+    /// go of the logged edits it holds. Returns the state. `unsaved` is a
+    /// state whose contents are the file's, when the document has edits the
+    /// file doesn't.
+    async fn keep(&self, unsaved: Option<Vec<u8>>) -> Result<Vec<u8>, crate::db::Error> {
         let state = self
             .doc
             .transact()
@@ -687,7 +691,8 @@ impl Room {
     ///
     /// With a base, the change is the difference between the base and the
     /// file, merged with edits made since, as a three-way merge would.
-    /// Without one, the document is made to match the file. Either way the
+    /// Without one, the document is made to match the file, and its state
+    /// then becomes the base, so a later change merges too. Either way the
     /// state is kept at once, with the file's hash, so after a restart the
     /// file counts as taken in.
     async fn absorb(&mut self, contents: &[u8]) {
@@ -702,7 +707,7 @@ impl Room {
         if matched {
             // Nothing to take in, and nothing the file doesn't have.
             self.unsaved = None;
-            match self.keep(false).await {
+            match self.keep(None).await {
                 Ok(state) => self.base = Some(state),
                 Err(err) => {
                     tracing::warn!(item = %self.item, %err, "couldn't keep a co-edited file's state");
@@ -712,8 +717,16 @@ impl Room {
         }
         let before = self.doc.transact().state_vector();
         let taken = guarded(|| match &self.base {
-            Some(base) => merge_in(&*self.format, base, &self.doc, contents).map(Some),
-            None => self.format.absorb(&self.doc, contents).map(|()| None),
+            Some(base) => merge_in(&*self.format, base, &self.doc, contents),
+            // The document now holds the file, so its state is a base for
+            // the next outside change. Without one, that change would also
+            // replace whatever was typed since, which a new document that
+            // hasn't saved yet would lose.
+            None => self.format.absorb(&self.doc, contents).map(|()| {
+                self.doc
+                    .transact()
+                    .encode_state_as_update_v1(&StateVector::default())
+            }),
         });
         let new_base = match taken {
             Some(Ok(new_base)) => new_base,
@@ -738,8 +751,8 @@ impl Room {
             guarded(|| self.format.write(&self.doc)),
             Some(Ok(current)) if current == contents
         );
-        match self.keep(unsaved).await {
-            Ok(state) => self.base = if unsaved { new_base } else { Some(state) },
+        match self.keep(unsaved.then(|| new_base.clone())).await {
+            Ok(state) => self.base = Some(if unsaved { new_base } else { state }),
             Err(err) => {
                 tracing::error!(item = %self.item, %err, "couldn't keep a co-edited file's outside change");
                 self.failed = true;

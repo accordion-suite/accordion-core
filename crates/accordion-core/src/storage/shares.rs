@@ -26,6 +26,9 @@ use crate::sql_now;
 pub enum ShareLevel {
     /// Open, download, and copy to their own Drive.
     Viewer,
+    /// Also comment, in a module that has comments, such as Docs. Anywhere
+    /// else, the same as a viewer.
+    Commenter,
     /// Also add, rename, replace, and move items inside the shared folder,
     /// restore versions, and move items to the trash.
     Editor,
@@ -35,6 +38,7 @@ impl ShareLevel {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Viewer => "viewer",
+            Self::Commenter => "commenter",
             Self::Editor => "editor",
         }
     }
@@ -42,6 +46,7 @@ impl ShareLevel {
     fn from_column(row: &Row<'_>, index: usize) -> rusqlite::Result<Self> {
         match row.get_ref(index)?.as_str()? {
             "viewer" => Ok(Self::Viewer),
+            "commenter" => Ok(Self::Commenter),
             "editor" => Ok(Self::Editor),
             other => Err(rusqlite::Error::FromSqlConversionFailure(
                 index,
@@ -56,6 +61,8 @@ impl ShareLevel {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Access {
     Viewer,
+    /// A viewer who may also comment, where there are comments.
+    Commenter,
     Editor,
     /// Everything, including sharing it, and the trash.
     Owner,
@@ -65,6 +72,7 @@ impl From<ShareLevel> for Access {
     fn from(level: ShareLevel) -> Self {
         match level {
             ShareLevel::Viewer => Self::Viewer,
+            ShareLevel::Commenter => Self::Commenter,
             ShareLevel::Editor => Self::Editor,
         }
     }

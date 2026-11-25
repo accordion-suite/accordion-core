@@ -273,6 +273,28 @@ static MIGRATIONS: &[Migration] = &[
             WHERE parent_id IS NULL;
     ",
     },
+    Migration {
+        version: 9,
+        name: "Add the commenter level to sharing",
+        sql: "
+        -- SQLite can't change a check, so the table is made again with the
+        -- level between viewer and editor (decision 30).
+        CREATE TABLE storage_shares_new (
+            item_id BLOB NOT NULL REFERENCES storage_items (id) ON DELETE CASCADE,
+            user_id BLOB NOT NULL REFERENCES identity_users (id) ON DELETE CASCADE,
+            level TEXT NOT NULL CHECK (level IN ('viewer', 'commenter', 'editor')),
+            -- Not a reference, so the record outlives the account.
+            shared_by BLOB NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY (item_id, user_id)
+        ) STRICT, WITHOUT ROWID;
+        INSERT INTO storage_shares_new SELECT item_id, user_id, level, shared_by, created_at
+            FROM storage_shares;
+        DROP TABLE storage_shares;
+        ALTER TABLE storage_shares_new RENAME TO storage_shares;
+        CREATE INDEX storage_shares_user ON storage_shares (user_id);
+    ",
+    },
 ];
 
 /// My Drive's place. Its top folder has an empty name.

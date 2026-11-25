@@ -176,6 +176,40 @@ async fn removing_someone_works_at_once() {
 }
 
 #[tokio::test]
+async fn a_commenter_is_between_a_viewer_and_an_editor() {
+    let f = family().await;
+    let s = &f.server;
+    s.storage
+        .share(f.holiday, f.sam, ShareLevel::Viewer, f.alex)
+        .await
+        .unwrap();
+    s.storage
+        .share(f.photo, f.sam, ShareLevel::Commenter, f.alex)
+        .await
+        .unwrap();
+    // The highest share counts, wherever it is.
+    assert_eq!(s.access(f.sam, f.photo).await, Some(Access::Commenter));
+    s.storage
+        .share(f.holiday, f.sam, ShareLevel::Editor, f.alex)
+        .await
+        .unwrap();
+    assert_eq!(s.access(f.sam, f.photo).await, Some(Access::Editor));
+    assert!(Access::Viewer < Access::Commenter && Access::Commenter < Access::Editor);
+
+    let shares = s.storage.shares(f.photo).await.unwrap();
+    assert_eq!(shares[0].level, ShareLevel::Commenter);
+    let history: Vec<_> = s
+        .storage
+        .share_history(f.photo)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|event| event.level)
+        .collect();
+    assert_eq!(history, [Some(ShareLevel::Commenter)]);
+}
+
+#[tokio::test]
 async fn lists_shares_and_whats_shared() {
     let f = family().await;
     let s = &f.server;

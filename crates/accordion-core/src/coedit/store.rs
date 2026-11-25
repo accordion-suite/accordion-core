@@ -10,10 +10,11 @@ use crate::storage::ContentHash;
 
 const OWNER: &str = "coedit";
 
-static MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    name: "Create document states and the edit log",
-    sql: "
+static MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        name: "Create document states and the edit log",
+        sql: "
         -- Each document's yrs state when its file was last written or read,
         -- so the next people to open it carry on from the same history, and
         -- the hash of that file. Unsaved is 1 when the state has edits the
@@ -36,7 +37,19 @@ static MIGRATIONS: &[Migration] = &[Migration {
             PRIMARY KEY (item_id, seq)
         ) STRICT, WITHOUT ROWID;
     ",
-}];
+    },
+    Migration {
+        version: 2,
+        name: "Keep the state an unsaved document's file was read into",
+        sql: "
+        -- While unsaved is 1, the state whose contents are the file's, so a
+        -- change to the file after a restart merges with the edits the
+        -- file doesn't have, rather than replacing them. NULL in states
+        -- kept before this column was added.
+        ALTER TABLE coedit_states ADD COLUMN base BLOB;
+    ",
+    },
+];
 
 /// What's kept for a document between sessions.
 pub(super) struct Kept {
@@ -53,6 +66,8 @@ pub(super) struct KeptState {
     pub state: Vec<u8>,
     /// The state has edits the file doesn't.
     pub unsaved: bool,
+    /// While unsaved, a state whose contents are the file's.
+    pub base: Option<Vec<u8>>,
 }
 
 pub(super) async fn migrate(db: &Database) -> Result<(), db::Error> {
@@ -81,7 +96,7 @@ pub(super) async fn load(db: &Database, item: ItemId) -> Result<Kept, db::Error>
     db.read(move |conn| {
         let state = conn
             .query_row(
-                "SELECT format, file_hash, state, unsaved FROM coedit_states
+                "SELECT format, file_hash, state, unsaved, base FROM coedit_states
                  WHERE item_id = ?1",
                 [item.as_uuid()],
                 |row| {
@@ -91,6 +106,7 @@ pub(super) async fn load(db: &Database, item: ItemId) -> Result<Kept, db::Error>
                         file_hash: ContentHash(hash.try_into().unwrap_or([0; 32])),
                         state: row.get(2)?,
                         unsaved: row.get(3)?,
+                        base: row.get(4)?,
                     })
                 },
             )
@@ -131,29 +147,38 @@ pub(super) async fn append(
 
 /// Keeps the document's `state`, which takes in the file with `file_hash`,
 /// and lets go of the edits before `next_seq`, which the state holds.
-/// `unsaved` when the state has edits the file doesn't.
+/// `unsaved` is a state whose contents are the file's, when `state` has
+/// edits the file doesn't.
 pub(super) async fn keep(
     db: &Database,
     item: ItemId,
     format: &'static str,
     file_hash: ContentHash,
     state: Vec<u8>,
-    unsaved: bool,
+    unsaved: Option<Vec<u8>>,
     next_seq: i64,
 ) -> Result<(), db::Error> {
     db.write(move |tx| {
         tx.execute(
             concat!(
-                "INSERT INTO coedit_states (item_id, format, file_hash, state, unsaved, saved_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ",
+                "INSERT INTO coedit_states
+                     (item_id, format, file_hash, state, unsaved, base, saved_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ",
                 sql_now!(),
                 ")
                  ON CONFLICT (item_id) DO UPDATE SET
                      format = excluded.format, file_hash = excluded.file_hash,
                      state = excluded.state, unsaved = excluded.unsaved,
-                     saved_at = excluded.saved_at"
+                     base = excluded.base, saved_at = excluded.saved_at"
             ),
-            (item.as_uuid(), format, &file_hash.0[..], state, unsaved),
+            (
+                item.as_uuid(),
+                format,
+                &file_hash.0[..],
+                state,
+                unsaved.is_some(),
+                unsaved,
+            ),
         )?;
         tx.execute(
             "DELETE FROM coedit_updates WHERE item_id = ?1 AND seq < ?2",

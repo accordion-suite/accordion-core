@@ -58,6 +58,29 @@ impl Format for Other {
     }
 }
 
+/// Text that always ends with a line break, so a file without one is
+/// written back a little differently from how it was read, as Docs writes a
+/// page it didn't make.
+struct Tidy;
+
+impl Format for Tidy {
+    fn name(&self) -> &'static str {
+        "tidy"
+    }
+
+    fn absorb(&self, doc: &Doc, contents: &[u8]) -> Result<(), FormatError> {
+        Plain.absorb(doc, contents)
+    }
+
+    fn write(&self, doc: &Doc) -> Result<Vec<u8>, FormatError> {
+        let mut text = Plain.write(doc)?;
+        if !text.ends_with(b"\n") {
+            text.push(b'\n');
+        }
+        Ok(text)
+    }
+}
+
 struct Server {
     dir: tempfile::TempDir,
     db: Database,
@@ -157,10 +180,19 @@ impl Server {
         session: Option<SessionId>,
         doc: Doc,
     ) -> Result<Editor, JoinError> {
-        let connection = self
-            .coediting
-            .join(item, user, session, Arc::new(Plain))
-            .await?;
+        self.join_in(item, user, session, doc, Arc::new(Plain))
+            .await
+    }
+
+    async fn join_in(
+        &self,
+        item: ItemId,
+        user: UserId,
+        session: Option<SessionId>,
+        doc: Doc,
+        format: Arc<dyn Format>,
+    ) -> Result<Editor, JoinError> {
+        let connection = self.coediting.join(item, user, session, format).await?;
         let mut editor = Editor {
             doc,
             connection,
@@ -491,6 +523,78 @@ async fn a_change_from_elsewhere_merges_with_unsaved_edits() {
     drop((a, b));
     s.all_closed().await;
     assert_eq!(s.contents(item).await, format!("{merged}Jam\n"));
+}
+
+#[tokio::test]
+async fn a_change_from_elsewhere_before_the_first_save_keeps_the_typing() {
+    let s = start(SLOW).await;
+    let alex = s.user("alex").await;
+    // Written back with a line break at the end, so the room has edits to
+    // save from the moment it opens, and no saved state to merge from.
+    let item = s.file(alex, "list.txt", "Milk\nEggs").await;
+    let mut a = s
+        .join_in(
+            item,
+            alex,
+            None,
+            Doc::with_options(options()),
+            Arc::new(Tidy),
+        )
+        .await
+        .unwrap();
+    a.type_at(0, "Bread\n").await;
+    a.settle().await;
+
+    s.change_outside(item, "Oat milk\nEggs").await;
+    a.settle().await;
+    assert_eq!(a.text(), "Bread\nOat milk\nEggs");
+    drop(a);
+    s.all_closed().await;
+    assert_eq!(s.contents(item).await, "Bread\nOat milk\nEggs\n");
+}
+
+#[tokio::test]
+async fn a_change_from_elsewhere_after_a_restart_keeps_unsaved_typing() {
+    let s = start(SLOW).await;
+    let alex = s.user("alex").await;
+    let item = s.file(alex, "list.txt", "Milk\nEggs").await;
+    let a = s
+        .join_in(
+            item,
+            alex,
+            None,
+            Doc::with_options(options()),
+            Arc::new(Tidy),
+        )
+        .await
+        .unwrap();
+
+    // A second server on the same database, as after a crash, opens the
+    // document with edits its file doesn't have yet.
+    let after = CoEditing::open(s.db.clone(), s.storage.clone(), s.identity.clone(), SLOW)
+        .await
+        .unwrap();
+    let connection = after.join(item, alex, None, Arc::new(Tidy)).await.unwrap();
+    let mut b = Editor {
+        doc: Doc::with_options(options()),
+        connection,
+        awareness: AwarenessUpdate {
+            clients: Default::default(),
+        },
+    };
+    let step1 = Message::Sync(SyncMessage::SyncStep1(b.doc.transact().state_vector()));
+    b.send(step1.encode_v1()).await;
+    b.settle().await;
+    b.type_at(0, "Bread\n").await;
+    b.settle().await;
+
+    s.change_outside(item, "Oat milk\nEggs").await;
+    b.settle().await;
+    assert_eq!(b.text(), "Bread\nOat milk\nEggs");
+    drop(a);
+    drop(b);
+    after.stop().await;
+    s.coediting.stop().await;
 }
 
 #[tokio::test]

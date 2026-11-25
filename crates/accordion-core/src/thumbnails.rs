@@ -763,6 +763,22 @@ pub enum PictureError {
     Failed(String),
 }
 
+/// Why [`Thumbnails::office_to_word`] couldn't make a Word file.
+#[derive(Debug, thiserror::Error)]
+pub enum ConvertError {
+    /// LibreOffice isn't installed on the server.
+    #[error("LibreOffice isn't installed")]
+    NotInstalled,
+    /// The file isn't one LibreOffice may read this way, or LibreOffice
+    /// couldn't read it, or the sandbox couldn't run.
+    #[error("couldn't convert the file: {0}")]
+    Failed(String),
+}
+
+/// The formats [`Thumbnails::office_to_word`] converts: older Word files
+/// and Rich Text, which modules don't read themselves.
+const TO_WORD: [&str; 2] = ["doc", "rtf"];
+
 /// The thumbnail service. Cloning it is cheap.
 #[derive(Clone)]
 pub struct Thumbnails {
@@ -1647,6 +1663,82 @@ impl Thumbnails {
             COMMAND_LIMITS,
         )
         .await
+    }
+
+    /// An older Word file (`.doc`) or Rich Text (`.rtf`) as a Word file
+    /// (`.docx`), made by LibreOffice in the sandbox, for Docs to read
+    /// (decision 30). As for thumbnails, the file must start the way its
+    /// format does, and only LibreOffice's reader for that format runs, so a
+    /// file named as one format can't reach another's reader. Macros never
+    /// run, and nothing the file links to is fetched.
+    pub async fn office_to_word(
+        &self,
+        contents: &[u8],
+        extension: &str,
+    ) -> Result<Vec<u8>, ConvertError> {
+        if !self.inner.tools.has_office() {
+            return Err(ConvertError::NotInstalled);
+        }
+        let extension = extension.to_ascii_lowercase();
+        let format = TO_WORD
+            .contains(&extension.as_str())
+            .then(|| format(&format!("file.{extension}"), contents))
+            .flatten()
+            .ok_or_else(|| ConvertError::Failed(format!("it isn't a .{extension} file")))?;
+        if contents.len() as u64 > MAX_DOCUMENT {
+            return Err(ConvertError::Failed("it's too large".into()));
+        }
+        let failed = ConvertError::Failed;
+        let mut profile = self.inner.office.lock().await;
+        if profile.is_none() {
+            *profile = Some(self.office_profile().await.map_err(failed)?);
+        }
+        let profile = profile.as_ref().expect("made above").path().join("profile");
+        let scratch = self.scratch_dir().await.map_err(failed)?;
+        copy_folder(&profile, &scratch.path().join("profile"))
+            .map_err(|err| failed(format!("couldn't copy LibreOffice's settings: {err}")))?;
+        let file = scratch.path().join(format!("file.{extension}"));
+        std::fs::write(&file, contents)
+            .map_err(|err| failed(format!("couldn't write the file to convert: {err}")))?;
+        let out = scratch.path().join("out");
+        std::fs::create_dir(&out)
+            .map_err(|err| failed(format!("couldn't make a folder: {err}")))?;
+        let args = [
+            OsString::from(format!(
+                "-env:UserInstallation={}",
+                file_url(&scratch.path().join("profile"))
+            )),
+            "--headless".into(),
+            "--norestore".into(),
+            "--nolockcheck".into(),
+            format!("--infilter={}", format.filter).into(),
+            "--convert-to".into(),
+            "docx:MS Word 2007 XML".into(),
+            "--outdir".into(),
+            out.clone().into(),
+            file.clone().into(),
+        ];
+        let messages = self
+            .office(&scratch, &args, &[file])
+            .await
+            .map_err(failed)?;
+        // The worker named the Word file after the file. It could only make
+        // folders and plain files there.
+        let made = out.join("file.docx");
+        if !made.symlink_metadata().is_ok_and(|found| found.is_file()) {
+            return Err(failed(match messages.as_str() {
+                "" => "LibreOffice didn't make a Word file".to_owned(),
+                said => format!("LibreOffice didn't make a Word file: {said}"),
+            }));
+        }
+        let mut word = Vec::new();
+        std::fs::File::open(&made)
+            .and_then(|opened| opened.take(MAX_DOCUMENT + 1).read_to_end(&mut word))
+            .map_err(|err| failed(format!("couldn't read LibreOffice's Word file: {err}")))?;
+        if word.len() as u64 > MAX_DOCUMENT || !word.starts_with(ZIP) {
+            return Err(failed("LibreOffice didn't make a Word file".into()));
+        }
+        Ok(word)
     }
 
     /// A phone's voice recording in AMR, as Google Keep exports them, as

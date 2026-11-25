@@ -14,8 +14,8 @@ use accordion_core::db::Database;
 use accordion_core::identity::{Identity, NewUser};
 use accordion_core::storage::{ContentHash, ItemKind, Storage};
 use accordion_core::thumbnails::{
-    Facts, PREVIEW_PAGES, PictureError, PreviewSettings, ThumbnailKind, Thumbnails, Tools,
-    VideoConversion,
+    ConvertError, Facts, PREVIEW_PAGES, PictureError, PreviewSettings, ThumbnailKind, Thumbnails,
+    Tools, VideoConversion,
 };
 use accordion_types::{ItemId, Role};
 use rusqlite::OptionalExtension;
@@ -839,6 +839,38 @@ async fn stops_a_long_spreadsheets_preview_at_50_pages() {
     let preview = server.thumbnails.preview(hash).unwrap();
     assert!(preview.partial);
     assert_eq!(pages(&preview.path), PREVIEW_PAGES);
+}
+
+#[tokio::test]
+async fn converts_older_word_files_and_rich_text_to_word() {
+    let server = start().await;
+    for from in ["doc", "rtf"] {
+        let file = server.document("letter.fodt", LETTER, from);
+        let word = server.thumbnails.office_to_word(&file, from).await.unwrap();
+        assert!(word.starts_with(b"PK\x03\x04"), "{from}");
+        let text = String::from_utf8_lossy(&unzip(&word, "word/document.xml")).into_owned();
+        assert!(text.contains("Dear Sam"), "{from}: {text}");
+    }
+    // A file is read only as what its name says, and only these two.
+    let odt = server.document("letter.fodt", LETTER, "odt");
+    assert!(matches!(
+        server.thumbnails.office_to_word(&odt, "doc").await,
+        Err(ConvertError::Failed(_))
+    ));
+    assert!(matches!(
+        server.thumbnails.office_to_word(&odt, "odt").await,
+        Err(ConvertError::Failed(_))
+    ));
+    let without = start_with(|tools| Tools {
+        soffice: "/nonexistent/soffice.bin".into(),
+        ..tools
+    })
+    .await;
+    let rtf = server.document("letter.fodt", LETTER, "rtf");
+    assert!(matches!(
+        without.thumbnails.office_to_word(&rtf, "rtf").await,
+        Err(ConvertError::NotInstalled)
+    ));
 }
 
 #[tokio::test]
@@ -2499,4 +2531,17 @@ async fn shows_a_comic_books_cover() {
     let details: serde_json::Value =
         serde_json::from_slice(&std::fs::read(details).unwrap()).unwrap();
     assert_eq!(details["title"], "Slumberland");
+}
+
+/// The file at `path` in a zip.
+fn unzip(zip: &[u8], path: &str) -> Vec<u8> {
+    use std::io::Read;
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(zip)).unwrap();
+    let mut out = Vec::new();
+    archive
+        .by_name(path)
+        .unwrap()
+        .read_to_end(&mut out)
+        .unwrap();
+    out
 }

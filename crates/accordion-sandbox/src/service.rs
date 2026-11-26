@@ -347,6 +347,12 @@ fn start(
     }
     if let Some(path) = &run.sockets {
         command.arg("--sockets").arg(path);
+        // A job's user has no account on the system, so LibreOffice finds no
+        // home folder and maps the code it makes through a file in /tmp.
+        // Only the job's own files there are within its reach.
+        if matches!(identity, Identity::Own(_)) {
+            command.arg("--temp-files");
+        }
     }
     command
         .arg("--")

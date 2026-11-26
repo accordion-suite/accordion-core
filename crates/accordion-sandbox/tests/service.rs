@@ -2,8 +2,8 @@
 //! the test's own user, as in development, so they check the connection,
 //! job folders, and stopping jobs, with Landlock as the sandbox.
 //!
-//! `runs_each_connection_as_a_user_of_its_own` checks the users themselves.
-//! Switching users needs root, so it runs only when
+//! The tests named `..._user_of_its_own...` check the users themselves.
+//! Switching users needs root, so they run only when
 //! `ACCORDION_TEST_JOB_USERS=1` is set, such as with `sudo` in CI.
 
 use std::ffi::OsString;
@@ -278,5 +278,95 @@ for path in [{secret:?}, {data:?}]:
     assert_eq!(
         String::from_utf8(output).unwrap(),
         "True\nthe video\nrefused\nrefused\n"
+    );
+}
+
+/// What LibreOffice does when memory can't be both writable and runnable:
+/// it maps the code it makes twice through a file, writable and runnable.
+/// A job's user has no home folder, so the file goes in /tmp.
+const DOUBLE_MAP: &str = r#"
+import mmap, os, tempfile
+fd, path = tempfile.mkstemp(dir="/tmp", prefix=".execooo")
+os.unlink(path)
+os.ftruncate(fd, mmap.PAGESIZE)
+mmap.mmap(fd, mmap.PAGESIZE, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+mmap.mmap(fd, mmap.PAGESIZE, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_EXEC)
+print("mapped")
+"#;
+
+#[tokio::test]
+async fn a_user_of_its_own_makes_files_where_it_makes_sockets() {
+    if std::env::var_os("ACCORDION_TEST_JOB_USERS").is_none() {
+        return;
+    }
+    let running = Running::start(Some(service::JOB_UIDS));
+    std::fs::set_permissions(running.data.path(), PermissionsExt::from_mode(0o711)).unwrap();
+    let args = args(&["-I", "-c", DOUBLE_MAP]);
+    let output = running
+        .sandbox
+        .run(Job {
+            sockets: Some(Path::new("/tmp")),
+            ..job("/usr/bin/python3", &args)
+        })
+        .await
+        .unwrap();
+    assert_eq!(String::from_utf8(output).unwrap(), "mapped\n");
+    // Without sockets there, nothing may be made there.
+    let result = running.sandbox.run(job("/usr/bin/python3", &args)).await;
+    let message = result
+        .expect_err("a job without sockets made a file in /tmp")
+        .to_string();
+    assert!(message.contains("PermissionError"), "{message}");
+}
+
+/// LibreOffice's first start, as the server makes its settings, crashed as
+/// a job's user before it could make files in /tmp: Ubuntu 24.04's
+/// LibreOffice 24.2 maps code through a file there as it starts.
+#[tokio::test]
+async fn libreoffice_starts_as_a_user_of_its_own() {
+    const SOFFICE: &str = "/usr/lib/libreoffice/program/soffice.bin";
+    if std::env::var_os("ACCORDION_TEST_JOB_USERS").is_none() || !Path::new(SOFFICE).is_file() {
+        return;
+    }
+    let running = Running::start(Some(service::JOB_UIDS));
+    std::fs::set_permissions(running.data.path(), PermissionsExt::from_mode(0o711)).unwrap();
+    let folder = running.sandbox.folder(Path::new("/")).await.unwrap();
+    let home = folder.path().to_str().unwrap().to_owned();
+    let profile = folder.path().join("profile");
+    let args = args(&[
+        &format!("-env:UserInstallation=file://{}", profile.display()),
+        "--headless",
+        "--norestore",
+        "--terminate_after_init",
+    ]);
+    let env = [("HOME", home.as_str()), ("TMPDIR", home.as_str())];
+    let read = [
+        "/etc/libreoffice",
+        "/etc/fonts",
+        "/var/cache/fontconfig",
+        "/etc/passwd",
+    ]
+    .map(PathBuf::from);
+    let result = running
+        .sandbox
+        .run(Job {
+            env: &env,
+            read: &read,
+            folder: Some(&folder),
+            sockets: Some(Path::new("/tmp")),
+            limits: Limits {
+                cpu: Duration::from_secs(60),
+                time: Duration::from_secs(90),
+                ..LIMITS
+            },
+            ..job(SOFFICE, &args)
+        })
+        .await;
+    if let Err(err) = result {
+        panic!("LibreOffice didn't start: {err}");
+    }
+    assert!(
+        profile.join("user").is_dir(),
+        "LibreOffice made no settings"
     );
 }

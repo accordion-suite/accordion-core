@@ -1,8 +1,8 @@
 //! The launcher: `sandbox --memory <bytes> --cpu <seconds>
 //! [--landlock-optional] [--read <path>]... [--write <folder>]...
-//! [--sockets <folder>] -- <program> [<argument>]...`. It runs in a process
-//! of its own, after `exec`, so it restricts itself with ordinary code
-//! rather than between `fork` and `exec` in the server.
+//! [--sockets <folder> [--temp-files]] -- <program> [<argument>]...`. It
+//! runs in a process of its own, after `exec`, so it restricts itself with
+//! ordinary code rather than between `fork` and `exec` in the server.
 //!
 //! The worker service also runs it as a job's user to tidy up after the
 //! job, with `--settle` or `--clean` ([`crate::service`]).
@@ -15,8 +15,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use landlock::{
-    ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset,
-    RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope,
+    ABI, Access, AccessFs, AccessNet, BitFlags, CompatLevel, Compatible, PathBeneath, PathFd,
+    Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetStatus, Scope,
 };
 use seccompiler::{
     BpfProgram, SeccompAction, SeccompCmpArgLen, SeccompCmpOp, SeccompCondition, SeccompFilter,
@@ -34,6 +34,13 @@ struct Request {
     write: Vec<PathBuf>,
     /// Where the worker may make local sockets, to listen on.
     sockets: Option<PathBuf>,
+    /// Whether the worker may also make files of its own in `sockets`. Only
+    /// the worker service asks for it, for a worker that runs as a user of
+    /// its own, since only that user's ownership keeps other workers' files
+    /// there out of reach. LibreOffice needs it there: with no home folder
+    /// for its user, it maps the code it generates through a file in `/tmp`,
+    /// because memory can't be both writable and runnable.
+    temp_files: bool,
     /// Whether the worker may run without Landlock, which only the worker
     /// service asks for, when the worker runs as a user of its own.
     landlock_optional: bool,
@@ -77,6 +84,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Request, String> {
     let mut read = Vec::new();
     let mut write = Vec::new();
     let mut sockets = None;
+    let mut temp_files = false;
     let mut landlock_optional = false;
     let number = |value: Option<OsString>, name: &str| {
         value
@@ -98,6 +106,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Request, String> {
                     args.next().ok_or("--sockets needs a folder")?,
                 ));
             }
+            Some("--temp-files") => temp_files = true,
             Some("--") => break,
             _ => {
                 return Err(format!(
@@ -111,12 +120,16 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Request, String> {
     if !program.is_absolute() {
         return Err(format!("{} isn't a full path", program.display()));
     }
+    if temp_files && sockets.is_none() {
+        return Err("--temp-files needs --sockets".into());
+    }
     Ok(Request {
         memory: memory.ok_or("--memory is missing")?,
         cpu: cpu.ok_or("--cpu is missing")?,
         read,
         write,
         sockets,
+        temp_files,
         landlock_optional,
         program,
         args: args.collect(),
@@ -241,11 +254,21 @@ fn landlock(request: &Request, interpreter: Option<&Path>) -> Result<(), String>
             .add_rule(PathBeneath::new(fd, write))
             .map_err(|err| fail(&err))?;
     }
-    // Only new sockets: the folder's files stay out of reach.
+    // Only new sockets: the folder's files stay out of reach. With
+    // `temp_files`, files too, which reach only the worker's own files there,
+    // since it's a user of its own. Running them still isn't allowed.
     if let Some(folder) = &request.sockets {
+        let mut access = BitFlags::from(AccessFs::MakeSock);
+        if request.temp_files {
+            access |= AccessFs::MakeReg
+                | AccessFs::ReadFile
+                | AccessFs::WriteFile
+                | AccessFs::Truncate
+                | AccessFs::RemoveFile;
+        }
         let fd = PathFd::new(folder).map_err(|err| fail(&err))?;
         ruleset = ruleset
-            .add_rule(PathBeneath::new(fd, AccessFs::MakeSock))
+            .add_rule(PathBeneath::new(fd, access))
             .map_err(|err| fail(&err))?;
     }
     for program in std::iter::once(request.program.as_path()).chain(interpreter) {

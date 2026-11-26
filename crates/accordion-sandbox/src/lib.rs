@@ -31,7 +31,9 @@
 //! decision 29). It runs each connection's jobs as a user ID of their own,
 //! which owns nothing and can't see the data folder beyond the job's own
 //! folder, with no network, so Landlock is one more layer where the kernel
-//! has it.
+//! has it. Since a job's user owns its files, such a job that may make
+//! sockets in a folder may make files of its own there too, as LibreOffice
+//! needs to in `/tmp`.
 
 mod acl;
 mod launch;
@@ -48,7 +50,7 @@ pub fn main() -> ! {
     if args.next().is_none_or(|command| command != "sandbox") {
         eprintln!(
             "Usage: {} sandbox --memory <bytes> --cpu <seconds> [--read <path>]... [--write \
-             <folder>]... [--sockets <folder>] -- <program> [<argument>]...",
+             <folder>]... [--sockets <folder> [--temp-files]] -- <program> [<argument>]...",
             std::env::args().next().unwrap_or_default()
         );
         std::process::exit(2);

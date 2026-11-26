@@ -114,7 +114,7 @@ const ACCOUNT_ACTIONS: &str = "'signed_in', 'sign_in_failed', 'signed_out', 'ses
 
 const SHARE_ACTIONS: &str = "'shared', 'share_changed', 'unshared'";
 /// Notices about an item for one person only, which activity leaves out.
-const PERSONAL_ACTIONS: &str = "'reminder_due', 'import_finished'";
+const PERSONAL_ACTIONS: &str = "'reminder_due', 'import_finished', 'mentioned', 'replied'";
 
 /// Edits to one file by one person this close together become one event,
 /// and a restore this soon after the same person trashed it undoes it.
@@ -329,6 +329,15 @@ pub enum Action {
     /// `state` (`done`, `canceled`, or `failed`), `brought`, and `error`
     /// when it stopped.
     ImportFinished,
+    /// Someone mentioned `other` in a comment on a document (decision 30).
+    /// Only the person mentioned hears about it, and it's never in anyone's
+    /// activity. Details: `thread`, `comment`, and `text`, the start of
+    /// what the comment says.
+    Mentioned,
+    /// Someone replied in a thread `other` started or wrote in, without
+    /// mentioning them. Like a mention, only `other` hears about it.
+    /// Details as for [`Action::Mentioned`].
+    Replied,
 }
 
 impl Action {
@@ -371,10 +380,12 @@ impl Action {
             Self::PreviewsChanged => "previews_changed",
             Self::ReminderDue => "reminder_due",
             Self::ImportFinished => "import_finished",
+            Self::Mentioned => "mentioned",
+            Self::Replied => "replied",
         }
     }
 
-    const ALL: [Self; 37] = [
+    const ALL: [Self; 39] = [
         Self::Added,
         Self::Edited,
         Self::Renamed,
@@ -412,6 +423,8 @@ impl Action {
         Self::PreviewsChanged,
         Self::ReminderDue,
         Self::ImportFinished,
+        Self::Mentioned,
+        Self::Replied,
     ];
 
     fn from_column(row: &Row<'_>, index: usize) -> rusqlite::Result<Self> {
@@ -948,7 +961,7 @@ pub(crate) fn record(conn: &Connection, actor: Actor, event: &NewEvent) -> rusql
     )?;
     let id = conn.last_insert_rowid();
     let notify = match event.action {
-        Action::Shared | Action::ShareChanged => {
+        Action::Shared | Action::ShareChanged | Action::Mentioned | Action::Replied => {
             event.other.filter(|&other| Some(other) != actor.user)
         }
         Action::LinkOpened | Action::ReminderDue | Action::ImportFinished => event.other,
@@ -983,9 +996,12 @@ fn hint(conn: &Connection, event: &NewEvent) -> rusqlite::Result<()> {
     let Some(item) = event.item else {
         return Ok(());
     };
-    // A reminder or an import's end changes nothing, and only rings its
-    // owner's bell.
-    if matches!(event.action, Action::ReminderDue | Action::ImportFinished) {
+    // A reminder, an import's end, or a comment changes nothing in Drive,
+    // and only rings one person's bell.
+    if matches!(
+        event.action,
+        Action::ReminderDue | Action::ImportFinished | Action::Mentioned | Action::Replied
+    ) {
         return Ok(());
     }
     let mut folders = Vec::new();

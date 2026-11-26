@@ -741,3 +741,104 @@ async fn a_reminder_rings_only_its_persons_bell_and_stays_out_of_activity() {
     assert_eq!(s.activity(alex, top).await.len(), before.len());
     assert!(!actions(&s.activity(sam, note.id).await).contains(&Action::ReminderDue));
 }
+
+#[tokio::test]
+async fn a_mention_rings_only_the_mentioned_persons_bell() {
+    let s = start().await;
+    let alex = s.user("alex").await;
+    let sam = s.user("sam").await;
+    let top = s.storage.top_folder(alex).await.unwrap();
+    let document = s
+        .by(alex)
+        .write_file(top, "Plan.html", &b"<p>Plan</p>"[..])
+        .await
+        .unwrap();
+    s.by(alex)
+        .share(document.id, sam, ShareLevel::Commenter, alex)
+        .await
+        .unwrap();
+    let before = s.activity(alex, document.id).await;
+    let details = json!({"thread": "t", "comment": "c", "text": "@Alex Kim look"});
+
+    for (action, to) in [(Action::Mentioned, alex), (Action::Replied, alex)] {
+        s.events
+            .record(
+                Actor::person(sam, Via::Web),
+                NewEvent::about(action, document.id, alex)
+                    .other(to)
+                    .details(details.clone()),
+            )
+            .await
+            .unwrap();
+    }
+    // Nobody hears about their own comment.
+    s.events
+        .record(
+            Actor::person(sam, Via::Web),
+            NewEvent::about(Action::Mentioned, document.id, alex)
+                .other(sam)
+                .details(details),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        s.notified(alex).await,
+        [
+            (Action::Replied, false, false),
+            (Action::Mentioned, false, false)
+        ]
+    );
+    assert_eq!(s.notified(sam).await, [(Action::Shared, false, false)]);
+    assert_eq!(s.activity(alex, document.id).await, before);
+    assert_eq!(s.activity(alex, top).await.len(), before.len());
+}
+
+#[tokio::test]
+async fn an_unrecorded_edit_saves_a_version_without_an_event() {
+    let s = start().await;
+    let alex = s.user("alex").await;
+    let sam = s.user("sam").await;
+    let top = s.storage.top_folder(alex).await.unwrap();
+    let document = s
+        .by(alex)
+        .write_file(top, "Plan.html", &b"<p>Plan</p>"[..])
+        .await
+        .unwrap();
+    s.by(alex)
+        .share(document.id, sam, ShareLevel::Commenter, alex)
+        .await
+        .unwrap();
+    let base = |item: &accordion_core::storage::Item| match item.kind {
+        accordion_core::storage::ItemKind::File { blob, .. } => blob.hash,
+        accordion_core::storage::ItemKind::Folder => panic!("a file"),
+    };
+    let before = s.activity(alex, document.id).await;
+
+    // Sam's comment goes into the file, and nobody hears it was edited.
+    let saved = s
+        .by(sam)
+        .write_unrecorded_edit(
+            document.id,
+            base(&document),
+            uuid::Uuid::from_u128(1),
+            &b"<p>Plan</p><!-- comment -->"[..],
+        )
+        .await
+        .unwrap();
+    assert_ne!(base(&saved), base(&document));
+    assert_eq!(s.storage.versions(document.id).await.unwrap().len(), 2);
+    assert_eq!(s.activity(alex, document.id).await, before);
+    assert!(s.notified(alex).await.is_empty());
+
+    // An edit of what it says is still recorded.
+    s.by(sam)
+        .write_edit(
+            document.id,
+            base(&saved),
+            uuid::Uuid::from_u128(2),
+            &b"<p>Plan B</p>"[..],
+        )
+        .await
+        .unwrap();
+    assert_eq!(s.notified(alex).await, [(Action::Edited, false, false)]);
+}

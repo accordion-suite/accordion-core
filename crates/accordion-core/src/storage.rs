@@ -1332,7 +1332,51 @@ impl Storage {
             parent,
             file.name,
             contents,
-            Over::File(id, base, Some(edit)),
+            Over::File(
+                id,
+                base,
+                Some(Edit {
+                    session: edit,
+                    recorded: true,
+                }),
+            ),
+            None,
+        )
+        .await
+    }
+
+    /// Saves `contents` as the file's new version, as
+    /// [`Storage::write_edit`] does, but records no event, so nobody's
+    /// activity or bell says the file was edited. For changes to a file
+    /// that aren't changes to what it says, such as the comments Docs keeps
+    /// in a document's file: the comments ring bells of their own.
+    pub async fn write_unrecorded_edit(
+        &self,
+        id: ItemId,
+        base: ContentHash,
+        edit: Uuid,
+        contents: impl AsyncRead + Unpin,
+    ) -> Result<Item, Error> {
+        let file = self.item(id).await?.ok_or(Error::NotFound)?;
+        if file.kind == ItemKind::Folder {
+            return Err(Error::NotAFile);
+        }
+        if file.trashed_at.is_some() {
+            return Err(Error::InTrash);
+        }
+        let parent = file.parent.ok_or(Error::NotAFile)?;
+        self.receive_and_save(
+            parent,
+            file.name,
+            contents,
+            Over::File(
+                id,
+                base,
+                Some(Edit {
+                    session: edit,
+                    recorded: false,
+                }),
+            ),
             None,
         )
         .await
@@ -1388,7 +1432,19 @@ impl Storage {
                 insert_blob(tx, blob, stored)?;
                 let id = match existing {
                     Some(id) => {
-                        record(tx, actor, NewEvent::about(Action::Edited, id, parent.owner))?;
+                        if !matches!(
+                            over,
+                            Over::File(
+                                _,
+                                _,
+                                Some(Edit {
+                                    recorded: false,
+                                    ..
+                                })
+                            )
+                        ) {
+                            record(tx, actor, NewEvent::about(Action::Edited, id, parent.owner))?;
+                        }
                         id
                     }
                     None => {
@@ -1398,7 +1454,7 @@ impl Storage {
                     }
                 };
                 let edit = match over {
-                    Over::File(_, _, edit) => edit,
+                    Over::File(_, _, edit) => edit.map(|edit| edit.session),
                     Over::Any | Over::Nothing => None,
                 };
                 add_version(tx, id, blob, edit, dates.map(|dates| dates.modified))?;
@@ -2789,9 +2845,18 @@ enum Over {
     Nothing,
     /// This file, and only while its contents are still these. Contents
     /// rather than a version ID, because a save over an empty version
-    /// keeps its ID. With an editing session's ID, a recent version from
-    /// the same session is replaced.
-    File(ItemId, ContentHash, Option<Uuid>),
+    /// keeps its ID. With an editing session, a recent version from the
+    /// same session is replaced.
+    File(ItemId, ContentHash, Option<Edit>),
+}
+
+/// A save from an editing session.
+#[derive(Clone, Copy, Debug)]
+struct Edit {
+    /// The session's ID.
+    session: Uuid,
+    /// Whether the save records an edit in the event log.
+    recorded: bool,
 }
 
 /// Checks that `name` in `parent` can take a new file or version of

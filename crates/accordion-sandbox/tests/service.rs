@@ -62,6 +62,14 @@ impl Running {
     }
 }
 
+/// A part of the job users' IDs of its own for each test. Tests run at the
+/// same time, and a job's user stops every process of that user when its
+/// work is done, so two tests sharing a user would stop each other's jobs.
+fn job_uids(test: u32) -> Range<u32> {
+    let start = service::JOB_UIDS.start + test * 16;
+    start..start + 16
+}
+
 fn rand_suffix() -> u64 {
     use std::hash::{BuildHasher, RandomState};
     RandomState::new().hash_one(std::time::SystemTime::now())
@@ -234,7 +242,7 @@ async fn runs_each_connection_as_a_user_of_its_own() {
     if std::env::var_os("ACCORDION_TEST_JOB_USERS").is_none() {
         return;
     }
-    let running = Running::start(Some(service::JOB_UIDS));
+    let running = Running::start(Some(job_uids(0)));
     // On a server, the worker service sees only jobs/. Here it sees the
     // whole data folder, so jobs need to pass through it, without reading it.
     std::fs::set_permissions(running.data.path(), PermissionsExt::from_mode(0o711)).unwrap();
@@ -299,7 +307,7 @@ async fn a_user_of_its_own_makes_files_where_it_makes_sockets() {
     if std::env::var_os("ACCORDION_TEST_JOB_USERS").is_none() {
         return;
     }
-    let running = Running::start(Some(service::JOB_UIDS));
+    let running = Running::start(Some(job_uids(1)));
     std::fs::set_permissions(running.data.path(), PermissionsExt::from_mode(0o711)).unwrap();
     let args = args(&["-I", "-c", DOUBLE_MAP]);
     let output = running
@@ -328,7 +336,7 @@ async fn libreoffice_starts_as_a_user_of_its_own() {
     if std::env::var_os("ACCORDION_TEST_JOB_USERS").is_none() || !Path::new(SOFFICE).is_file() {
         return;
     }
-    let running = Running::start(Some(service::JOB_UIDS));
+    let running = Running::start(Some(job_uids(2)));
     std::fs::set_permissions(running.data.path(), PermissionsExt::from_mode(0o711)).unwrap();
     let folder = running.sandbox.folder(Path::new("/")).await.unwrap();
     let home = folder.path().to_str().unwrap().to_owned();

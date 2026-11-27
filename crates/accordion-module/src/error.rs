@@ -129,9 +129,8 @@ impl From<storage::Error> for ApiError {
     fn from(err: storage::Error) -> Self {
         use storage::Error::*;
         let status = match err {
-            InvalidName | GiveToSelf | ShareWithOwner | ShareTopFolder | InvalidRetention => {
-                StatusCode::BAD_REQUEST
-            }
+            InvalidName | InvalidVersionName | GiveToSelf | ShareWithOwner | ShareTopFolder
+            | InvalidRetention => StatusCode::BAD_REQUEST,
             NotFound | UserNotFound | UploadNotFound | UnknownPlace(_) => StatusCode::NOT_FOUND,
             NameTaken { .. }
             | NotAFolder

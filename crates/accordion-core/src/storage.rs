@@ -295,6 +295,25 @@ static MIGRATIONS: &[Migration] = &[
         CREATE INDEX storage_shares_user ON storage_shares (user_id);
     ",
     },
+    Migration {
+        version: 10,
+        name: "Add version names and who made each version",
+        sql: "
+        -- A named version is kept past the retention period, until its
+        -- name is removed (decision 30).
+        ALTER TABLE storage_versions ADD COLUMN name TEXT
+            CHECK (name IS NULL OR length(name) BETWEEN 1 AND 100);
+
+        -- The people whose changes went into each version, in the order
+        -- they first did. Versions saved before this have none.
+        CREATE TABLE storage_version_people (
+            version_id BLOB NOT NULL REFERENCES storage_versions (id) ON DELETE CASCADE,
+            user_id BLOB NOT NULL REFERENCES identity_users (id) ON DELETE CASCADE,
+            UNIQUE (version_id, user_id)
+        ) STRICT;
+        CREATE INDEX storage_version_people_user ON storage_version_people (user_id);
+    ",
+    },
 ];
 
 /// My Drive's place. Its top folder has an empty name.
@@ -324,6 +343,9 @@ pub struct Reach {
 /// How long saves from one editing session replace the version the session
 /// started, before the next save starts a new one.
 pub const EDIT_VERSION_MINUTES: u32 = 30;
+
+/// The longest version name, in characters.
+pub const MAX_VERSION_NAME_LEN: usize = 100;
 
 /// The longest name, in bytes of UTF-8. Most file systems allow 255, so the
 /// plain view can show every name exactly.
@@ -366,6 +388,9 @@ pub enum Error {
 
     #[error("Files and folders can only move within one person's storage.")]
     DifferentOwner,
+
+    #[error("Version names can be 1 to {MAX_VERSION_NAME_LEN} characters long, on one line.")]
+    InvalidVersionName,
 
     #[error("That's in the trash. Restore it first, then try again.")]
     InTrash,
@@ -491,6 +516,13 @@ pub struct Version {
     pub number: u32,
     pub blob: Blob,
     pub created_at: String,
+    /// The name someone gave it. A named version is kept past the
+    /// retention period, until the name is removed.
+    pub name: Option<String>,
+    /// The people whose changes went into it, in the order they first did.
+    /// Empty for versions saved before Accordion recorded them, versions
+    /// from somewhere else, and versions the server made.
+    pub people: Vec<UserId>,
 }
 
 /// When an item was made and last changed somewhere else, such as in
@@ -1313,11 +1345,14 @@ impl Storage {
     /// 30). When the file's current version came from the same `edit` less
     /// than [`EDIT_VERSION_MINUTES`] after that session's first save to it,
     /// this replaces that version, so a session's saves become one version.
+    /// `editors` are everyone whose changes are in `contents`, beside the
+    /// handle's actor, for the version's people.
     pub async fn write_edit(
         &self,
         id: ItemId,
         base: ContentHash,
         edit: Uuid,
+        editors: &[UserId],
         contents: impl AsyncRead + Unpin,
     ) -> Result<Item, Error> {
         let file = self.item(id).await?.ok_or(Error::NotFound)?;
@@ -1328,21 +1363,20 @@ impl Storage {
             return Err(Error::InTrash);
         }
         let parent = file.parent.ok_or(Error::NotAFile)?;
-        self.receive_and_save(
-            parent,
-            file.name,
-            contents,
-            Over::File(
-                id,
-                base,
-                Some(Edit {
-                    session: edit,
-                    recorded: true,
-                }),
-            ),
-            None,
-        )
-        .await
+        let received = self.inner.blobs.receive(contents).await?;
+        let over = Over::File(
+            id,
+            base,
+            Some(Edit {
+                session: edit,
+                recorded: true,
+            }),
+        );
+        let result = self
+            .save(parent, file.name, &received, None, over, None, editors)
+            .await;
+        let _ = tokio::fs::remove_file(&received.path).await;
+        result
     }
 
     /// Saves `contents` as the file's new version, as
@@ -1393,7 +1427,9 @@ impl Storage {
         // Receiving the contents is the slow part, so it happens before
         // taking the lock.
         let received = self.inner.blobs.receive(contents).await?;
-        let result = self.save(parent, name, &received, None, over, dates).await;
+        let result = self
+            .save(parent, name, &received, None, over, dates, &[])
+            .await;
         // Gone already if it was stored. Otherwise nothing uses it.
         let _ = tokio::fs::remove_file(&received.path).await;
         result
@@ -1401,7 +1437,9 @@ impl Storage {
 
     /// Stores received contents as the file `name` in `parent`, as a new
     /// version if a file with that name is already there. For a resumable
-    /// upload, this also ends the upload.
+    /// upload, this also ends the upload. `editors` are the people whose
+    /// changes are in it, in the order they made them, beside the actor.
+    #[allow(clippy::too_many_arguments)]
     async fn save(
         &self,
         parent: ItemId,
@@ -1410,6 +1448,7 @@ impl Storage {
         upload: Option<UploadId>,
         over: Over,
         dates: Option<Dates>,
+        editors: &[UserId],
     ) -> Result<Item, Error> {
         let blob = received.blob;
         let _changes = self.inner.changes.lock().await;
@@ -1424,6 +1463,8 @@ impl Storage {
         let stored = kept.stored;
         let new_id = ItemId::generate();
         let actor = self.actor;
+        let mut people = editors.to_vec();
+        people.extend(actor.user.filter(|user| !editors.contains(user)));
         let item = self
             .inner
             .db
@@ -1457,7 +1498,33 @@ impl Storage {
                     Over::File(_, _, edit) => edit.map(|edit| edit.session),
                     Over::Any | Over::Nothing => None,
                 };
-                add_version(tx, id, blob, edit, dates.map(|dates| dates.modified))?;
+                // A dated save came from somewhere else, and an unrecorded
+                // edit didn't change what the file says, so neither names
+                // anyone.
+                let unrecorded = matches!(
+                    over,
+                    Over::File(
+                        _,
+                        _,
+                        Some(Edit {
+                            recorded: false,
+                            ..
+                        })
+                    )
+                );
+                let people = if dates.is_some() || unrecorded {
+                    &[][..]
+                } else {
+                    &people[..]
+                };
+                add_version(
+                    tx,
+                    id,
+                    blob,
+                    edit,
+                    dates.map(|dates| dates.modified),
+                    people,
+                )?;
                 if let Some(upload) = upload {
                     tx.execute(
                         "DELETE FROM storage_uploads WHERE id = ?1",
@@ -1583,27 +1650,90 @@ impl Storage {
                 if item.kind == ItemKind::Folder {
                     return Err(Error::NotAFile);
                 }
+                let mut people: HashMap<VersionId, Vec<UserId>> = HashMap::new();
                 let mut statement = conn.prepare(
-                    "SELECT v.id, v.number, v.blob, b.size, v.created_at
+                    "SELECT p.version_id, p.user_id
+                     FROM storage_version_people p
+                     JOIN storage_versions v ON v.id = p.version_id
+                     WHERE v.item_id = ?1 ORDER BY p.rowid",
+                )?;
+                let mut rows = statement.query([id.as_uuid()])?;
+                while let Some(row) = rows.next()? {
+                    people
+                        .entry(VersionId::from_uuid(row.get(0)?))
+                        .or_default()
+                        .push(UserId::from_uuid(row.get(1)?));
+                }
+                let mut statement = conn.prepare(
+                    "SELECT v.id, v.number, v.blob, b.size, v.created_at, v.name
                      FROM storage_versions v JOIN storage_blobs b ON b.hash = v.blob
                      WHERE v.item_id = ?1 ORDER BY v.number DESC",
                 )?;
                 let versions = statement
                     .query_map([id.as_uuid()], |row| {
+                        let id = VersionId::from_uuid(row.get(0)?);
                         Ok(Version {
-                            id: VersionId::from_uuid(row.get(0)?),
+                            id,
                             number: row.get(1)?,
                             blob: Blob {
                                 hash: hash_from(row, 2)?,
                                 size: size_from(row, 3)?,
                             },
                             created_at: row.get(4)?,
+                            name: row.get(5)?,
+                            people: people.remove(&id).unwrap_or_default(),
                         })
                     })?
                     .collect::<Result<_, _>>()?;
                 Ok(versions)
             })
             .await
+    }
+
+    /// Names a version, or removes its name with `None`. A named version is
+    /// kept past the retention period (decision 30). The name is trimmed,
+    /// and an empty one removes it. Naming records no event.
+    pub async fn name_version(
+        &self,
+        id: ItemId,
+        version: VersionId,
+        name: Option<&str>,
+    ) -> Result<Version, Error> {
+        let name = match name.map(str::trim) {
+            None | Some("") => None,
+            Some(name)
+                if name.chars().count() > MAX_VERSION_NAME_LEN
+                    || name.chars().any(char::is_control) =>
+            {
+                return Err(Error::InvalidVersionName);
+            }
+            Some(name) => Some(name.to_owned()),
+        };
+        self.inner
+            .db
+            .write(move |tx| {
+                let item = item(tx, id)?.ok_or(Error::NotFound)?;
+                if item.kind == ItemKind::Folder {
+                    return Err(Error::NotAFile);
+                }
+                if !location(tx, id)?.visible {
+                    return Err(Error::InTrash);
+                }
+                let named = tx.execute(
+                    "UPDATE storage_versions SET name = ?3 WHERE item_id = ?1 AND id = ?2",
+                    (id.as_uuid(), version.as_uuid(), &name),
+                )?;
+                if named == 0 {
+                    return Err(Error::NotFound);
+                }
+                Ok(())
+            })
+            .await?;
+        self.versions(id)
+            .await?
+            .into_iter()
+            .find(|v| v.id == version)
+            .ok_or(Error::NotFound)
     }
 
     /// Makes an older version current again, by saving it as a new version.
@@ -1638,7 +1768,7 @@ impl Storage {
                     .optional()?
                     .ok_or(Error::NotFound)?;
                 check_space(tx, item.owner, blob.size, None)?;
-                add_version(tx, id, blob, None, None)?;
+                add_version(tx, id, blob, None, None, actor.user.as_slice())?;
                 record(
                     tx,
                     actor,
@@ -1679,7 +1809,7 @@ impl Storage {
                 }
                 check_space(tx, parent.owner, blob.size, None)?;
                 insert_item(tx, new_id, parent.owner, parent.id, &name, "file", None)?;
-                add_version(tx, new_id, blob, None, None)?;
+                add_version(tx, new_id, blob, None, None, actor.user.as_slice())?;
                 record(tx, actor, added(new_id, parent.owner, "copied"))?;
                 item_or_missing(tx, new_id)
             })
@@ -3022,6 +3152,7 @@ fn add_version(
     blob: Blob,
     edit: Option<Uuid>,
     at: Option<SystemTime>,
+    people: &[UserId],
 ) -> Result<(), Error> {
     // A dated version, from somewhere else, says when it was made there.
     let at = at.map(|at| {
@@ -3040,6 +3171,8 @@ fn add_version(
                 sql_now!(),
                 " WHERE id = (SELECT id FROM storage_versions WHERE item_id = ?1
                               ORDER BY number DESC LIMIT 1)
+                    -- A named version keeps what it had when it was named.
+                    AND name IS NULL
                     AND edit_id = ?3
                     AND edit_started_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?4)"
             ),
@@ -3058,7 +3191,7 @@ fn add_version(
                 sql_now!(),
                 ") WHERE id = (SELECT v.id FROM storage_versions v
                           JOIN storage_blobs b ON b.hash = v.blob
-                          WHERE v.item_id = ?1 AND b.size = 0
+                          WHERE v.item_id = ?1 AND b.size = 0 AND v.name IS NULL
                             AND v.number = (SELECT max(number) FROM storage_versions
                                             WHERE item_id = ?1))"
             ),
@@ -3090,6 +3223,29 @@ fn add_version(
             ") WHERE id = ?1"
         ),
         (item.as_uuid(), &at),
+    )?;
+    if !people.is_empty() {
+        let newest = VersionId::from_uuid(conn.query_row(
+            "SELECT id FROM storage_versions WHERE item_id = ?1 ORDER BY number DESC LIMIT 1",
+            [item.as_uuid()],
+            |row| row.get(0),
+        )?);
+        for &person in people {
+            add_person(conn, newest, person)?;
+        }
+    }
+    Ok(())
+}
+
+/// Adds `person` to the people whose changes went into `version`, unless
+/// they're there already, or the version or the person is gone.
+fn add_person(conn: &Connection, version: VersionId, person: UserId) -> Result<(), Error> {
+    conn.execute(
+        "INSERT OR IGNORE INTO storage_version_people (version_id, user_id)
+         SELECT ?1, ?2
+         WHERE EXISTS (SELECT 1 FROM storage_versions WHERE id = ?1)
+           AND EXISTS (SELECT 1 FROM identity_users WHERE id = ?2)",
+        (version.as_uuid(), person.as_uuid()),
     )?;
     Ok(())
 }

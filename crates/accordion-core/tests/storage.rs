@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use accordion_core::db::Database;
+use accordion_core::events::{Actor, Via};
 use accordion_core::identity::{Identity, NewUser};
 use accordion_core::storage::{
     Dates, Error, Found, Hit, ItemKind, LeaveFiles, Only, Search, Storage,
@@ -221,12 +222,12 @@ async fn groups_an_editing_sessions_saves_into_one_version() {
     // A session's first save is a version, and its next saves replace it.
     let saved = server
         .storage
-        .write_edit(file.id, hash(&file), session, &b"plan A"[..])
+        .write_edit(file.id, hash(&file), session, &[], &b"plan A"[..])
         .await
         .unwrap();
     let saved = server
         .storage
-        .write_edit(file.id, hash(&saved), session, &b"plan AB"[..])
+        .write_edit(file.id, hash(&saved), session, &[], &b"plan AB"[..])
         .await
         .unwrap();
     assert_eq!(read(&server.storage, file.id).await, "plan AB");
@@ -241,7 +242,7 @@ async fn groups_an_editing_sessions_saves_into_one_version() {
         .unwrap();
     let saved = server
         .storage
-        .write_edit(file.id, hash(&elsewhere), session, &b"plan ABCD"[..])
+        .write_edit(file.id, hash(&elsewhere), session, &[], &b"plan ABCD"[..])
         .await
         .unwrap();
     assert_eq!(versions(server.storage.clone()).await.len(), 4);
@@ -250,7 +251,7 @@ async fn groups_an_editing_sessions_saves_into_one_version() {
     let other = uuid::Uuid::from_u128(2);
     let saved = server
         .storage
-        .write_edit(file.id, hash(&saved), other, &b"plan ABCDE"[..])
+        .write_edit(file.id, hash(&saved), other, &[], &b"plan ABCDE"[..])
         .await
         .unwrap();
     assert_eq!(versions(server.storage.clone()).await.len(), 5);
@@ -264,7 +265,7 @@ async fn groups_an_editing_sessions_saves_into_one_version() {
     .unwrap();
     let saved = server
         .storage
-        .write_edit(file.id, hash(&saved), other, &b"plan ABCDEF"[..])
+        .write_edit(file.id, hash(&saved), other, &[], &b"plan ABCDEF"[..])
         .await
         .unwrap();
     assert_eq!(versions(server.storage.clone()).await.len(), 6);
@@ -272,13 +273,175 @@ async fn groups_an_editing_sessions_saves_into_one_version() {
     // A stale base is refused, as with any version.
     let stale = server
         .storage
-        .write_edit(file.id, hash(&file), other, &b"old"[..])
+        .write_edit(file.id, hash(&file), other, &[], &b"old"[..])
         .await;
     assert!(matches!(stale, Err(Error::Changed)));
     assert_eq!(
         hash(&server.storage.item(file.id).await.unwrap().unwrap()),
         hash(&saved)
     );
+}
+
+#[tokio::test]
+async fn records_who_made_each_version() {
+    let server = start().await;
+    let alex = server.user("alex").await;
+    let sam = server.user("sam").await;
+    let dana = server.user("dana").await;
+    let by = |user| server.storage.acting_as(Actor::person(user, Via::Web));
+    let top = server.storage.top_folder(alex).await.unwrap();
+    let hash = |item: &accordion_core::storage::Item| match item.kind {
+        ItemKind::File { blob, .. } => blob.hash,
+        ItemKind::Folder => panic!("a file"),
+    };
+    let people = |storage: Storage, id| async move {
+        storage
+            .versions(id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|version| version.people)
+            .collect::<Vec<_>>()
+    };
+
+    let file = by(alex)
+        .write_file(top, "plan.txt", &b"plan"[..])
+        .await
+        .unwrap();
+    let saved = by(sam)
+        .write_version(file.id, hash(&file), &b"plan B"[..])
+        .await
+        .unwrap();
+    // A co-editing save names everyone who edited, in the order they did,
+    // and the saver.
+    let session = uuid::Uuid::from_u128(1);
+    let saved = by(alex)
+        .write_edit(file.id, hash(&saved), session, &[sam, alex], &b"plan C"[..])
+        .await
+        .unwrap();
+    // The session's next save replaces its version, and adds its people.
+    by(sam)
+        .write_edit(file.id, hash(&saved), session, &[dana], &b"plan D"[..])
+        .await
+        .unwrap();
+    assert_eq!(
+        people(server.storage.clone(), file.id).await,
+        [vec![sam, alex, dana], vec![sam], vec![alex]]
+    );
+
+    // A restore names who restored it, the server names no one, and
+    // neither does a save from somewhere else, with its own dates.
+    let first = server.storage.versions(file.id).await.unwrap()[2].id;
+    by(dana).restore_version(file.id, first).await.unwrap();
+    let saved = server.storage.item(file.id).await.unwrap().unwrap();
+    let saved = server
+        .storage
+        .write_version(file.id, hash(&saved), &b"plan E"[..])
+        .await
+        .unwrap();
+    assert_ne!(hash(&saved), hash(&file));
+    by(alex)
+        .write_file_dated(
+            top,
+            "plan.txt",
+            &b"plan F"[..],
+            Dates {
+                created: day(1),
+                modified: day(2),
+            },
+        )
+        .await
+        .unwrap();
+    let people = people(server.storage.clone(), file.id).await;
+    assert_eq!(people[..3], [vec![], vec![], vec![dana]]);
+}
+
+#[tokio::test]
+async fn names_versions() {
+    let server = start().await;
+    let alex = server.user("alex").await;
+    let top = server.storage.top_folder(alex).await.unwrap();
+    let file = server
+        .storage
+        .write_file(top, "plan.txt", &b"plan"[..])
+        .await
+        .unwrap();
+    let hash = |item: &accordion_core::storage::Item| match item.kind {
+        ItemKind::File { blob, .. } => blob.hash,
+        ItemKind::Folder => panic!("a file"),
+    };
+    let session = uuid::Uuid::from_u128(1);
+    let saved = server
+        .storage
+        .write_edit(file.id, hash(&file), session, &[], &b"plan A"[..])
+        .await
+        .unwrap();
+    let current = server.storage.versions(file.id).await.unwrap()[0].id;
+
+    // Names are trimmed, and an empty one removes the name.
+    let named = server
+        .storage
+        .name_version(file.id, current, Some("  Sent to Sam "))
+        .await
+        .unwrap();
+    assert_eq!(named.name.as_deref(), Some("Sent to Sam"));
+    let named = server
+        .storage
+        .name_version(file.id, current, Some(" "))
+        .await
+        .unwrap();
+    assert_eq!(named.name, None);
+    let long = "é".repeat(100);
+    let named = server
+        .storage
+        .name_version(file.id, current, Some(&long))
+        .await
+        .unwrap();
+    assert_eq!(named.name.as_deref(), Some(long.as_str()));
+    for wrong in ["é".repeat(101), "Sent\nto Sam".into()] {
+        assert!(matches!(
+            server
+                .storage
+                .name_version(file.id, current, Some(&wrong))
+                .await,
+            Err(Error::InvalidVersionName)
+        ));
+    }
+    assert!(matches!(
+        server
+            .storage
+            .name_version(file.id, accordion_types::VersionId::generate(), None)
+            .await,
+        Err(Error::NotFound)
+    ));
+
+    // The session's next save doesn't replace a named version.
+    server
+        .storage
+        .write_edit(file.id, hash(&saved), session, &[], &b"plan AB"[..])
+        .await
+        .unwrap();
+    let versions = server.storage.versions(file.id).await.unwrap();
+    assert_eq!(versions.len(), 3);
+    assert_eq!(versions[1].id, current);
+    assert_eq!(versions[1].name.as_deref(), Some(long.as_str()));
+    let mut old = String::new();
+    server
+        .storage
+        .open_version(file.id, current)
+        .await
+        .unwrap()
+        .read_to_string(&mut old)
+        .await
+        .unwrap();
+    assert_eq!(old, "plan A");
+
+    // A file in the trash can't have its versions named.
+    server.storage.delete(file.id).await.unwrap();
+    assert!(matches!(
+        server.storage.name_version(file.id, current, None).await,
+        Err(Error::InTrash)
+    ));
 }
 
 #[tokio::test]

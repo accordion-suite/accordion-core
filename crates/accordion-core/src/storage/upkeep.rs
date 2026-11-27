@@ -236,7 +236,8 @@ impl Storage {
         }
 
         // A version goes once the version after it is old enough. The
-        // current version has none after it, so it always stays.
+        // current version has none after it, so it always stays, and a named
+        // one stays until its name is removed (decision 30).
         let version_cutoff = format!("-{} days", retention.version_days);
         loop {
             let _changes = self.inner.changes.lock().await;
@@ -247,7 +248,8 @@ impl Storage {
                 .write(move |tx| {
                     Ok::<_, Error>(tx.execute(
                         "DELETE FROM storage_versions WHERE id IN (
-                             SELECT v.id FROM storage_versions v WHERE EXISTS (
+                             SELECT v.id FROM storage_versions v
+                             WHERE v.name IS NULL AND EXISTS (
                                  SELECT 1 FROM storage_versions newer
                                  WHERE newer.item_id = v.item_id AND newer.number > v.number
                                    AND newer.created_at

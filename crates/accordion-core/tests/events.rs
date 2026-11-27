@@ -836,9 +836,22 @@ async fn an_unrecorded_edit_saves_a_version_without_an_event() {
             document.id,
             base(&saved),
             uuid::Uuid::from_u128(2),
+            &[],
             &b"<p>Plan B</p>"[..],
         )
         .await
         .unwrap();
     assert_eq!(s.notified(alex).await, [(Action::Edited, false, false)]);
+
+    // The edit names Sam among the version's people, and the comment
+    // doesn't.
+    let people: Vec<_> = s
+        .storage
+        .versions(document.id)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|version| version.people)
+        .collect();
+    assert_eq!(people, [vec![sam], vec![], vec![alex]]);
 }

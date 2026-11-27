@@ -451,6 +451,37 @@ async fn saves_after_a_pause_as_one_version() {
 }
 
 #[tokio::test]
+async fn a_version_names_everyone_who_edited_it() {
+    // One save when everyone leaves, so nothing clears the list sooner.
+    let s = start(SLOW).await;
+    let alex = s.user("alex").await;
+    let sam = s.user("sam").await;
+    let item = s.file(alex, "list.txt", "Milk\n").await;
+    s.storage
+        .share(item, sam, ShareLevel::Editor, alex)
+        .await
+        .unwrap();
+    let mut a = s.join(item, alex).await;
+    let mut b = s.join(item, sam).await;
+    a.settle().await;
+    b.settle().await;
+
+    // Alex typed first, though Sam's save came last.
+    a.type_at_end("Eggs\n").await;
+    a.settle().await;
+    b.settle().await;
+    b.type_at_end("Bread\n").await;
+    b.settle().await;
+    drop(a);
+    drop(b);
+    s.all_closed().await;
+    assert_eq!(s.contents(item).await, "Milk\nEggs\nBread\n");
+    let versions = s.storage.versions(item).await.unwrap();
+    assert_eq!(versions.len(), 2);
+    assert_eq!(versions[0].people, [alex, sam]);
+}
+
+#[tokio::test]
 async fn edits_survive_a_restart_before_they_were_saved() {
     let s = start(SLOW).await;
     let alex = s.user("alex").await;

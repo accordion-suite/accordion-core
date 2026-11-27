@@ -335,6 +335,60 @@ async fn purges_old_trash_and_replaced_versions() {
 }
 
 #[tokio::test]
+async fn keeps_named_versions_until_their_name_is_removed() {
+    let server = start().await;
+    let storage = &server.storage;
+    let (_, top) = server.user("alex").await;
+    let notes = storage
+        .write_file(top, "notes.md", &b"one"[..])
+        .await
+        .unwrap();
+    for text in ["two", "three"] {
+        storage
+            .write_file(top, "notes.md", text.as_bytes())
+            .await
+            .unwrap();
+    }
+    let first = storage.versions(notes.id).await.unwrap()[2].id;
+    storage
+        .name_version(notes.id, first, Some("First draft"))
+        .await
+        .unwrap();
+    server
+        .sql(format!(
+            "UPDATE storage_versions SET created_at = {LONG_AGO} WHERE number < 3;"
+        ))
+        .await;
+    let numbers = || async {
+        storage
+            .versions(notes.id)
+            .await
+            .unwrap()
+            .iter()
+            .map(|version| version.number)
+            .collect::<Vec<u32>>()
+    };
+
+    // Version 1 is named, so it stays though version 2 replaced it long ago.
+    assert_eq!(
+        storage.purge(Retention::default()).await.unwrap(),
+        Purged::default()
+    );
+    assert_eq!(numbers().await, [3, 2, 1]);
+
+    // Without its name, it goes on the usual schedule.
+    storage.name_version(notes.id, first, None).await.unwrap();
+    assert_eq!(
+        storage.purge(Retention::default()).await.unwrap(),
+        Purged {
+            items: 0,
+            versions: 1
+        }
+    );
+    assert_eq!(numbers().await, [3, 2]);
+}
+
+#[tokio::test]
 async fn removes_contents_a_day_after_nothing_uses_them() {
     let server = start().await;
     let storage = &server.storage;

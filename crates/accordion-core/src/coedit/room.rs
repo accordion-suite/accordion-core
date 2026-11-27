@@ -86,6 +86,9 @@ pub(super) struct Room {
     /// Each Yjs client's cursor and name, and whose connection it is.
     awareness: HashMap<ClientID, Peer>,
     unsaved: Option<Unsaved>,
+    /// Everyone who edited since the last save, in the order they first
+    /// did, for the version's people.
+    editors: Vec<UserId>,
     /// The copy in memory can't be trusted, since reading an edit panicked.
     failed: bool,
     /// The file was deleted or moved to the trash.
@@ -146,6 +149,7 @@ impl Room {
             next_person: 0,
             awareness: HashMap::new(),
             unsaved: None,
+            editors: Vec::new(),
             failed: false,
             gone: false,
         }
@@ -544,8 +548,11 @@ impl Room {
             retry_at: None,
         });
         unsaved.last_edit = now;
-        if editor.is_some() {
+        if let Some(user) = editor {
             unsaved.editor = editor;
+            if !self.editors.contains(&user) {
+                self.editors.push(user);
+            }
         }
     }
 
@@ -598,7 +605,13 @@ impl Room {
                 .inner
                 .storage
                 .acting_as(actor)
-                .write_edit(self.item, file_hash, self.edit, &contents[..])
+                .write_edit(
+                    self.item,
+                    file_hash,
+                    self.edit,
+                    &self.editors,
+                    &contents[..],
+                )
                 .await;
             match written {
                 Ok(item) => match item.kind {
@@ -635,6 +648,7 @@ impl Room {
             Ok(state) => {
                 self.base = Some(state);
                 self.unsaved = None;
+                self.editors.clear();
             }
             Err(err) => {
                 tracing::warn!(item = %self.item, %err, "couldn't keep a co-edited file's state");
@@ -707,6 +721,7 @@ impl Room {
         if matched {
             // Nothing to take in, and nothing the file doesn't have.
             self.unsaved = None;
+            self.editors.clear();
             match self.keep(None).await {
                 Ok(state) => self.base = Some(state),
                 Err(err) => {
@@ -767,6 +782,7 @@ impl Room {
             self.edited(None);
         } else {
             self.unsaved = None;
+            self.editors.clear();
         }
     }
 

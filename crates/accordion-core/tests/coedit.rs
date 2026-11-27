@@ -81,6 +81,40 @@ impl Format for Tidy {
     }
 }
 
+/// Text with the document's co-editing state after it, as Docs' files
+/// carry theirs, so a file written elsewhere differs from what the editor
+/// writes even when it says the same.
+struct Stamped;
+
+/// The text of a [`Stamped`] file, before its state.
+fn stamped_text(contents: &[u8]) -> &[u8] {
+    contents.split(|byte| *byte == 0).next().unwrap_or_default()
+}
+
+impl Format for Stamped {
+    fn name(&self) -> &'static str {
+        "stamped"
+    }
+
+    fn absorb(&self, doc: &Doc, contents: &[u8]) -> Result<(), FormatError> {
+        Plain.absorb(doc, stamped_text(contents))
+    }
+
+    fn write(&self, doc: &Doc) -> Result<Vec<u8>, FormatError> {
+        let mut file = Plain.write(doc)?;
+        let state = doc
+            .transact()
+            .encode_state_as_update_v1(&yrs::StateVector::default());
+        file.push(0);
+        file.extend(state.len().to_string().into_bytes());
+        Ok(file)
+    }
+
+    fn same_document(&self, written: &[u8], contents: &[u8]) -> bool {
+        stamped_text(written) == stamped_text(contents)
+    }
+}
+
 struct Server {
     dir: tempfile::TempDir,
     db: Database,
@@ -456,24 +490,31 @@ async fn a_version_names_everyone_who_edited_it() {
     let s = start(SLOW).await;
     let alex = s.user("alex").await;
     let sam = s.user("sam").await;
+    let kim = s.user("kim").await;
     let item = s.file(alex, "list.txt", "Milk\n").await;
-    s.storage
-        .share(item, sam, ShareLevel::Editor, alex)
-        .await
-        .unwrap();
+    for person in [sam, kim] {
+        s.storage
+            .share(item, person, ShareLevel::Editor, alex)
+            .await
+            .unwrap();
+    }
     let mut a = s.join(item, alex).await;
     let mut b = s.join(item, sam).await;
     a.settle().await;
     b.settle().await;
 
-    // Alex typed first, though Sam's save came last.
+    // Alex typed first, though Sam's save came last. Kim opened it in
+    // between, and only watched.
     a.type_at_end("Eggs\n").await;
     a.settle().await;
     b.settle().await;
+    let mut c = s.join(item, kim).await;
+    c.settle().await;
     b.type_at_end("Bread\n").await;
     b.settle().await;
     drop(a);
     drop(b);
+    drop(c);
     s.all_closed().await;
     assert_eq!(s.contents(item).await, "Milk\nEggs\nBread\n");
     let versions = s.storage.versions(item).await.unwrap();
@@ -1036,4 +1077,62 @@ async fn saving_now_writes_unsaved_edits_at_once() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     a.settle().await;
     assert_eq!(a.text(), "Hi there, Sam");
+}
+
+#[tokio::test]
+async fn a_restored_version_comes_in_without_a_save_of_its_own() {
+    let s = start(SLOW).await;
+    let alex = s.user("alex").await;
+    let item = s.file(alex, "list.txt", "Milk\n").await;
+    let first = s.storage.versions(item).await.unwrap()[0].id;
+    let mut a = s
+        .join_in(
+            item,
+            alex,
+            None,
+            Doc::with_options(options()),
+            Arc::new(Stamped),
+        )
+        .await
+        .unwrap();
+    a.type_at_end("Eggs\n").await;
+    a.settle().await;
+    s.coediting.save_now(item).await;
+    assert_eq!(s.versions(item).await, 2);
+
+    // Restoring the first version reaches the editor, and the file, which
+    // says what the document says, isn't saved again as another version.
+    s.storage
+        .acting_as(Actor::person(alex, Via::Web))
+        .restore_version(item, first)
+        .await
+        .unwrap();
+    settle_all(&mut [&mut a]).await;
+    assert_eq!(a.text(), "Milk\n");
+    s.coediting.save_now(item).await;
+    assert_eq!(s.versions(item).await, 3);
+    // Nor does someone opening it, who has nothing to add.
+    let mut b = s
+        .join_in(
+            item,
+            alex,
+            None,
+            Doc::with_options(options()),
+            Arc::new(Stamped),
+        )
+        .await
+        .unwrap();
+    settle_all(&mut [&mut a, &mut b]).await;
+    s.coediting.save_now(item).await;
+    assert_eq!(s.versions(item).await, 3);
+
+    // Typing after it saves as usual.
+    a.type_at_end("Jam\n").await;
+    a.settle().await;
+    s.coediting.save_now(item).await;
+    assert_eq!(s.versions(item).await, 4);
+    assert_eq!(
+        stamped_text(s.contents(item).await.as_bytes()),
+        b"Milk\nJam\n"
+    );
 }

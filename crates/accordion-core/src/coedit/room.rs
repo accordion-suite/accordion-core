@@ -478,10 +478,20 @@ impl Room {
     async fn accept(&mut self, from: u64, user: UserId, update: Vec<u8>) -> Result<(), Closed> {
         // Decoding changes nothing, so an edit that can't be decoded, even
         // one that makes yrs panic, only closes its sender.
-        let Some(Ok(decoded)) = guarded(|| Update::decode_v1(&update)) else {
-            return Err(Closed::Invalid);
+        // The update isn't Send, so it's gone before anything awaits.
+        let applied = {
+            let Some(Ok(decoded)) = guarded(|| Update::decode_v1(&update)) else {
+                return Err(Closed::Invalid);
+            };
+            // Every editor answers the server's sync request as it joins,
+            // with nothing when it has nothing new. That isn't an edit: it
+            // mustn't name them in the next version, or save one of its own.
+            if decoded.is_empty() {
+                return Ok(());
+            }
+            guarded(|| self.doc.transact_mut().apply_update(decoded))
         };
-        match guarded(|| self.doc.transact_mut().apply_update(decoded)) {
+        match applied {
             Some(Ok(())) => {}
             Some(Err(_)) => return Err(Closed::Invalid),
             None => {
@@ -711,7 +721,7 @@ impl Room {
     /// file counts as taken in.
     async fn absorb(&mut self, contents: &[u8]) {
         let matched = match guarded(|| self.format.write(&self.doc)) {
-            Some(Ok(current)) => current == contents,
+            Some(Ok(current)) => self.format.same_document(&current, contents),
             Some(Err(_)) => false,
             None => {
                 self.failed = true;
@@ -764,7 +774,7 @@ impl Room {
         // saving.
         let unsaved = !matches!(
             guarded(|| self.format.write(&self.doc)),
-            Some(Ok(current)) if current == contents
+            Some(Ok(current)) if self.format.same_document(&current, contents)
         );
         match self.keep(unsaved.then(|| new_base.clone())).await {
             Ok(state) => self.base = Some(if unsaved { new_base } else { state }),

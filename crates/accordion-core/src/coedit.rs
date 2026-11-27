@@ -75,6 +75,16 @@ pub trait Format: Send + Sync + 'static {
 
     /// The file's contents for the document as it is now.
     fn write(&self, doc: &Doc) -> Result<Vec<u8>, FormatError>;
+
+    /// Whether `written`, as [`Format::write`] wrote it, holds the same
+    /// document as the file's `contents`, so taking in a change from
+    /// outside needs no save of its own, such as a restored version. A
+    /// format whose files carry their co-editing state, as Docs' do,
+    /// compares what the files say, since the states differ whenever a file
+    /// was written elsewhere.
+    fn same_document(&self, written: &[u8], contents: &[u8]) -> bool {
+        written == contents
+    }
 }
 
 /// Why a format couldn't read or write a file.

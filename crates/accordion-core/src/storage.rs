@@ -1779,6 +1779,8 @@ impl Storage {
             })
             .await?;
         self.update_view(Change::Show(item.id)).await;
+        // A document open for co-editing takes in the restored version.
+        self.inner.saved.send_modify(|count| *count += 1);
         Ok(item)
     }
 
